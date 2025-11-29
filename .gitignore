@@ -81,3 +81,10 @@ docker-compose.override.yml
 debug_output/
 *.debug
 *.trace
+
+# ============================================
+# SSH Keys
+# ============================================
+ssh_keys/
+*.pem
+*.pub
