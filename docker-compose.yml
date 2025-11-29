@@ -1,10 +1,9 @@
 services:
-  intraday:
+  tradingbot:
     build: .
-    container_name: intraday
-    env_file:
-      - .env
+    container_name: intraday_options_bot_angel
+    env_file: .env
     volumes:
       - ./logs:/app/logs
       - ./audit:/app/audit
-    restart: "no"
+    restart: "no"         # <-- correct for your setup
