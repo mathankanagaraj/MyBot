@@ -9,14 +9,70 @@ write_files:
   # --------------------------
   # Global Environment Variables
   # --------------------------
+  # IMPORTANT: Edit these values with your actual credentials after instance creation
   - path: /etc/default/intraday-bot
     permissions: "0644"
     content: |
       BOT_DIR="/opt/intraday_bot"
       REPO_URL="https://github.com/mathankanagaraj/MyBot.git"
       BRANCH="main"
+      
+      # Telegram Notifications
       TELEGRAM_TOKEN="8312696115:AAFCdD1OdeMfpQ0KVioOoLu85nt6YPNDWL8"
       TELEGRAM_CHAT="8255162322"
+      
+      # Angel Broker API Credentials (REPLACE WITH YOUR ACTUAL VALUES)
+      ANGEL_API_KEY="YOUR_API_KEY_HERE"
+      ANGEL_CLIENT_CODE="YOUR_CLIENT_CODE_HERE"
+      ANGEL_PASSWORD="YOUR_PASSWORD_HERE"
+      ANGEL_TOTP_SECRET="YOUR_TOTP_SECRET_HERE"
+      
+      # Trading Configuration
+      SYMBOLS="NIFTY,BANKNIFTY,RELIANCE,INFY,TCS,ICICIBANK,HDFCBANK"
+      MODE="LIVE"
+      MAX_CONTRACTS_PER_TRADE="1"
+      ALLOC_PCT="0.70"
+      MAX_DAILY_LOSS="5000"
+      MAX_POSITION_SIZE="50000"
+      MARKET_HOURS_ONLY="true"
+      TIMEZONE="Asia/Kolkata"
+
+  # --------------------------
+  # .env file generator script
+  # --------------------------
+  - path: /usr/local/bin/create_env.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      source /etc/default/intraday-bot
+      cat > "${BOT_DIR}/.env" <<EOF
+      # Angel Broker API Credentials
+      ANGEL_API_KEY=${ANGEL_API_KEY}
+      ANGEL_CLIENT_CODE=${ANGEL_CLIENT_CODE}
+      ANGEL_PASSWORD=${ANGEL_PASSWORD}
+      ANGEL_TOTP_SECRET=${ANGEL_TOTP_SECRET}
+      
+      # Telegram Notifications
+      TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      TELEGRAM_CHAT_ID=${TELEGRAM_CHAT}
+      
+      # Indian Market Symbols (NSE Stocks + Index Futures)
+      SYMBOLS=${SYMBOLS}
+      
+      # Trading Mode (LIVE ONLY - Angel Broker doesn't support paper trading)
+      MODE=${MODE}
+      
+      # Risk Management
+      MAX_CONTRACTS_PER_TRADE=${MAX_CONTRACTS_PER_TRADE}
+      ALLOC_PCT=${ALLOC_PCT}
+      MAX_DAILY_LOSS=${MAX_DAILY_LOSS}
+      MAX_POSITION_SIZE=${MAX_POSITION_SIZE}
+      
+      # Market Hours
+      MARKET_HOURS_ONLY=${MARKET_HOURS_ONLY}
+      TIMEZONE=${TIMEZONE}
+      EOF
+      chmod 600 "${BOT_DIR}/.env"
 
   # --------------------------
   # Telegram sender script
@@ -32,13 +88,13 @@ write_files:
         -d text="$MSG" >/dev/null 2>&1 || true
 
   # --------------------------
-  # Systemd service (start/stop)
+  # Systemd service - START
   # --------------------------
-  - path: /etc/systemd/system/intraday-bot.service
+  - path: /etc/systemd/system/intraday-bot-start.service
     permissions: "0644"
     content: |
       [Unit]
-      Description=Intraday Bot (Docker Compose)
+      Description=Intraday Bot - Start Service
       After=network-online.target docker.service
       Wants=network-online.target
 
@@ -48,26 +104,55 @@ write_files:
       WorkingDirectory=/opt/intraday_bot
       ExecStartPre=/usr/local/bin/tg.sh "📈 Starting Intraday Bot..."
       ExecStart=/usr/bin/docker compose up -d --build
-      ExecStop=/usr/local/bin/tg.sh "🛑 Stopping Intraday Bot..."
-      ExecStop=/usr/bin/docker compose down
       StandardOutput=append:/var/log/intraday_bot/service.log
       StandardError=append:/var/log/intraday_bot/service.log
       RemainAfterExit=yes
 
-      [Install]
-      WantedBy=multi-user.target
-
   # --------------------------
-  # Timer: Start 09:00, Stop 15:45 IST
+  # Systemd service - STOP
   # --------------------------
-  - path: /etc/systemd/system/intraday-bot.timer
+  - path: /etc/systemd/system/intraday-bot-stop.service
     permissions: "0644"
     content: |
       [Unit]
-      Description=Scheduled Start/Stop for Intraday Bot (Indian Market)
+      Description=Intraday Bot - Stop Service
+      After=docker.service
+
+      [Service]
+      Type=oneshot
+      EnvironmentFile=/etc/default/intraday-bot
+      WorkingDirectory=/opt/intraday_bot
+      ExecStartPre=/usr/local/bin/tg.sh "🛑 Stopping Intraday Bot..."
+      ExecStart=/usr/bin/docker compose down
+      StandardOutput=append:/var/log/intraday_bot/service.log
+      StandardError=append:/var/log/intraday_bot/service.log
+
+  # --------------------------
+  # Timer: Start at 09:00 IST
+  # --------------------------
+  - path: /etc/systemd/system/intraday-bot-start.timer
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Start Intraday Bot at Market Open (09:00 IST)
 
       [Timer]
       OnCalendar=Mon-Fri 09:00 Asia/Kolkata
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+  # --------------------------
+  # Timer: Stop at 15:45 IST
+  # --------------------------
+  - path: /etc/systemd/system/intraday-bot-stop.timer
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Stop Intraday Bot at Market Close (15:45 IST)
+
+      [Timer]
       OnCalendar=Mon-Fri 15:45 Asia/Kolkata
       Persistent=true
 
@@ -117,7 +202,7 @@ write_files:
       #!/usr/bin/env bash
       if ! docker ps --format '{{.Names}}' | grep -q "intraday"; then
         /usr/local/bin/tg.sh "⚠️ Bot container not running — restarting!"
-        systemctl start intraday-bot.service
+        systemctl start intraday-bot-start.service
       fi
 
   # --------------------------
@@ -179,10 +264,16 @@ write_files:
 
       chmod -R 755 /opt/intraday_bot
 
+      # Create .env file from environment variables
+      /usr/local/bin/create_env.sh
+      echo "[SETUP] Created .env file from environment variables"
+
       systemctl daemon-reload
-      systemctl enable intraday-bot.timer
+      systemctl enable intraday-bot-start.timer
+      systemctl enable intraday-bot-stop.timer
       systemctl enable intraday-bot-health.timer
-      systemctl start intraday-bot.timer
+      systemctl start intraday-bot-start.timer
+      systemctl start intraday-bot-stop.timer
       systemctl start intraday-bot-health.timer
 
       /usr/local/bin/tg.sh "☁️ Oracle Instance Boot Complete — Bot Scheduler Online"

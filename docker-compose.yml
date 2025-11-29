@@ -6,4 +6,4 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./audit:/app/audit
-    restart: "no"         # <-- correct for your setup
+    restart: "no" # Systemd manages restarts via timer and health check
