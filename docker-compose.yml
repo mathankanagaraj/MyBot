@@ -1,0 +1,12 @@
+services:
+  tradingbot:
+    build: .
+    container_name: intraday_options_bot_angel
+    env_file:
+      - .env
+    network_mode: "host"
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+      - ./audit:/app/audit
+    restart: unless-stopped
