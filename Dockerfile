@@ -1,8 +1,8 @@
 ###############################
 # Stage 1 — Build dependencies
 ###############################
-# Explicitly target ARM64 for OCI free tier
-FROM --platform=linux/arm64 python:3.12-slim-bullseye AS builder
+# Multi-platform support: automatically detects ARM64 or AMD64
+FROM python:3.12-slim-bullseye AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -26,7 +26,7 @@ RUN pip install --prefix=/install --no-cache-dir -r requirements.txt
 ###############################
 # Stage 2 — Runtime image
 ###############################
-FROM --platform=linux/arm64 python:3.12-slim-bullseye
+FROM python:3.12-slim-bullseye
 
 ENV TZ=Asia/Kolkata
 ENV PYTHONUNBUFFERED=1
