@@ -196,3 +196,9 @@ For issues or questions:
 ## License
 
 MIT License - Use at your own risk
+## 📚 Documentation
+
+For detailed technical guides, see the [`docs/`](docs/) directory:
+- [Data Flow Guide](docs/DATA_FLOW_GUIDE.md) - How 1m bars flow through the system
+- [Logging Guide](docs/LOGGING_GUIDE.md) - Understanding bot logging output
+

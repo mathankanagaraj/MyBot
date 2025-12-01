@@ -20,7 +20,12 @@ from core.config import (
 )
 from core.logger import logger
 from core.option_selector import find_option_contract_async
-from core.signal_engine import detect_5m_entry, detect_15m_bias
+from core.signal_engine import (
+    detect_5m_entry,
+    detect_15m_bias,
+    get_next_candle_close_time,
+    get_seconds_until_next_close,
+)
 from core.utils import init_audit_file, is_market_open, send_telegram, write_audit_row
 
 _STOP = False
@@ -44,11 +49,12 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
     Main worker loop for each symbol.
     Monitors market, detects signals, and executes trades.
     """
-    logger.info("[%s] Worker task started", symbol)
+    logger.info("[%s] 🚀 Worker started", symbol)
     last_15m_signal_time = None
 
     while not _STOP:
         try:
+
             # Market hours guard
             is_open = is_market_open()
             await notify_market_state(is_open)
@@ -71,62 +77,105 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                         break
 
                 if not has_pos:
-                    logger.info("[%s] Position closed detected via Angel API poll", symbol)
+                    logger.info("[%s] ✅ Position closed", symbol)
                     cash_mgr.force_release(symbol)
                     send_telegram(f"✅ {symbol} position closed")
 
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
-            # Get latest bars from BarManager
-            df5, df15 = await bar_manager.get_resampled()
+            # Get current time for candle completion checks
+            now = datetime.utcnow()
+            
+            # Wait until next 15m candle close before checking bias
+            next_15m_close = get_next_candle_close_time(now, '15min')
+            sleep_seconds = get_seconds_until_next_close(now, '15min')
+            
+            logger.info(
+                "[%s] ⏰ Waiting for 15m close at %s",
+                symbol,
+                next_15m_close.strftime("%H:%M:%S"),
+            )
+            await asyncio.sleep(sleep_seconds)
+            
+            # Now we're at a 15m boundary - get latest bars with complete candles only
+            now = datetime.utcnow()
+            df5, df15 = await bar_manager.get_resampled(current_time=now)
 
             if df15.empty:
-                await asyncio.sleep(60)  # Wait for more data
-                continue
-
-            # Detect 15m bias
-            bias = detect_15m_bias(df15)
-            if not bias:
+                logger.warning("[%s] ⚠️ No 15m data available, waiting...", symbol)
                 await asyncio.sleep(60)
                 continue
+
+            # Detect 15m bias at candle close
+            logger.info("[%s] 🔍 Checking 15m bias (bars: 5m=%d, 15m=%d)...", symbol, len(df5), len(df15))
+            bias = detect_15m_bias(df15)
+            
+            if not bias:
+                continue  # No bias, loop will wait for next 15m close
+
+            logger.info("[%s] ✅ 15m bias detected: %s", symbol, bias)
 
             # Avoid duplicate triggers
             now = datetime.utcnow()
             if last_15m_signal_time and (now - last_15m_signal_time) < timedelta(minutes=15):
+                time_since_last = (now - last_15m_signal_time).total_seconds() / 60
+                logger.info(
+                    "[%s] ⏭️ Skipping duplicate signal (%.1f min since last), sleeping 60s...",
+                    symbol,
+                    time_since_last,
+                )
                 await asyncio.sleep(60)
                 continue
 
             # Notify 15m bias found
+            logger.info("[%s] 🎯 NEW 15m signal: %s - Starting 5m entry search...", symbol, bias)
             send_telegram(f"📊 [{symbol}] 15m Trend: {bias}. Looking for 5m entry...")
             last_15m_signal_time = now
 
             checks = 0
             entered = False
 
-            # Look for 5m entry confirmation
+            # Look for 5m entry confirmation at 5m candle closes
+            logger.info("[%s] 🔎 Monitoring 5m entries (max %d checks)...", symbol, MAX_5M_CHECKS)
             while checks < MAX_5M_CHECKS and not entered and not _STOP:
-                await asyncio.sleep(60)  # Wait for next 1m bar
+                checks += 1
+                
+                # Wait for next 5m candle close
+                now = datetime.utcnow()
+                next_5m_close = get_next_candle_close_time(now, '5min')
+                sleep_seconds = get_seconds_until_next_close(now, '5min')
+                
+                logger.info(
+                    "[%s] ⏰ 5m check #%d - waiting for %s",
+                    symbol,
+                    checks,
+                    next_5m_close.strftime("%H:%M:%S"),
+                )
+                await asyncio.sleep(sleep_seconds)
 
-                df5_new, df15_new = await bar_manager.get_resampled()
+                # Get fresh data at 5m boundary with complete candles only
+                now = datetime.utcnow()
+                df5_new, df15_new = await bar_manager.get_resampled(current_time=now)
                 if df5_new.empty or df15_new.empty:
-                    checks += 1
                     continue
 
                 # Revalidate 15m bias hasn't flipped
                 bias_now = detect_15m_bias(df15_new)
+                
                 if bias_now != bias:
+                    logger.warning("[%s] ⚠️ 15m bias changed %s → %s, aborting entry search", symbol, bias, bias_now)
                     send_telegram(f"⚠️ {symbol} 15m bias changed {bias} → {bias_now}, aborting")
                     break
 
-                # Check 5m entry conditions
+                # Check 5m entry conditions at candle close
                 entry_ok, details = detect_5m_entry(df5_new, bias)
+                
                 if not entry_ok:
-                    checks += 1
-                    continue
+                    continue  # No entry yet
 
                 # Entry signal confirmed!
-                logger.info(f"[{symbol}] Entry signal confirmed: {bias}")
+                logger.info(f"[{symbol}] ✅ 5m ENTRY SIGNAL CONFIRMED: {bias} - {details}")
 
                 # Get underlying price
                 # For indices: Get futures price (for signal accuracy)
@@ -134,29 +183,42 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 from core.config import INDEX_FUTURES
 
                 if symbol in INDEX_FUTURES:
+                    logger.info("[%s] 📊 Fetching futures price for index...", symbol)
                     # Get current monthly futures price for indices
                     underlying = await angel_client.get_futures_price(symbol)
                 else:
+                    logger.info("[%s] 📊 Fetching stock price...", symbol)
                     # Get stock price
                     underlying = await angel_client.get_last_price(symbol, exchange="NSE")
 
                 if not underlying:
+                    logger.error("[%s] ❌ Failed to get underlying price", symbol)
                     send_telegram(f"❌ {symbol} failed to get underlying price")
                     break
+
+                logger.info("[%s] 💰 Underlying price: ₹%.2f", symbol, underlying)
 
                 # Select option contract (ALWAYS OPTIONS, never futures)
                 # For indices: Uses futures price to select index option strike
                 # For stocks: Uses stock price to select stock option strike
+                logger.info("[%s] 🔍 Selecting option contract...", symbol)
                 opt_contract, reason = await find_option_contract_async(angel_client, symbol, bias, underlying)
                 if not opt_contract:
+                    logger.error("[%s] ❌ Option selection failed: %s", symbol, reason)
                     send_telegram(f"❌ {symbol} option selection failed: {reason}")
                     break
 
+                logger.info("[%s] ✅ Selected option: %s", symbol, opt_contract["symbol"])
+
                 # Get option premium
+                logger.info("[%s] 💰 Fetching option premium...", symbol)
                 prem = await angel_client.get_last_price(opt_contract["symbol"], exchange="NFO")
                 if prem is None or prem < MIN_PREMIUM:
+                    logger.error("[%s] ❌ Premium too low: ₹%s (min: ₹%.2f)", symbol, prem, MIN_PREMIUM)
                     send_telegram(f"❌ {symbol} premium too low: ₹{prem}")
                     break
+
+                logger.info("[%s] 💰 Option premium: ₹%.2f", symbol, prem)
 
                 # Calculate position size
                 lot_size = opt_contract.get("lot_size", 1)
@@ -164,9 +226,19 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 qty = MAX_CONTRACTS_PER_TRADE
                 est_cost = per_lot_cost * qty
 
+                logger.info(
+                    "[%s] 📊 Position sizing: %d lots × %d qty × ₹%.2f = ₹%.2f",
+                    symbol,
+                    qty,
+                    lot_size,
+                    prem,
+                    est_cost,
+                )
+
                 # Check if we can open position
                 can_open = await cash_mgr.can_open_position(symbol, est_cost)
                 if not can_open:
+                    logger.error("[%s] ❌ Insufficient funds or risk limit reached", symbol)
                     send_telegram(f"❌ {symbol} insufficient funds or risk limit reached")
                     break
 
@@ -183,7 +255,7 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
 
                 # Place bracket order
                 logger.info(
-                    f"Placing order for {symbol} {bias}: "
+                    f"[{symbol}] 📤 Placing bracket order: {bias} "
                     f"Entry=₹{prem:.2f}, SL=₹{stop_price:.2f}, TP=₹{target_price:.2f}"
                 )
 
@@ -197,10 +269,12 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 )
 
                 if bracket is None:
+                    logger.error("[%s] ❌ Order placement failed", symbol)
                     send_telegram(f"❌ {symbol} order placement failed")
                     cash_mgr.force_release(symbol)
                     break
 
+                logger.info("[%s] ✅ Order placed successfully!", symbol)
                 send_telegram(
                     f"✅ Entered {symbol} {bias}\n"
                     f"Option: {opt_contract['symbol']}\n"
@@ -224,14 +298,52 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
 
                 entered = True
 
-            await asyncio.sleep(60)
+            if not entered:
+                logger.info("[%s] ⛔ No entry after %d checks", symbol, checks)
+            # Loop will continue and wait for next 15m candle close
 
         except Exception as e:
-            logger.exception("[%s] Worker exception: %s", symbol, e)
+            logger.exception("[%s] ❌ Worker exception: %s", symbol, e)
             send_telegram(f"⚠️ Error in {symbol} worker: {str(e)[:100]}")
             await asyncio.sleep(2)
 
-    logger.info("[%s] Worker exiting", symbol)
+    logger.info("[%s] 🛑 Worker exiting", symbol)
+
+
+async def data_fetcher_loop(symbol, angel_client, bar_manager):
+    """
+    Background task that fetches new 1-minute bars every 5 minutes.
+    This keeps the BarManager updated with fresh data.
+    """
+    logger.info("[%s] 📡 Data fetcher started", symbol)
+
+    while not _STOP:
+        try:
+
+            # Fetch last 15 minutes of data to ensure we don't miss any bars
+            df_new = await angel_client.req_historic_1m(symbol, duration_days=0.01)  # ~15 minutes
+
+            if df_new is not None and not df_new.empty:
+                # Add new bars to BarManager
+                for idx, row in df_new.iterrows():
+                    bar_dict = {
+                        'datetime': idx,
+                        'open': row['open'],
+                        'high': row['high'],
+                        'low': row['low'],
+                        'close': row['close'],
+                        'volume': row['volume']
+                    }
+                    await bar_manager.add_bar(bar_dict)
+
+            # Sleep for 5 minutes before next fetch
+            await asyncio.sleep(300)  # 5 minutes
+
+        except Exception as e:
+            logger.exception("[%s] ❌ Data fetcher exception: %s", symbol, e)
+            await asyncio.sleep(60)  # Retry after 1 minute on error
+
+    logger.info("[%s] 🛑 Data fetcher exiting", symbol)
 
 
 async def run_all_workers():
@@ -274,11 +386,22 @@ async def run_all_workers():
         else:
             logger.warning("[%s] Failed to load historical data", symbol)
 
-    # Start worker tasks
+    # Start worker tasks AND data fetcher tasks
     tasks = []
+    
+    # Start data fetcher for each symbol (runs every 5 minutes)
+    logger.info("🚀 Starting background data fetchers (5-minute interval)...")
+    for symbol in SYMBOLS:
+        bar_mgr = bar_managers.get(symbol)
+        tasks.append(data_fetcher_loop(symbol, angel_client, bar_mgr))
+        logger.info("[%s] 📡 Data fetcher thread started", symbol)
+    
+    # Start worker loop for each symbol
+    logger.info("🚀 Starting worker loops...")
     for symbol in SYMBOLS:
         bar_mgr = bar_managers.get(symbol)
         tasks.append(worker_loop(symbol, angel_client, cash_mgr, bar_mgr))
+        logger.info("[%s] 🔄 Worker thread started", symbol)
 
     send_telegram("🚀 Angel Broker Bot Started (LIVE TRADING)")
 

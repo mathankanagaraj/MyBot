@@ -69,12 +69,13 @@ class BarManager:
             df = df.set_index('datetime')[['open', 'high', 'low', 'close', 'volume']]
             return df
     
-    async def get_resampled(self, lookback_minutes=None):
+    async def get_resampled(self, lookback_minutes=None, current_time=None):
         """
         Get 5m and 15m resampled bars with indicators.
         
         Args:
             lookback_minutes: If specified, only use last N minutes of 1m data
+            current_time: If specified, filter out incomplete candles
             
         Returns:
             Tuple of (df5m, df15m) DataFrames with indicators
@@ -84,7 +85,7 @@ class BarManager:
         if df1m.empty:
             return pd.DataFrame(), pd.DataFrame()
         
-        df5, df15 = resample_from_1m(df1m)
+        df5, df15 = resample_from_1m(df1m, current_time=current_time)
         return df5, df15
     
     async def initialize_from_historical(self, historical_df):
