@@ -346,6 +346,101 @@ async def data_fetcher_loop(symbol, angel_client, bar_manager):
     logger.info("[%s] 🛑 Data fetcher exiting", symbol)
 
 
+async def pre_market_check(cash_mgr):
+    """
+    Perform pre-market balance check and notification.
+    Called once when bot starts or when market opens.
+    """
+    logger.info("🔍 Performing pre-market balance check...")
+    await cash_mgr.check_and_log_start_balance()
+
+
+async def end_of_day_report(cash_mgr, angel_client):
+    """
+    Generate and send end-of-day trading report.
+    Includes balance, P&L, trade count, and position status.
+    """
+    logger.info("📊 Generating end-of-day report...")
+    
+    try:
+        # Get daily statistics
+        stats = await cash_mgr.get_daily_statistics()
+        
+        # Get open positions from Angel API
+        positions = angel_client.get_positions()
+        open_positions = [p for p in positions if p.get("netqty", "0") != "0"]
+        
+        # Calculate P&L percentage
+        start_bal = stats["start_balance"]
+        pnl = stats["daily_pnl"]
+        pnl_pct = (pnl / start_bal * 100) if start_bal > 0 else 0.0
+        
+        # Build report message
+        msg = (
+            f"📊 **End of Day Report**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Start Balance: ₹{start_bal:,.2f}\n"
+            f"💰 End Balance: ₹{stats['current_balance']:,.2f}\n"
+            f"📈 Daily P&L: ₹{pnl:,.2f} ({pnl_pct:+.2f}%)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Total Trades: {stats['total_trades']}\n"
+            f"📂 Open Positions: {len(open_positions)}\n"
+        )
+        
+        # Add open position details if any
+        if open_positions:
+            msg += "\n🔓 Open Positions:\n"
+            for pos in open_positions:
+                symbol = pos.get("tradingsymbol", "Unknown")
+                qty = pos.get("netqty", "0")
+                pnl_pos = float(pos.get("pnl", 0))
+                msg += f"  • {symbol}: Qty {qty} | P&L ₹{pnl_pos:,.2f}\n"
+        else:
+            msg += "\n✅ All positions closed\n"
+        
+        msg += "━━━━━━━━━━━━━━━━━━━━"
+        
+        logger.info(msg.replace("**", "").replace("━", "-"))
+        send_telegram(msg)
+        
+    except Exception as e:
+        logger.exception("Error generating end-of-day report: %s", e)
+        send_telegram(f"⚠️ Error generating end-of-day report: {str(e)[:100]}")
+
+
+async def schedule_end_of_day_report(cash_mgr, angel_client):
+    """
+    Background task that schedules end-of-day report at market close.
+    Runs continuously and triggers report at 3:30 PM IST each trading day.
+    """
+    from core.utils import get_seconds_until_market_close
+    
+    logger.info("📅 End-of-day report scheduler started")
+    
+    while not _STOP:
+        try:
+            # Calculate wait time until market close
+            wait_seconds = get_seconds_until_market_close()
+            
+            logger.info(f"⏰ End-of-day report scheduled in {wait_seconds/3600:.1f} hours")
+            
+            # Wait until market close
+            await asyncio.sleep(wait_seconds)
+            
+            # Generate report
+            if not _STOP:
+                await end_of_day_report(cash_mgr, angel_client)
+            
+            # Wait a bit before scheduling next report (avoid duplicate reports)
+            await asyncio.sleep(300)  # 5 minutes
+            
+        except Exception as e:
+            logger.exception("Error in end-of-day scheduler: %s", e)
+            await asyncio.sleep(60)
+    
+    logger.info("📅 End-of-day report scheduler exiting")
+
+
 async def run_all_workers():
     """Initialize and run all worker tasks"""
     global _STOP
@@ -386,8 +481,16 @@ async def run_all_workers():
         else:
             logger.warning("[%s] Failed to load historical data", symbol)
 
+    # Perform pre-market balance check
+    logger.info("🔍 Checking account balance...")
+    await pre_market_check(cash_mgr)
+
     # Start worker tasks AND data fetcher tasks
     tasks = []
+    
+    # Start end-of-day report scheduler
+    logger.info("📅 Starting end-of-day report scheduler...")
+    tasks.append(schedule_end_of_day_report(cash_mgr, angel_client))
     
     # Start data fetcher for each symbol (runs every 5 minutes)
     logger.info("🚀 Starting background data fetchers (5-minute interval)...")

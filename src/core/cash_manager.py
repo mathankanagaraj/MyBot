@@ -25,6 +25,11 @@ class LiveCashManager:
         self.max_position_size = max_position_size
         self.open_positions = {}
         self.daily_pnl = 0.0
+        
+        # Daily tracking
+        self.daily_start_balance = 0.0
+        self.total_trades_today = 0
+        self.last_balance_check_date = None
 
     async def available_exposure(self):
         """
@@ -112,7 +117,8 @@ class LiveCashManager:
             return False
 
         self.open_positions[symbol] = cost
-        logger.info(f"Registered open position: {symbol} @ ₹{cost:.2f}")
+        self.total_trades_today += 1
+        logger.info(f"Registered open position: {symbol} @ ₹{cost:.2f} (Trade #{self.total_trades_today})")
         return True
 
     def register_close(self, symbol: str, exit_value: float) -> float:
@@ -156,6 +162,80 @@ class LiveCashManager:
     def get_daily_pnl(self) -> float:
         """Get current daily P&L"""
         return self.daily_pnl
+
+    async def get_account_balance(self):
+        """
+        Get current account balance from Angel Broker.
+
+        Returns:
+            Dict with balance information
+        """
+        try:
+            summary = await self.angel_client.get_account_summary_async()
+            return {
+                "available_funds": float(summary.get("AvailableFunds", 0)),
+                "total_funds": float(summary.get("TotalFunds", 0)),
+                "utilized_funds": float(summary.get("UtilizedFunds", 0)),
+            }
+        except Exception as e:
+            logger.exception(f"Error getting account balance: {e}")
+            return {"available_funds": 0.0, "total_funds": 0.0, "utilized_funds": 0.0}
+
+    async def check_and_log_start_balance(self):
+        """
+        Check and log starting balance for the day.
+        Send Telegram notification with balance and allocation info.
+        """
+        from datetime import date
+        from core.utils import send_telegram
+
+        today = date.today()
+
+        # Only check once per day
+        if self.last_balance_check_date == today:
+            logger.info("Balance already checked today")
+            return
+
+        balance_info = await self.get_account_balance()
+        self.daily_start_balance = balance_info["available_funds"]
+        self.last_balance_check_date = today
+
+        # Calculate allocation limits
+        max_allocation = self.daily_start_balance * self.max_alloc_pct
+
+        # Log and notify
+        msg = (
+            f"📊 **Daily Balance Check**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Total Funds: ₹{balance_info['total_funds']:,.2f}\n"
+            f"✅ Available: ₹{self.daily_start_balance:,.2f}\n"
+            f"📈 Max Allocation (70%): ₹{max_allocation:,.2f}\n"
+            f"🎯 Available for Trading: ₹{max_allocation:,.2f}\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        logger.info(msg.replace("**", "").replace("━", "-"))
+        send_telegram(msg)
+
+    async def get_daily_statistics(self):
+        """
+        Get comprehensive daily trading statistics.
+
+        Returns:
+            Dict with daily statistics
+        """
+        balance_info = await self.get_account_balance()
+        current_balance = balance_info["available_funds"]
+
+        return {
+            "start_balance": self.daily_start_balance,
+            "current_balance": current_balance,
+            "total_funds": balance_info["total_funds"],
+            "daily_pnl": self.daily_pnl,
+            "total_trades": self.total_trades_today,
+            "open_positions_count": len(self.open_positions),
+            "open_positions": dict(self.open_positions),
+        }
 
 
 def create_cash_manager(angel_client, max_alloc_pct=0.70, max_daily_loss=5000.0, max_position_size=50000.0):

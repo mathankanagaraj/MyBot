@@ -110,3 +110,40 @@ def is_market_open(now_utc=None):
         )
 
     return is_open
+
+
+def get_seconds_until_market_close(now_utc=None):
+    """
+    Calculate seconds until NSE market close (3:30 PM IST).
+    If already past market close, returns seconds until next trading day's close.
+
+    Returns:
+        Number of seconds until market close
+    """
+    from datetime import timedelta
+
+    if not now_utc:
+        now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+    now_ist = now_utc.astimezone(IST)
+
+    # Create market close time for today
+    close_time = now_ist.replace(
+        hour=NSE_MARKET_CLOSE_HOUR,
+        minute=NSE_MARKET_CLOSE_MINUTE,
+        second=0,
+        microsecond=0
+    )
+
+    # If we're past market close today, target next trading day
+    if now_ist >= close_time:
+        # Move to next day
+        close_time += timedelta(days=1)
+        
+        # Skip weekends
+        while close_time.weekday() >= 5:  # Saturday = 5, Sunday = 6
+            close_time += timedelta(days=1)
+
+    # Calculate seconds difference
+    seconds = (close_time - now_ist).total_seconds()
+    return max(0, int(seconds))
+

@@ -1,4 +1,5 @@
 # core/option_selector.py
+import re
 from datetime import datetime
 from typing import Optional, Tuple
 
@@ -101,24 +102,20 @@ async def find_current_monthly_option(
 
                 # Extract strike price
                 try:
-                    # NSE option format: NIFTY24DEC21000CE or RELIANCE24DEC2500CE
-                    # Extract numeric part before CE/PE
-                    strike_str = ""
-                    for i, char in enumerate(symbol_name):
-                        if char.isdigit():
-                            strike_str += char
-                        elif strike_str and (symbol_name[i : i + 2] in ["CE", "PE"]):
-                            break
-
-                    if not strike_str:
+                    # NSE option format: SYMBOLDDMMMYYSTRIKECE/PE
+                    # Examples: RELIANCE30DEC251200PE, NIFTY26DEC2421000CE
+                    # Pattern: SYMBOL(letters) + DD(2 digits) + MMM(3 letters) + YY(2 digits) + STRIKE(digits) + CE/PE
+                    match = re.search(r'[A-Z]+(\d{2}[A-Z]{3}\d{2})(\d+)(CE|PE)$', symbol_name)
+                    if not match:
                         continue
-
-                    # Strikes are typically in whole numbers for indices, may need division for stocks
+                    
+                    # Group 1: Date (e.g., "30DEC25")
+                    # Group 2: Strike (e.g., "1200")
+                    # Group 3: Type (CE/PE)
+                    strike_str = match.group(2)
                     strike = float(strike_str)
-                    if strike > 10000:  # Likely in paise
-                        strike = strike / 100.0
 
-                except (ValueError, IndexError):
+                except (ValueError, AttributeError):
                     continue
 
                 options.append(
@@ -139,30 +136,54 @@ async def find_current_monthly_option(
         # Sort by expiry (nearest first), then by strike
         options.sort(key=lambda x: (x["expiry"], abs(x["strike"] - underlying_price)))
 
-        # Select best option based on strike proximity
+        # Select 1-2 strikes ITM for better delta and directional exposure
+        # This works for all underlyings (indices and stocks) with different strike intervals
+        
         best_option = None
-        best_diff = float("inf")
-
-        for opt in options[:20]:  # Check top 20 candidates
-            strike = opt["strike"]
-
-            # Simple selection: slightly OTM
-            if bias == "BULL":
-                target_strike = underlying_price * 1.02  # 2% OTM
+        
+        if bias == "BULL":
+            # For BULL (CE): Select strike below spot (ITM)
+            # Target: 1-2 strikes below spot, roughly 0.5-1.5% ITM
+            target_strike = underlying_price * 0.99  # 1% below spot as target
+            
+            # Find strikes below spot price (ITM for CE)
+            itm_options = [opt for opt in options if opt["strike"] < underlying_price]
+            
+            if itm_options:
+                # Sort by strike descending (highest ITM strike first)
+                itm_options.sort(key=lambda x: x["strike"], reverse=True)
+                
+                # Pick the strike closest to target (typically 1-2 strikes ITM)
+                best_option = min(itm_options, key=lambda x: abs(x["strike"] - target_strike))
             else:
-                target_strike = underlying_price * 0.98  # 2% OTM
-
-            diff = abs(strike - target_strike)
-
-            if diff < best_diff:
-                best_diff = diff
-                best_option = opt
+                # Fallback: if no ITM available, pick nearest strike
+                best_option = min(options, key=lambda x: abs(x["strike"] - underlying_price))
+                
+        else:  # BEAR
+            # For BEAR (PE): Select strike above spot (ITM)
+            # Target: 1-2 strikes above spot, roughly 0.5-1.5% ITM
+            target_strike = underlying_price * 1.01  # 1% above spot as target
+            
+            # Find strikes above spot price (ITM for PE)
+            itm_options = [opt for opt in options if opt["strike"] > underlying_price]
+            
+            if itm_options:
+                # Sort by strike ascending (lowest ITM strike first)
+                itm_options.sort(key=lambda x: x["strike"])
+                
+                # Pick the strike closest to target (typically 1-2 strikes ITM)
+                best_option = min(itm_options, key=lambda x: abs(x["strike"] - target_strike))
+            else:
+                # Fallback: if no ITM available, pick nearest strike
+                best_option = min(options, key=lambda x: abs(x["strike"] - underlying_price))
 
         if not best_option:
             return None, "no_suitable_option"
 
         logger.info(
             f"Selected option: {best_option['symbol']} | Strike: {best_option['strike']} | "
+            f"Underlying: {underlying_price:.2f} | "
+            f"ITM by: {abs(best_option['strike'] - underlying_price):.2f} | "
             f"Expiry: {best_option['expiry']} | Lot Size: {best_option['lot_size']}"
         )
 
