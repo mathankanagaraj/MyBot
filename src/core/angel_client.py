@@ -18,6 +18,7 @@ from core.config import (
     SCRIP_MASTER_URL,
 )
 from core.logger import logger
+from core.rate_limiter import APIRateLimiter
 
 
 class AngelClient:
@@ -26,7 +27,7 @@ class AngelClient:
     Handles authentication, data fetching, and order execution.
     """
 
-    def __init__(self):
+    def __init__(self, enable_rate_limiting: bool = True):
         self.api_key = ANGEL_API_KEY
         self.client_code = ANGEL_CLIENT_CODE
         self.password = ANGEL_PASSWORD
@@ -44,6 +45,9 @@ class AngelClient:
         self.symbol_cache = {}
 
         self.alert_sent = False
+        
+        # API Rate Limiter (90% of official limits for safety)
+        self.rate_limiter = APIRateLimiter(enabled=enable_rate_limiting, safety_margin=0.9)
 
     async def connect_async(self, retry_backoff=1.0, max_backoff=60.0):
         """
@@ -287,10 +291,33 @@ class AngelClient:
                 "todate": to_date_str,
             }
 
+            logger.debug(
+                f"[{symbol}] Requesting 1m data: {from_date_str} to {to_date_str} ({duration_days:.4f} days)"
+            )
+
+            # Rate limiting for getCandleData (3/sec, 180/min, 5000/hour)
+            await self.rate_limiter.acquire('getCandleData')
+            
             data = self.smart_api.getCandleData(historic_param)
 
             if not data or not data.get("data"):
-                logger.warning(f"No historical data returned for {symbol}")
+                # Check for specific error codes
+                if data and data.get("errorcode"):
+                    error_code = data.get("errorcode")
+                    error_msg = data.get("message", "Unknown error")
+                    
+                    if error_code == "AB1004":
+                        logger.warning(
+                            f"[{symbol}] ⚠️ API Rate Limit (AB1004): {error_msg}. "
+                            f"Request: {from_date_str} to {to_date_str}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[{symbol}] API Error {error_code}: {error_msg}. "
+                            f"Request: {from_date_str} to {to_date_str}"
+                        )
+                else:
+                    logger.warning(f"No historical data returned for {symbol}")
                 return None
 
             # Convert to DataFrame
@@ -314,11 +341,19 @@ class AngelClient:
             for col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            logger.info(f"Fetched {len(df)} 1m candles for {symbol}")
+            logger.debug(f"[{symbol}] Successfully fetched {len(df)} 1m candles")
             return df
 
         except Exception as e:
-            logger.exception(f"Error fetching historical data for {symbol}: {e}")
+            error_str = str(e)
+            
+            # Detect rate limiting in exception message
+            if "AB1004" in error_str or "Try After Sometime" in error_str:
+                logger.error(
+                    f"[{symbol}] 🚫 API Rate Limit Exception: {error_str[:200]}"
+                )
+            else:
+                logger.exception(f"Error fetching historical data for {symbol}: {e}")
             return None
 
     async def get_last_price(self, symbol: str, exchange: str = "NSE") -> Optional[float]:
@@ -337,6 +372,9 @@ class AngelClient:
             if not symbol_token:
                 return None
 
+            # Rate limiting for ltpData (10/sec, 500/min, 5000/hour)
+            await self.rate_limiter.acquire('ltpData')
+            
             # Use LTP API
             ltp_data = self.smart_api.ltpData(exchange, symbol, symbol_token)
 
@@ -398,6 +436,9 @@ class AngelClient:
                 logger.warning(f"Current monthly futures not found for {symbol}")
                 return None
 
+            # Rate limiting for ltpData (10/sec, 500/min, 5000/hour)
+            await self.rate_limiter.acquire('ltpData')
+            
             # Get LTP for futures
             ltp_data = self.smart_api.ltpData("NFO", futures_symbol, futures_token)
 
@@ -545,12 +586,11 @@ class AngelClient:
 
             logger.info(f"Bracket order placed: {result}")
             return result
-
         except Exception as e:
             logger.exception(f"Error placing bracket order: {e}")
             return None
 
-    def get_positions(self) -> List[Dict]:
+    async def get_positions(self) -> List[Dict]:
         """
         Get current open positions.
 
@@ -558,6 +598,9 @@ class AngelClient:
             List of position dicts
         """
         try:
+            # Rate limiting for getPosition (1/sec)
+            await self.rate_limiter.acquire('getPosition')
+            
             response = self.smart_api.position()
 
             if response and response.get("data"):
@@ -577,6 +620,9 @@ class AngelClient:
             Dict with account details
         """
         try:
+            # Rate limiting for getRMS (2/sec)
+            await self.rate_limiter.acquire('getRMS')
+            
             # Get RMS Limits (Risk Management System)
             rms = self.smart_api.rmsLimit()
 

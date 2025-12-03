@@ -37,22 +37,23 @@ def is_candle_complete(candle_time, timeframe, current_time):
 def get_next_candle_close_time(current_time, timeframe):
     """
     Calculate the next candle close time for a given timeframe.
+    Works with both naive and timezone-aware datetimes.
     
     Args:
-        current_time: Current datetime
+        current_time: Current datetime (naive or timezone-aware)
         timeframe: '5min' or '15min'
         
     Returns:
-        datetime: Next candle close time
+        datetime: Next candle close time (preserves timezone if input was aware)
         
     Example:
-        current_time = 09:22:30
+        current_time = 14:37:30 IST
         timeframe = '5min'
-        Returns: 09:25:00 (next 5m boundary)
+        Returns: 14:40:00 IST (next 5m boundary)
         
-        current_time = 09:22:30
+        current_time = 14:37:30 IST
         timeframe = '15min'
-        Returns: 09:30:00 (next 15m boundary)
+        Returns: 14:45:00 IST (next 15m boundary)
     """
     if timeframe == '5min':
         interval_minutes = 5
@@ -77,19 +78,20 @@ def get_next_candle_close_time(current_time, timeframe):
 def get_seconds_until_next_close(current_time, timeframe):
     """
     Get seconds to wait until next candle close.
+    Works with both naive and timezone-aware datetimes.
     
     Args:
-        current_time: Current datetime
+        current_time: Current datetime (naive or timezone-aware)
         timeframe: '5min' or '15min'
         
     Returns:
         int: Seconds to wait (minimum 5 seconds to avoid edge cases)
         
     Example:
-        current_time = 09:22:30
+        current_time = 14:37:30 IST
         timeframe = '5min'
-        next_close = 09:25:00
-        Returns: 150 seconds
+        next_close = 14:40:00 IST
+        Returns: 155 seconds (150 + 5 buffer)
     """
     next_close = get_next_candle_close_time(current_time, timeframe)
     seconds = (next_close - current_time).total_seconds()

@@ -1,6 +1,7 @@
 # core/worker.py
 import asyncio
-from datetime import datetime, timedelta
+from datetime import timedelta
+import pytz
 
 from core.angel_client import AngelClient
 from core.bar_manager import BarManager
@@ -26,10 +27,17 @@ from core.signal_engine import (
     get_next_candle_close_time,
     get_seconds_until_next_close,
 )
-from core.utils import init_audit_file, is_market_open, send_telegram, write_audit_row
+from core.utils import (
+    init_audit_file,
+    is_market_open,
+    send_telegram,
+    write_audit_row,
+    get_ist_now,
+)
 
 _STOP = False
 _LAST_MARKET_OPEN_STATE = None
+_LAST_HEARTBEAT = {}
 
 
 def compute_stop_target(entry_price):
@@ -48,9 +56,11 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
     """
     Main worker loop for each symbol.
     Monitors market, detects signals, and executes trades.
+    Ensures 15m boundary checks happen at proper times regardless of bot start time.
     """
     logger.info("[%s] 🚀 Worker started", symbol)
     last_15m_signal_time = None
+    _LAST_HEARTBEAT[symbol] = get_ist_now()
 
     while not _STOP:
         try:
@@ -62,13 +72,26 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
             from core.config import MARKET_HOURS_ONLY
 
             if MARKET_HOURS_ONLY and not is_open:
+                logger.debug("[%s] 💤 Market closed, sleeping 5 minutes...", symbol)
                 await asyncio.sleep(300)  # Sleep 5 minutes if market closed
                 continue
+
+            # Heartbeat logging every 15 minutes
+            now_ist = get_ist_now()
+            if (now_ist - _LAST_HEARTBEAT[symbol]).total_seconds() > 900:  # 15 minutes
+                logger.info(
+                    "[%s] 💓 Heartbeat - IST: %s, Market: %s, Position: %s",
+                    symbol,
+                    now_ist.strftime("%H:%M:%S"),
+                    "OPEN" if is_open else "CLOSED",
+                    "YES" if symbol in cash_mgr.open_positions else "NO",
+                )
+                _LAST_HEARTBEAT[symbol] = now_ist
 
             # Check if we already have an open position for this symbol
             if symbol in cash_mgr.open_positions:
                 # Poll for position closure via Angel API
-                positions = angel_client.get_positions()
+                positions = await angel_client.get_positions()
                 has_pos = False
 
                 for p in positions:
@@ -84,23 +107,28 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
-            # Get current time for candle completion checks
-            now = datetime.utcnow()
+            # Get current time in IST for proper boundary detection
+            now_ist = get_ist_now()
             
-            # Wait until next 15m candle close before checking bias
-            next_15m_close = get_next_candle_close_time(now, '15min')
-            sleep_seconds = get_seconds_until_next_close(now, '15min')
+            # CRITICAL: Wait until next 15m candle close before checking bias
+            # This ensures we always check at proper 15m boundaries (09:15, 09:30, 09:45, etc.)
+            # regardless of when the bot started
+            next_15m_close = get_next_candle_close_time(now_ist, '15min')
+            sleep_seconds = get_seconds_until_next_close(now_ist, '15min')
             
             logger.info(
-                "[%s] ⏰ Waiting for 15m close at %s",
+                "[%s] ⏰ Waiting for 15m close at %s IST (sleeping %ds)",
                 symbol,
                 next_15m_close.strftime("%H:%M:%S"),
+                sleep_seconds,
             )
             await asyncio.sleep(sleep_seconds)
             
             # Now we're at a 15m boundary - get latest bars with complete candles only
-            now = datetime.utcnow()
-            df5, df15 = await bar_manager.get_resampled(current_time=now)
+            now_ist = get_ist_now()
+            # Convert IST to UTC for bar_manager (it expects UTC)
+            now_utc = now_ist.astimezone(pytz.UTC).replace(tzinfo=None)
+            df5, df15 = await bar_manager.get_resampled(current_time=now_utc)
 
             if df15.empty:
                 logger.warning("[%s] ⚠️ No 15m data available, waiting...", symbol)
@@ -108,18 +136,24 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 continue
 
             # Detect 15m bias at candle close
-            logger.info("[%s] 🔍 Checking 15m bias (bars: 5m=%d, 15m=%d)...", symbol, len(df5), len(df15))
+            logger.info(
+                "[%s] 🔍 Checking 15m bias at %s IST (bars: 5m=%d, 15m=%d)...",
+                symbol,
+                now_ist.strftime("%H:%M:%S"),
+                len(df5),
+                len(df15),
+            )
             bias = detect_15m_bias(df15)
             
             if not bias:
                 continue  # No bias, loop will wait for next 15m close
 
-            logger.info("[%s] ✅ 15m bias detected: %s", symbol, bias)
+            logger.info("[%s] ✅ 15m bias detected: %s at %s IST", symbol, bias, now_ist.strftime("%H:%M:%S"))
 
             # Avoid duplicate triggers
-            now = datetime.utcnow()
-            if last_15m_signal_time and (now - last_15m_signal_time) < timedelta(minutes=15):
-                time_since_last = (now - last_15m_signal_time).total_seconds() / 60
+            now_ist = get_ist_now()
+            if last_15m_signal_time and (now_ist - last_15m_signal_time) < timedelta(minutes=15):
+                time_since_last = (now_ist - last_15m_signal_time).total_seconds() / 60
                 logger.info(
                     "[%s] ⏭️ Skipping duplicate signal (%.1f min since last), sleeping 60s...",
                     symbol,
@@ -129,9 +163,14 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 continue
 
             # Notify 15m bias found
-            logger.info("[%s] 🎯 NEW 15m signal: %s - Starting 5m entry search...", symbol, bias)
-            send_telegram(f"📊 [{symbol}] 15m Trend: {bias}. Looking for 5m entry...")
-            last_15m_signal_time = now
+            logger.info(
+                "[%s] 🎯 NEW 15m signal: %s at %s IST - Starting 5m entry search...",
+                symbol,
+                bias,
+                now_ist.strftime("%H:%M:%S"),
+            )
+            send_telegram(f"📊 [{symbol}] 15m Trend: {bias} at {now_ist.strftime('%H:%M')} IST. Looking for 5m entry...")
+            last_15m_signal_time = now_ist
 
             checks = 0
             entered = False
@@ -141,23 +180,26 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
             while checks < MAX_5M_CHECKS and not entered and not _STOP:
                 checks += 1
                 
-                # Wait for next 5m candle close
-                now = datetime.utcnow()
-                next_5m_close = get_next_candle_close_time(now, '5min')
-                sleep_seconds = get_seconds_until_next_close(now, '5min')
+                # Wait for next 5m candle close (use IST for display)
+                now_ist = get_ist_now()
+                next_5m_close = get_next_candle_close_time(now_ist, '5min')
+                sleep_seconds = get_seconds_until_next_close(now_ist, '5min')
                 
                 logger.info(
-                    "[%s] ⏰ 5m check #%d - waiting for %s",
+                    "[%s] ⏰ 5m check #%d - waiting for %s IST (sleeping %ds)",
                     symbol,
                     checks,
                     next_5m_close.strftime("%H:%M:%S"),
+                    sleep_seconds,
                 )
                 await asyncio.sleep(sleep_seconds)
 
                 # Get fresh data at 5m boundary with complete candles only
-                now = datetime.utcnow()
-                df5_new, df15_new = await bar_manager.get_resampled(current_time=now)
+                now_ist = get_ist_now()
+                now_utc = now_ist.astimezone(pytz.UTC).replace(tzinfo=None)
+                df5_new, df15_new = await bar_manager.get_resampled(current_time=now_utc)
                 if df5_new.empty or df15_new.empty:
+                    logger.debug("[%s] ⚠️ Empty dataframe at 5m check #%d", symbol, checks)
                     continue
 
                 # Revalidate 15m bias hasn't flipped
@@ -283,7 +325,7 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
 
                 # Write audit
                 write_audit_row(
-                    timestamp=datetime.utcnow().isoformat(),
+                    timestamp=get_ist_now().isoformat(),
                     symbol=symbol,
                     bias=bias,
                     option=opt_contract["symbol"],
@@ -310,21 +352,57 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
     logger.info("[%s] 🛑 Worker exiting", symbol)
 
 
-async def data_fetcher_loop(symbol, angel_client, bar_manager):
+async def data_fetcher_loop(symbol, angel_client, bar_manager, symbol_index=0):
     """
-    Background task that fetches new 1-minute bars every 5 minutes.
-    This keeps the BarManager updated with fresh data.
+    Background task that fetches new 1-minute bars aligned to 5-minute boundaries.
+    Only fetches during market hours to avoid wasting API calls.
+    Fetches 15 minutes of data with overlap to ensure no gaps.
+    
+    Args:
+        symbol: Symbol to fetch data for
+        angel_client: Angel API client
+        bar_manager: Bar manager for this symbol
+        symbol_index: Index of symbol in list (for staggered startup)
     """
+    from core.config import MARKET_HOURS_ONLY
+    
+    # Stagger initial startup to prevent hitting rate limits during initialization
+    # This only affects the first fetch, subsequent fetches are aligned to 5-min boundaries
+    startup_delay = symbol_index * 0.4  # 400ms between each symbol
+    if startup_delay > 0:
+        logger.info("[%s] 📡 Data fetcher starting in %.1fs (staggered)", symbol, startup_delay)
+        await asyncio.sleep(startup_delay)
+    
     logger.info("[%s] 📡 Data fetcher started", symbol)
+    retry_count = 0
 
     while not _STOP:
         try:
-
+            now_ist = get_ist_now()
+            
+            # Check if market is open (only fetch during market hours)
+            if MARKET_HOURS_ONLY and not is_market_open():
+                # Market is closed, sleep until next 5-minute boundary and check again
+                # This avoids wasting API calls and creating log noise
+                next_check = get_next_candle_close_time(now_ist, '5min')
+                sleep_seconds = get_seconds_until_next_close(now_ist, '5min')
+                
+                logger.debug(
+                    "[%s] 💤 Market closed, data fetcher sleeping until %s IST",
+                    symbol,
+                    next_check.strftime("%H:%M:%S"),
+                )
+                await asyncio.sleep(sleep_seconds)
+                continue
+            
+            # Market is open - fetch data
             # Fetch last 15 minutes of data to ensure we don't miss any bars
-            df_new = await angel_client.req_historic_1m(symbol, duration_days=0.01)  # ~15 minutes
+            # 0.0104 days = 15 minutes exactly
+            df_new = await angel_client.req_historic_1m(symbol, duration_days=0.0104)
 
             if df_new is not None and not df_new.empty:
                 # Add new bars to BarManager
+                bars_added = 0
                 for idx, row in df_new.iterrows():
                     bar_dict = {
                         'datetime': idx,
@@ -335,13 +413,59 @@ async def data_fetcher_loop(symbol, angel_client, bar_manager):
                         'volume': row['volume']
                     }
                     await bar_manager.add_bar(bar_dict)
+                    bars_added += 1
+                
+                logger.info(
+                    "[%s] 📊 Fetched %d 1m candles at %s IST",
+                    symbol,
+                    len(df_new),
+                    now_ist.strftime("%H:%M:%S"),
+                )
+                retry_count = 0  # Reset retry counter on success
+            else:
+                logger.warning(
+                    "[%s] ⚠️ No data returned from API at %s IST (market open)",
+                    symbol,
+                    now_ist.strftime("%H:%M:%S"),
+                )
 
-            # Sleep for 5 minutes before next fetch
-            await asyncio.sleep(300)  # 5 minutes
+            # Sleep until next 5-minute boundary (00, 05, 10, 15, 20, 25, etc.)
+            # This ensures all symbols fetch at synchronized times
+            now_ist = get_ist_now()
+            next_fetch = get_next_candle_close_time(now_ist, '5min')
+            sleep_seconds = get_seconds_until_next_close(now_ist, '5min')
+            
+            logger.debug(
+                "[%s] ⏰ Next data fetch at %s IST (sleeping %ds)",
+                symbol,
+                next_fetch.strftime("%H:%M:%S"),
+                sleep_seconds,
+            )
+            await asyncio.sleep(sleep_seconds)
 
         except Exception as e:
-            logger.exception("[%s] ❌ Data fetcher exception: %s", symbol, e)
-            await asyncio.sleep(60)  # Retry after 1 minute on error
+            retry_count += 1
+            logger.exception(
+                "[%s] ❌ Data fetcher exception (retry #%d) at %s IST: %s",
+                symbol,
+                retry_count,
+                get_ist_now().strftime("%H:%M:%S"),
+                e,
+            )
+            
+            # Check if it's a rate limiting error
+            error_str = str(e).lower()
+            if "ab1004" in error_str or "try after sometime" in error_str:
+                logger.warning(
+                    "[%s] 🚫 API rate limit detected, waiting 2 minutes before retry...",
+                    symbol,
+                )
+                await asyncio.sleep(120)  # Wait 2 minutes for rate limiting
+            else:
+                # For other errors, wait until next 5-minute boundary
+                now_ist = get_ist_now()
+                sleep_seconds = get_seconds_until_next_close(now_ist, '5min')
+                await asyncio.sleep(sleep_seconds)
 
     logger.info("[%s] 🛑 Data fetcher exiting", symbol)
 
@@ -367,7 +491,7 @@ async def end_of_day_report(cash_mgr, angel_client):
         stats = await cash_mgr.get_daily_statistics()
         
         # Get open positions from Angel API
-        positions = angel_client.get_positions()
+        positions = await angel_client.get_positions()
         open_positions = [p for p in positions if p.get("netqty", "0") != "0"]
         
         # Calculate P&L percentage
@@ -492,12 +616,12 @@ async def run_all_workers():
     logger.info("📅 Starting end-of-day report scheduler...")
     tasks.append(schedule_end_of_day_report(cash_mgr, angel_client))
     
-    # Start data fetcher for each symbol (runs every 5 minutes)
-    logger.info("🚀 Starting background data fetchers (5-minute interval)...")
-    for symbol in SYMBOLS:
+    # Start data fetcher for each symbol (runs every 5 minutes with staggered startup)
+    logger.info("🚀 Starting background data fetchers (5-minute interval, staggered startup)...")
+    for idx, symbol in enumerate(SYMBOLS):
         bar_mgr = bar_managers.get(symbol)
-        tasks.append(data_fetcher_loop(symbol, angel_client, bar_mgr))
-        logger.info("[%s] 📡 Data fetcher thread started", symbol)
+        tasks.append(data_fetcher_loop(symbol, angel_client, bar_mgr, symbol_index=idx))
+        logger.info("[%s] 📡 Data fetcher thread queued (delay: %.1fs)", symbol, idx * 0.4)
     
     # Start worker loop for each symbol
     logger.info("🚀 Starting worker loops...")

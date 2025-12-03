@@ -81,6 +81,26 @@ METRICS = {"trades": 0, "opened": 0, "closed": 0, "errors": 0}
 IST = pytz.timezone("Asia/Kolkata")
 
 
+def get_ist_now():
+    """Get current time in IST timezone"""
+    return datetime.now(IST)
+
+
+def utc_to_ist(utc_dt):
+    """
+    Convert UTC datetime to IST datetime for display.
+    
+    Args:
+        utc_dt: datetime object (naive or UTC-aware)
+        
+    Returns:
+        IST-aware datetime
+    """
+    if utc_dt.tzinfo is None:
+        utc_dt = utc_dt.replace(tzinfo=pytz.utc)
+    return utc_dt.astimezone(IST)
+
+
 def is_market_open(now_utc=None):
     """
     Check if NSE market is open.
