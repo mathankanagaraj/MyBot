@@ -20,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 INDEX_FUTURES = ["NIFTY", "BANKNIFTY"]
 
 # Stock Symbols: Used for signal generation, then trade STOCK OPTIONS
-STOCK_SYMBOLS = ["RELIANCE", "INFY", "TCS", "ICICIBANK", "HDFCBANK"]
+STOCK_SYMBOLS = ["RELIANCE", "INFY", "TCS", "ICICIBANK", "HDFCBANK", "SBIN", "AXISBANK", "BHARTIARTL"]
 
 # All symbols to monitor (combined list)
 SYMBOLS = INDEX_FUTURES + STOCK_SYMBOLS
