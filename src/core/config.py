@@ -38,10 +38,10 @@ RISK_PCT_OF_PREMIUM = float(os.getenv("RISK_PCT_OF_PREMIUM", "0.20"))
 RR_RATIO = float(os.getenv("RR_RATIO", "2.0"))
 MIN_PREMIUM = float(os.getenv("MIN_PREMIUM", "5.0"))  # ₹5 minimum for Indian market
 
-# Position & Risk Limits
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "5000"))  # ₹5,000 daily loss limit
-MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "50000"))  # ₹50,000 max per position
-ALLOC_PCT = float(os.getenv("ALLOC_PCT", "0.70"))  # 70% of available funds
+# Position & Risk Limits (Percentage-based for scalability)
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))  # 5% of account balance
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.70"))  # 70% max per position
+ALLOC_PCT = float(os.getenv("ALLOC_PCT", "0.70"))  # 70% of available funds for all positions
 
 # Option Selection Parameters
 OPTION_MIN_DTE = int(os.getenv("OPTION_MIN_DTE", "2"))

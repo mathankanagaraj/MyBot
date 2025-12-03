@@ -10,8 +10,8 @@ from core.config import (
     ALLOC_PCT,
     MAX_5M_CHECKS,
     MAX_CONTRACTS_PER_TRADE,
-    MAX_DAILY_LOSS,
-    MAX_POSITION_SIZE,
+    MAX_DAILY_LOSS_PCT,
+    MAX_POSITION_PCT,
     MIN_PREMIUM,
     MONITOR_INTERVAL,
     RISK_PCT_OF_PREMIUM,
@@ -581,8 +581,8 @@ async def run_all_workers():
     cash_mgr = create_cash_manager(
         angel_client=angel_client,
         max_alloc_pct=ALLOC_PCT,
-        max_daily_loss=MAX_DAILY_LOSS,
-        max_position_size=MAX_POSITION_SIZE,
+        max_daily_loss_pct=MAX_DAILY_LOSS_PCT,
+        max_position_pct=MAX_POSITION_PCT,
     )
 
     # Initialize BarManagers for each symbol

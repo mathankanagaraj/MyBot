@@ -13,16 +13,16 @@ class LiveCashManager:
     """
 
     max_alloc_pct: float = 0.70
-    max_daily_loss: float = 5000.0  # ₹5,000 daily loss limit
-    max_position_size: float = 50000.0  # ₹50,000 max per position
+    max_daily_loss_pct: float = 0.05  # 5% daily loss limit
+    max_position_pct: float = 0.70  # 70% max per position
     open_positions: Dict[str, float] = field(default_factory=dict)
     daily_pnl: float = 0.0
 
-    def __init__(self, angel_client, max_alloc_pct=0.70, max_daily_loss=5000.0, max_position_size=50000.0):
+    def __init__(self, angel_client, max_alloc_pct=0.70, max_daily_loss_pct=0.05, max_position_pct=0.70):
         self.angel_client = angel_client
         self.max_alloc_pct = max_alloc_pct
-        self.max_daily_loss = max_daily_loss
-        self.max_position_size = max_position_size
+        self.max_daily_loss_pct = max_daily_loss_pct
+        self.max_position_pct = max_position_pct
         self.open_positions = {}
         self.daily_pnl = 0.0
         
@@ -48,9 +48,10 @@ class LiveCashManager:
             # Subtract currently used exposure
             current_exposure = sum(self.open_positions.values())
 
-            # Check daily loss limit
-            if abs(self.daily_pnl) >= self.max_daily_loss:
-                logger.warning(f"Daily loss limit reached: ₹{self.daily_pnl:.2f}")
+            # Check daily loss limit (percentage based)
+            max_daily_loss = avail_funds * self.max_daily_loss_pct
+            if abs(self.daily_pnl) >= max_daily_loss:
+                logger.warning(f"Daily loss limit reached: ₹{self.daily_pnl:.2f} (Limit: ₹{max_daily_loss:.2f})")
                 return 0.0
 
             available = max(0.0, max_allocation - current_exposure)
@@ -82,14 +83,20 @@ class LiveCashManager:
             logger.warning(f"Invalid cost: ₹{cost}")
             return False
 
-        # Check position size limit
-        if cost > self.max_position_size:
-            logger.warning(f"Position size ₹{cost:.2f} exceeds limit ₹{self.max_position_size:.2f}")
+        # Get account balance for limit calculations
+        balance_info = await self.get_account_balance()
+        avail_funds = balance_info["available_funds"]
+
+        # Check position size limit (percentage based)
+        max_position_size = avail_funds * self.max_position_pct
+        if cost > max_position_size:
+            logger.warning(f"Position size ₹{cost:.2f} exceeds limit ₹{max_position_size:.2f} ({self.max_position_pct*100}%)")
             return False
 
-        # Check daily loss limit
-        if abs(self.daily_pnl) >= self.max_daily_loss:
-            logger.warning(f"Daily loss limit reached: ₹{self.daily_pnl:.2f}")
+        # Check daily loss limit (percentage based)
+        max_daily_loss = avail_funds * self.max_daily_loss_pct
+        if abs(self.daily_pnl) >= max_daily_loss:
+            logger.warning(f"Daily loss limit reached: ₹{self.daily_pnl:.2f} (Limit: ₹{max_daily_loss:.2f})")
             return False
 
         # Check available exposure
@@ -238,15 +245,15 @@ class LiveCashManager:
         }
 
 
-def create_cash_manager(angel_client, max_alloc_pct=0.70, max_daily_loss=5000.0, max_position_size=50000.0):
+def create_cash_manager(angel_client, max_alloc_pct=0.70, max_daily_loss_pct=0.05, max_position_pct=0.70):
     """
     Create cash manager for Angel Broker (LIVE only).
 
     Args:
         angel_client: AngelClient instance
         max_alloc_pct: Maximum allocation percentage
-        max_daily_loss: Maximum daily loss in ₹
-        max_position_size: Maximum position size in ₹
+        max_daily_loss_pct: Maximum daily loss percentage
+        max_position_pct: Maximum position size percentage
 
     Returns:
         LiveCashManager instance
@@ -254,6 +261,6 @@ def create_cash_manager(angel_client, max_alloc_pct=0.70, max_daily_loss=5000.0,
     return LiveCashManager(
         angel_client=angel_client,
         max_alloc_pct=max_alloc_pct,
-        max_daily_loss=max_daily_loss,
-        max_position_size=max_position_size,
+        max_daily_loss_pct=max_daily_loss_pct,
+        max_position_pct=max_position_pct,
     )
