@@ -511,6 +511,43 @@ async def run_ibkr_workers():
     # Outer loop for connection management
     while not _STOP:
         try:
+            # Check for Market Close / Sleep Time FIRST
+            # This ensures we sleep even if disconnected (e.g. Gateway restart at close)
+            now_et = get_us_et_now()
+            if now_et.time() >= time(16, 0):
+                logger.info("[IBKR] 🌙 Market closed. Calculating sleep time...")
+
+                next_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+
+                # If it's already past 9:30 AM today, next open is tomorrow
+                if now_et >= next_open:
+                    next_open += timedelta(days=1)
+
+                # Handle weekends (if today is Friday, next open is Monday)
+                while next_open.weekday() > 4:  # If Sat or Sun
+                    next_open += timedelta(days=1)
+
+                sleep_seconds = (next_open - now_et).total_seconds()
+                sleep_hours = sleep_seconds / 3600
+
+                logger.info(
+                    f"[IBKR] 💤 Sleeping {sleep_hours:.1f} hours until next market open: "
+                    f"{next_open.strftime('%Y-%m-%d %H:%M:%S')} ET"
+                )
+                send_telegram(
+                    f"🌙 [IBKR] Market Closed. Sleeping {sleep_hours:.1f}h until {next_open.strftime('%H:%M')} ET"
+                )
+
+                # Sleep until 15 mins before open to allow for connection/warmup
+                warmup_seconds = 15 * 60
+                if sleep_seconds > warmup_seconds:
+                    await asyncio.sleep(sleep_seconds - warmup_seconds)
+                else:
+                    await asyncio.sleep(60)
+
+                logger.info("[IBKR] 🌅 Waking up for new trading day!")
+                continue
+
             # Connect to IB
             if not ibkr_client.connected:
                 logger.info("[IBKR] 🔄 Connecting to IB Gateway...")
@@ -577,39 +614,6 @@ async def run_ibkr_workers():
                 continue
 
             # Market closed - Sleep until next market open
-            logger.info("[IBKR] 🌙 Market closed. Calculating sleep time...")
-
-            now_et = get_us_et_now()
-            next_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-
-            # If it's already past 9:30 AM today, next open is tomorrow
-            if now_et >= next_open:
-                next_open += timedelta(days=1)
-
-            # Handle weekends (if today is Friday, next open is Monday)
-            # weekday(): 0=Mon, 4=Fri, 5=Sat, 6=Sun
-            while next_open.weekday() > 4:  # If Sat or Sun
-                next_open += timedelta(days=1)
-
-            sleep_seconds = (next_open - now_et).total_seconds()
-            sleep_hours = sleep_seconds / 3600
-
-            logger.info(
-                f"[IBKR] 💤 Sleeping {sleep_hours:.1f} hours until next market open: "
-                f"{next_open.strftime('%Y-%m-%d %H:%M:%S')} ET"
-            )
-            send_telegram(
-                f"🌙 [IBKR] Market Closed. Sleeping {sleep_hours:.1f}h until {next_open.strftime('%H:%M')} ET"
-            )
-
-            # Sleep until 15 mins before open to allow for connection/warmup
-            warmup_seconds = 15 * 60
-            if sleep_seconds > warmup_seconds:
-                await asyncio.sleep(sleep_seconds - warmup_seconds)
-            else:
-                await asyncio.sleep(60)
-
-            logger.info("[IBKR] 🌅 Waking up for new trading day!")
             # Loop continues to reconnect and start fresh
 
         except Exception as e:
