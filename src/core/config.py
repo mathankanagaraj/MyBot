@@ -9,7 +9,11 @@ load_dotenv()
 # ============================================================================
 # BROKER SELECTION
 # ============================================================================
-BROKER = os.getenv("BROKER", "ANGEL").upper()  # Options: ANGEL, IBKR, BOTH
+# With separate Docker containers, each container runs ONE broker:
+# - angel_bot container: BROKER=ANGEL
+# - ibkr_bot container: BROKER=IBKR
+# Note: BROKER=BOTH is deprecated (use separate containers instead)
+BROKER = os.getenv("BROKER", "ANGEL").upper()  # Options: ANGEL or IBKR
 
 # ============================================================================
 # ANGEL ONE CONFIGURATION
@@ -22,7 +26,16 @@ ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "")
 
 # Angel One Symbols (Indian Market)
 ANGEL_INDEX_FUTURES = ["NIFTY", "BANKNIFTY"]
-ANGEL_STOCK_SYMBOLS = ["RELIANCE", "INFY", "TCS", "ICICIBANK", "HDFCBANK", "SBIN", "AXISBANK", "BHARTIARTL"]
+ANGEL_STOCK_SYMBOLS = [
+    "RELIANCE",
+    "INFY",
+    "TCS",
+    "ICICIBANK",
+    "HDFCBANK",
+    "SBIN",
+    "AXISBANK",
+    "BHARTIARTL",
+]
 ANGEL_SYMBOLS = ANGEL_INDEX_FUTURES + ANGEL_STOCK_SYMBOLS
 
 # ============================================================================
@@ -31,10 +44,14 @@ ANGEL_SYMBOLS = ANGEL_INDEX_FUTURES + ANGEL_STOCK_SYMBOLS
 IB_HOST = os.getenv("IB_HOST", "host.docker.internal")
 IB_PORT = int(os.getenv("IB_PORT", "7497"))  # 7497=paper, 7496=live
 IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "109"))
-IBKR_PAPER_BALANCE = float(os.getenv("IBKR_PAPER_BALANCE", "10000"))  # Starting balance for paper
+IBKR_PAPER_BALANCE = float(
+    os.getenv("IBKR_PAPER_BALANCE", "10000")
+)  # Starting balance for paper
 
 # IBKR Symbols (US Market - Stock Options)
-IBKR_SYMBOLS_STR = os.getenv("IBKR_SYMBOLS", "SPY,QQQ,TSLA,NVDA,MSFT,GOOGL,AAPL,AMZN,META")
+IBKR_SYMBOLS_STR = os.getenv(
+    "IBKR_SYMBOLS", "SPY,QQQ,TSLA,NVDA,MSFT,GOOGL,AAPL,AMZN,META"
+)
 IBKR_SYMBOLS = [s.strip() for s in IBKR_SYMBOLS_STR.split(",")]
 
 # ============================================================================
@@ -56,8 +73,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # TRADING MODE
 # ============================================================================
 # Each broker has its own mode
-ANGEL_MODE = os.getenv("ANGEL_MODE", "LIVE").upper()  # Angel One: Always LIVE (no paper)
-IBKR_MODE = os.getenv("IBKR_MODE", "PAPER").upper()    # IBKR: PAPER or LIVE
+ANGEL_MODE = os.getenv(
+    "ANGEL_MODE", "LIVE"
+).upper()  # Angel One: Always LIVE (no paper)
+IBKR_MODE = os.getenv("IBKR_MODE", "PAPER").upper()  # IBKR: PAPER or LIVE
 
 # Legacy MODE for backward compatibility
 MODE = ANGEL_MODE  # For existing Angel One code
@@ -72,9 +91,13 @@ RR_RATIO = float(os.getenv("RR_RATIO", "2.0"))
 MIN_PREMIUM = float(os.getenv("MIN_PREMIUM", "5.0"))  # ₹5 for Indian, $5 for US
 
 # Position & Risk Limits (Percentage-based for scalability)
-MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))  # 5% of account balance
+MAX_DAILY_LOSS_PCT = float(
+    os.getenv("MAX_DAILY_LOSS_PCT", "0.05")
+)  # 5% of account balance
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.70"))  # 70% max per position
-ALLOC_PCT = float(os.getenv("ALLOC_PCT", "0.70"))  # 70% of available funds for all positions
+ALLOC_PCT = float(
+    os.getenv("ALLOC_PCT", "0.70")
+)  # 70% of available funds for all positions
 
 # ============================================================================
 # OPTION SELECTION PARAMETERS (Common for both brokers)
@@ -120,7 +143,11 @@ AUDIT_CSV = ANGEL_AUDIT_CSV
 # ============================================================================
 # MARKET HOURS & TIMEZONE
 # ============================================================================
-MARKET_HOURS_ONLY = os.getenv("MARKET_HOURS_ONLY", "true").lower() in ("1", "true", "yes")
+MARKET_HOURS_ONLY = os.getenv("MARKET_HOURS_ONLY", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Indian Market (Angel One)
 ANGEL_TIMEZONE = "Asia/Kolkata"

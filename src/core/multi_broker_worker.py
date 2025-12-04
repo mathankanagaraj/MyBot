@@ -575,36 +575,44 @@ async def run_ibkr_workers():
 
 async def run_multi_broker():
     """
-    Run both Angel One and IBKR workers based on BROKER configuration.
+    Run the broker worker based on BROKER configuration.
+    With separate containers, each container runs ONE broker:
+    - angel_bot container: Runs Angel One worker
+    - ibkr_bot container: Runs IBKR worker
     """
     global _STOP
 
-    logger.info(f"🚀 Multi-Broker mode: {BROKER}")
+    logger.info(f"🚀 Starting broker worker: {BROKER}")
 
-    tasks = []
-
-    if BROKER in ["ANGEL", "BOTH"]:
+    # With separate containers, run only the configured broker
+    if BROKER == "ANGEL":
         logger.info("[ANGEL] 🇮🇳 Starting Angel One worker...")
-        tasks.append(run_angel_workers())
+        try:
+            await run_angel_workers()
+        except asyncio.CancelledError:
+            logger.info("Angel worker cancelled")
+        except Exception as e:
+            logger.exception(f"Error in Angel worker: {e}")
+            send_telegram(f"🚨 Angel worker error: {str(e)[:100]}")
+        finally:
+            logger.info("👋 Angel worker shutdown complete")
 
-    if BROKER in ["IBKR", "BOTH"]:
+    elif BROKER == "IBKR":
         logger.info("[IBKR] 🇺🇸 Starting IBKR worker...")
-        tasks.append(run_ibkr_workers())
+        try:
+            await run_ibkr_workers()
+        except asyncio.CancelledError:
+            logger.info("IBKR worker cancelled")
+        except Exception as e:
+            logger.exception(f"Error in IBKR worker: {e}")
+            send_telegram(f"🚨 IBKR worker error: {str(e)[:100]}")
+        finally:
+            logger.info("👋 IBKR worker shutdown complete")
 
-    if not tasks:
-        logger.error(f"❌ Invalid BROKER configuration: {BROKER}")
-        send_telegram(f"❌ Invalid BROKER configuration: {BROKER}")
-        return
-
-    try:
-        await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        logger.info("Multi-broker tasks cancelled")
-    except Exception as e:
-        logger.exception(f"Error in multi-broker runner: {e}")
-        send_telegram(f"🚨 Multi-broker error: {str(e)[:100]}")
-    finally:
-        logger.info("👋 Multi-broker shutdown complete")
+    else:
+        error_msg = f"❌ Invalid BROKER configuration: {BROKER}. Must be ANGEL or IBKR"
+        logger.error(error_msg)
+        send_telegram(error_msg)
 
 
 def stop_all_workers():
@@ -612,6 +620,7 @@ def stop_all_workers():
     global _STOP
     _STOP = True
 
+    # Also stop Angel workers if applicable
     from core.worker import stop_all_workers as stop_angel_workers
 
     stop_angel_workers()

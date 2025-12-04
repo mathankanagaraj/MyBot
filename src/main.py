@@ -1,15 +1,10 @@
 import asyncio
 import signal
 
-from core.config import MODE, BROKER, ANGEL_MODE, IBKR_MODE
+from core.config import BROKER, ANGEL_MODE, IBKR_MODE
 from core.logger import setup_logging
 from core.utils import send_telegram
-
-# Import appropriate worker based on BROKER config
-if BROKER in ['IBKR', 'BOTH']:
-    from core.multi_broker_worker import run_multi_broker, stop_all_workers
-else:
-    from core.worker import run_all_workers, stop_all_workers
+from core.multi_broker_worker import run_multi_broker, stop_all_workers
 
 logger = setup_logging()
 
@@ -26,18 +21,20 @@ signal.signal(signal.SIGTERM, _signal_handler)
 
 
 def run():
-    if BROKER in ['IBKR', 'BOTH']:
-        logger.info(f"Starting Multi-Broker Bot (BROKER={BROKER}, Angel={ANGEL_MODE}, IBKR={IBKR_MODE}) [AsyncIO]")
-        send_telegram(f"🚀 Multi-Broker Bot Starting\n👼 Angel: {ANGEL_MODE}\n🏦 IBKR: {IBKR_MODE}")
+    # With separate containers, each runs a single broker
+    if BROKER == "ANGEL":
+        logger.info(f"🇮🇳 Starting Angel One Bot (Mode: {ANGEL_MODE}) [AsyncIO]")
+        send_telegram(f"🚀 Angel One Bot Starting (Mode: {ANGEL_MODE})")
+    elif BROKER == "IBKR":
+        logger.info(f"🇺🇸 Starting IBKR Bot (Mode: {IBKR_MODE}) [AsyncIO]")
+        send_telegram(f"🚀 IBKR Bot Starting (Mode: {IBKR_MODE})")
     else:
-        logger.info("Starting Intraday Options Bot (mode=%s) [AsyncIO]", MODE)
-        send_telegram(f"🚀 Bot Starting Up (Mode: {MODE})")
-    
+        logger.error(f"❌ Invalid BROKER setting: {BROKER}. Must be ANGEL or IBKR")
+        send_telegram(f"❌ Invalid BROKER: {BROKER}")
+        return
+
     try:
-        if BROKER in ['IBKR', 'BOTH']:
-            asyncio.run(run_multi_broker())
-        else:
-            asyncio.run(run_all_workers())
+        asyncio.run(run_multi_broker())
     except KeyboardInterrupt:
         pass
     except Exception as e:

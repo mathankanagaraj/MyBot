@@ -1,12 +1,31 @@
 services:
-  tradingbot:
-    build: .
-    container_name: intraday_options_bot
-
+  # Angel One Trading Bot - Indian Markets (IST)
+  angel_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.angel
+    container_name: angel_options_bot
     env_file: .env
     environment:
+      - TZ=Asia/Kolkata
+      - BROKER=ANGEL
+    volumes:
+      - ./logs:/app/logs
+      - ./audit:/app/audit
+    restart: "no" # Systemd manages restarts
+
+  # IBKR Trading Bot - US Markets (ET)
+  ibkr_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.ibkr
+    container_name: ibkr_options_bot
+    env_file: .env
+    environment:
+      - TZ=America/New_York
+      - BROKER=IBKR
       - IB_HOST=host.docker.internal
     volumes:
       - ./logs:/app/logs
       - ./audit:/app/audit
-    restart: "no" # Systemd manages restarts via timer and health check
+    restart: "no" # Systemd manages restarts

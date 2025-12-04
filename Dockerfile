@@ -1,4 +1,11 @@
 ###############################
+# DEPRECATED: This Dockerfile is no longer used.
+# Use Dockerfile.angel for Angel One broker (IST timezone)
+# Use Dockerfile.ibkr for IBKR broker (ET timezone)
+# See docker-compose.yml for the new architecture
+###############################
+
+###############################
 # Stage 1 — Build dependencies
 ###############################
 # Multi-platform support: automatically detects ARM64 or AMD64
