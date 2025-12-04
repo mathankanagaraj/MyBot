@@ -13,7 +13,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./audit:/app/audit
-    restart: "no" # Systemd manages restarts
+    restart: "unless-stopped" # Auto-restart on crash/reboot
 
   # IBKR Trading Bot - US Markets (ET)
   ibkr_bot:
@@ -30,4 +30,4 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./audit:/app/audit
-    restart: "no" # Systemd manages restarts
+    restart: "unless-stopped" # Auto-restart on crash/reboot
