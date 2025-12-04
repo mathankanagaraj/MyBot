@@ -311,6 +311,13 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
                 continue
 
             # Detect 15m bias
+            logger.info(
+                "[%s] 🕒 Checking 15m bias at %s ET (bars: 5m=%d, 15m=%d)...",
+                symbol,
+                now_et.strftime("%H:%M:%S"),
+                len(df5m),
+                len(df15m),
+            )
             bias = detect_15m_bias(df15m)
             if not bias:
                 logger.debug("[%s] No clear 15m bias", symbol)
@@ -397,6 +404,9 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
                     break
 
                 # Check 5m entry conditions at candle close
+                logger.info(
+                    "[%s] 🔎 Checking 5m entry conditions for %s bias...", symbol, bias
+                )
                 entry_ok, details = detect_5m_entry(df5_new, bias)
 
                 if not entry_ok:
@@ -492,6 +502,11 @@ async def run_ibkr_workers():
         bar_managers[symbol] = BarManager(symbol, max_bars=2880)
 
     send_telegram(f"🚀 [IBKR] Bot Started ({IBKR_MODE} Trading)")
+
+    # Start heartbeat task (same as Angel worker)
+    from core.worker import heartbeat_task
+
+    asyncio.create_task(heartbeat_task())
 
     # Outer loop for connection management
     while not _STOP:

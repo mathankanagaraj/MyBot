@@ -1,8 +1,6 @@
 ###############################
-# DEPRECATED: This Dockerfile is no longer used.
-# Use Dockerfile.angel for Angel One broker (IST timezone)
-# Use Dockerfile.ibkr for IBKR broker (ET timezone)
-# See docker-compose.yml for the new architecture
+# Shared Dockerfile for both Angel One and IBKR containers
+# Timezone and BROKER are set via docker-compose environment variables
 ###############################
 
 ###############################
