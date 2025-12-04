@@ -1,6 +1,5 @@
 # core/angel_client.py
 import asyncio
-import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -242,7 +241,8 @@ class AngelClient:
 
             # Search in scrip master
             for instrument in self.scrip_master or []:
-                if instrument.get("name") == symbol and instrument.get("exch_seg") == exchange:
+                # Check against 'name' (underlying) OR 'symbol' (trading symbol)
+                if (instrument.get("name") == symbol or instrument.get("symbol") == symbol) and instrument.get("exch_seg") == exchange:
                     token = instrument.get("token")
                     self.symbol_cache[key] = instrument
                     return token
@@ -298,7 +298,11 @@ class AngelClient:
             # Rate limiting for getCandleData (3/sec, 180/min, 5000/hour)
             await self.rate_limiter.acquire('getCandleData')
             
-            data = self.smart_api.getCandleData(historic_param)
+            # Add timeout to prevent indefinite blocking
+            data = await asyncio.wait_for(
+                asyncio.to_thread(self.smart_api.getCandleData, historic_param),
+                timeout=10.0
+            )
 
             if not data or not data.get("data"):
                 # Check for specific error codes
@@ -375,8 +379,11 @@ class AngelClient:
             # Rate limiting for ltpData (10/sec, 500/min, 5000/hour)
             await self.rate_limiter.acquire('ltpData')
             
-            # Use LTP API
-            ltp_data = self.smart_api.ltpData(exchange, symbol, symbol_token)
+            # Use LTP API with timeout
+            ltp_data = await asyncio.wait_for(
+                asyncio.to_thread(self.smart_api.ltpData, exchange, symbol, symbol_token),
+                timeout=5.0
+            )
 
             if ltp_data and ltp_data.get("data"):
                 return float(ltp_data["data"]["ltp"])
@@ -453,7 +460,7 @@ class AngelClient:
             logger.exception(f"Error getting futures price for {symbol}: {e}")
             return None
 
-    def place_order(
+    async def place_order(
         self,
         symbol: str,
         token: str,
@@ -496,7 +503,10 @@ class AngelClient:
             if order_type == "LIMIT":
                 order_params["price"] = str(price)
 
-            response = self.smart_api.placeOrder(order_params)
+            response = await asyncio.wait_for(
+                asyncio.to_thread(self.smart_api.placeOrder, order_params),
+                timeout=10.0
+            )
 
             if response and response.get("status"):
                 logger.info(f"Order placed: {response}")
@@ -509,7 +519,7 @@ class AngelClient:
             logger.exception(f"Error placing order: {e}")
             return None
 
-    def place_bracket_order(
+    async def place_bracket_order(
         self,
         option_symbol: str,
         option_token: str,
@@ -538,7 +548,7 @@ class AngelClient:
         """
         try:
             # Place entry order (Market BUY)
-            entry_order = self.place_order(
+            entry_order = await self.place_order(
                 symbol=option_symbol,
                 token=option_token,
                 exchange=exchange,
@@ -554,10 +564,10 @@ class AngelClient:
             entry_order_id = entry_order["data"]["orderid"]
 
             # Wait a bit for entry order to fill
-            time.sleep(1)
+            await asyncio.sleep(1)
 
             # Place stop-loss order (Stop-loss SELL)
-            sl_order = self.place_order(
+            sl_order = await self.place_order(
                 symbol=option_symbol,
                 token=option_token,
                 exchange=exchange,
@@ -568,7 +578,7 @@ class AngelClient:
             )
 
             # Place target order (Limit SELL)
-            target_order = self.place_order(
+            target_order = await self.place_order(
                 symbol=option_symbol,
                 token=option_token,
                 exchange=exchange,

@@ -118,7 +118,9 @@ def is_market_open(now_utc=None):
     open_t = dtime(NSE_MARKET_OPEN_HOUR, NSE_MARKET_OPEN_MINUTE)
     close_t = dtime(NSE_MARKET_CLOSE_HOUR, NSE_MARKET_CLOSE_MINUTE)
 
-    is_open = open_t <= now_ist.time() <= close_t
+    # Strict check: Open if time is >= 9:15 AND < 15:30
+    # We use < 15:30 because at 15:30:00 market is technically closed for new candle formation
+    is_open = open_t <= now_ist.time() < close_t
 
     if not is_open:
         logger.debug(
