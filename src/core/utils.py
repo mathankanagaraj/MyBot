@@ -74,16 +74,24 @@ def write_audit_row(**kwargs):
         )
 
 
+
+
 # simple metrics aggregator
 METRICS = {"trades": 0, "opened": 0, "closed": 0, "errors": 0}
 
-# Market hours (IST - Indian Standard Time)
+# Timezone constants
 IST = pytz.timezone("Asia/Kolkata")
+US_ET = pytz.timezone("America/New_York")
 
 
 def get_ist_now():
     """Get current time in IST timezone"""
     return datetime.now(IST)
+
+
+def get_us_et_now():
+    """Get current time in US Eastern timezone"""
+    return datetime.now(US_ET)
 
 
 def utc_to_ist(utc_dt):

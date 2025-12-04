@@ -237,7 +237,7 @@ Requires=docker.service
 Type=oneshot
 User=root
 ExecStart=/bin/bash -c '\
-    if ! docker ps | grep -q intraday_options_bot_angel; then \
+    if ! docker ps | grep -q intraday_options_bot; then \\
         /usr/local/bin/tg.sh "⚠️ Bot container is not running! Attempting restart..."; \
         cd /opt/intraday_bot && docker compose up -d --build; \
     fi'
@@ -338,7 +338,7 @@ log "NEXT STEPS:"
 log "1. Edit /etc/default/intraday-bot with your actual credentials"
 log "2. Run: sudo /usr/local/bin/create_env.sh"
 log "3. Test manually: sudo systemctl start intraday-bot-start.service"
-log "4. Check logs: docker logs intraday_options_bot_angel"
+log "4. Check logs: docker logs intraday_options_bot"
 log "5. Verify timers: systemctl list-timers"
 log ""
 log "Bot will automatically start at 09:00 and stop at 15:45 IST (Mon-Fri)"
