@@ -199,18 +199,84 @@ class IBKRClient:
             max_strike = underlying_price * 1.2
             strikes = [s for s in chain.strikes if min_strike <= s <= max_strike]
 
-            # Get near-term expirations (within 7 days)
+            # Smart expiry selection: weekly > 2 DTE, or next week if needed
+            # For last week of month, prefer monthly expiry
             today = datetime.now()
-            near_expiries = [
-                exp
-                for exp in chain.expirations
-                if 2 <= (datetime.strptime(exp, "%Y%m%d") - today).days <= 7
-            ]
+
+            # Separate weekly and monthly expiries
+            weekly_expiries = []
+            monthly_expiries = []
+
+            for exp in chain.expirations:
+                exp_date = datetime.strptime(exp, "%Y%m%d")
+                dte = (exp_date - today).days
+
+                # Skip expiries that are too far out (> 30 days)
+                if dte > 30:
+                    continue
+
+                # Check if it's a monthly expiry (typically 3rd Friday of the month)
+                # Monthly expiries are usually in the 15-21 day range of the month
+                is_monthly = exp_date.day >= 15 and exp_date.day <= 21
+
+                if is_monthly:
+                    monthly_expiries.append((exp, dte))
+                else:
+                    weekly_expiries.append((exp, dte))
+
+            # Sort by DTE
+            weekly_expiries.sort(key=lambda x: x[1])
+            monthly_expiries.sort(key=lambda x: x[1])
+
+            # Determine if we're in the last week of the month
+            # Last week = current date > 21st of month
+            is_last_week_of_month = today.day > 21
+
+            selected_expiries = []
+
+            if is_last_week_of_month and monthly_expiries:
+                # Prefer monthly expiry if we're in last week of month
+                for exp, dte in monthly_expiries:
+                    if dte > 2:  # Must be > 2 DTE
+                        selected_expiries.append(exp)
+                        logger.info(
+                            f"[IBKR] [{symbol}] Selected monthly expiry: {exp} (DTE={dte})"
+                        )
+                        break
+
+            # If no monthly expiry selected (either not last week or monthly < 2 DTE),
+            # use weekly expiry logic
+            if not selected_expiries:
+                for exp, dte in weekly_expiries:
+                    if dte > 2:  # Must be > 2 DTE
+                        selected_expiries.append(exp)
+                        logger.info(
+                            f"[IBKR] [{symbol}] Selected weekly expiry: {exp} (DTE={dte})"
+                        )
+                        break
+
+            # Fallback: if still no expiry found, use the nearest one available
+            if not selected_expiries:
+                all_expiries = weekly_expiries + monthly_expiries
+                if all_expiries:
+                    exp, dte = min(
+                        all_expiries, key=lambda x: abs(x[1] - 3)
+                    )  # Aim for ~3 DTE
+                    selected_expiries.append(exp)
+                    logger.warning(
+                        f"[IBKR] [{symbol}] No expiries > 2 DTE found, using fallback: {exp} (DTE={dte})"
+                    )
+
+            near_expiries = selected_expiries
+
+            if not near_expiries:
+                logger.warning(f"[IBKR] [{symbol}] No suitable expiries found")
+                return []
 
             options = []
 
             # Create option contracts for each strike/expiry combination
-            for expiry in near_expiries[:3]:  # Limit to 3 nearest expiries
+            for expiry in near_expiries:  # Use the single selected expiry
                 for strike in strikes:
                     # Create CALL and PUT contracts
                     for right in ["C", "P"]:
