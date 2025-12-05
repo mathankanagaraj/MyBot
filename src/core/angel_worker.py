@@ -662,8 +662,8 @@ async def schedule_end_of_day_report(cash_mgr, angel_client):
     logger.info("📅 End-of-day report scheduler exiting")
 
 
-async def run_all_workers():
-    """Initialize and run all worker tasks in a daily loop"""
+async def run_angel_workers():
+    """Initialize and run all Angel One worker tasks in a daily loop"""
     global _STOP
 
     logger.info("🤖 Bot process started")
@@ -841,8 +841,8 @@ async def run_all_workers():
         await heartbeat
 
 
-def stop_all_workers():
-    """Stop all worker tasks"""
+def stop_angel_workers():
+    """Stop all Angel One worker tasks"""
     global _STOP
     _STOP = True
 

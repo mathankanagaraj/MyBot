@@ -675,7 +675,7 @@ async def run_ibkr_workers():
     logger.info("[IBKR] 👋 Disconnected from IBKR")
 
 
-def stop_all_workers():
+def stop_ibkr_workers():
     """Stop all IBKR workers"""
     global _STOP
     _STOP = True
