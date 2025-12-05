@@ -53,6 +53,7 @@ IBKR_SYMBOLS_STR = os.getenv(
     "IBKR_SYMBOLS", "SPY,QQQ,TSLA,NVDA,MSFT,GOOGL,AAPL,AMZN,META"
 )
 IBKR_SYMBOLS = [s.strip() for s in IBKR_SYMBOLS_STR.split(",")]
+IBKR_QUANTITY = int(os.getenv("IBKR_QUANTITY", "1"))  # Number of contracts per trade
 
 # ============================================================================
 # LEGACY COMPATIBILITY (for Angel-only code paths)

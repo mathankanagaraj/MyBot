@@ -282,44 +282,95 @@ def detect_15m_bias(df15):
 def detect_5m_entry(df5, bias):
     if df5 is None or len(df5) < 4:
         return False, {"reason": "insufficient_data"}
+
     last = df5.iloc[-2]  # Closed candle
+    prev = df5.iloc[-3]  # Previous closed candle
 
-    # 5m Confirmation
-    # VWAP > close (Again assuming Close > VWAP for Bull)
-    # EMA 21, 12 - cross over > close (Assuming EMA12 > EMA21 > Close ?? Or Price > EMA12 > EMA21)
-    # SMA(20) > close (Assuming Close > SMA20)
-    # MACD signal and Histogram in up trend
+    # 5m Confirmation Logic
+    # We use a strict "double confirmation" to avoid fakeouts.
+    # 1. Trend must match bias (Price vs VWAP/MA)
+    # 2. MOMENTUM: MACD must support the move
+    # 3. PRICE ACTION:
+    #    - Current candle must be colored correctly (Green for Bull, Red for Bear)
+    #    - PREVIOUS candle must ALSO be colored correctly (Stronger signal)
+    #    - Both candles should ideally be on the correct side of SMA20
 
-    # We don't have SMA20 in indicators yet, let's use EMA21 as proxy or calculate it on fly?
-    # Better to add SMA20 to indicators if strictly needed.
-    # But user said "SMA(20) > close".
-    # I'll use EMA21 as close enough or calculate SMA20 here.
-    sma20 = df5["close"].rolling(window=20).mean().iloc[-2]
+    # Calculate SMA20 if not present (using EMA21 as proxy in previous code, but let's be precise if possible)
+    # If indicators didn't add SMA20, we calculate it on the fly.
+    sma20_series = df5["close"].rolling(window=20).mean()
+    sma20_last = sma20_series.iloc[-2]
+    sma20_prev = sma20_series.iloc[-3]
 
     if bias == "BULL":
-        # Trend continues
+        # --- BULLISH ENTRY CONDITIONS ---
+
+        # 1. Price above VWAP
         cond_vwap = last["close"] > last["vwap"]
-        # EMA stacking: fast EMA above slow EMA indicates bullish momentum
+
+        # 2. EMA Stacking (9 > 21) indicating short-term uptrend
         cond_ema_stack = last["ema9"] > last["ema21"]
-        cond_sma = last["close"] > sma20
+
+        # 3. Price above SMA20 (Trend baseline)
+        cond_sma = last["close"] > sma20_last
+
+        # 4. MACD Bullish (Histogram Green + MACD > Signal)
         cond_macd = (last["macd_hist"] > 0) and (last["macd"] > last["macd_sig"])
 
-        # Candle Color Check: Must be GREEN for BULL
+        # 5. CANDLE COLOR & CONFIRMATION
+        # Current candle Green?
         cond_candle_color = last["close"] > last["open"]
+        # Previous candle Green? (Avoid buying on first green after red)
+        cond_prev_color = prev["close"] > prev["open"]
+        # Previous price also above SMA20? (Avoid buying immediately on the crossover candle, wait for hold)
+        cond_prev_sma = prev["close"] > sma20_prev
 
-        if all([cond_vwap, cond_ema_stack, cond_sma, cond_macd, cond_candle_color]):
+        if all(
+            [
+                cond_vwap,
+                cond_ema_stack,
+                cond_sma,
+                cond_macd,
+                cond_candle_color,
+                cond_prev_color,
+                cond_prev_sma,
+            ]
+        ):
             return True, {"price": last["close"], "type": "BULL"}
 
     elif bias == "BEAR":
+        # --- BEARISH ENTRY CONDITIONS ---
+
+        # 1. Price below VWAP
         cond_vwap = last["close"] < last["vwap"]
+
+        # 2. EMA Stacking (9 < 21)
         cond_ema_stack = last["ema9"] < last["ema21"]
-        cond_sma = last["close"] < sma20
+
+        # 3. Price below SMA20
+        cond_sma = last["close"] < sma20_last
+
+        # 4. MACD Bearish
         cond_macd = (last["macd_hist"] < 0) and (last["macd"] < last["macd_sig"])
 
-        # Candle Color Check: Must be RED for BEAR
+        # 5. CANDLE COLOR & CONFIRMATION
+        # Current candle Red?
         cond_candle_color = last["close"] < last["open"]
+        # Previous candle Red?
+        cond_prev_color = prev["close"] < prev["open"]
+        # Previous price also below SMA20?
+        cond_prev_sma = prev["close"] < sma20_prev
 
-        if all([cond_vwap, cond_ema_stack, cond_sma, cond_macd, cond_candle_color]):
+        if all(
+            [
+                cond_vwap,
+                cond_ema_stack,
+                cond_sma,
+                cond_macd,
+                cond_candle_color,
+                cond_prev_color,
+                cond_prev_sma,
+            ]
+        ):
             return True, {"price": last["close"], "type": "BEAR"}
 
     return False, {"reason": "conditions_not_met"}

@@ -140,42 +140,64 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
         get_seconds_until_next_close,
     )
     from core.ibkr_option_selector import find_ibkr_option_contract
-    from core.config import RR_RATIO, MAX_5M_CHECKS
+    from core.config import RR_RATIO, MAX_5M_CHECKS, IBKR_QUANTITY
 
     global _STOP
 
     logger.info("[%s] 👀 Signal monitor started", symbol)
     last_15m_signal_time = None
 
+    # Helper function to check if we already have a position for this symbol
+    async def has_position(sym):
+        try:
+            positions = await ibkr_client.get_positions()
+            found = False
+            for p in positions:
+                if p["symbol"] == sym and p["position"] != 0:
+                    found = True
+                    break
+                if sym in p["symbol"] and p["position"] != 0:
+                    found = True
+                    break
+
+            if found:
+                logger.debug(f"[{sym}] Position check: FOUND ✅")
+                return True
+            else:
+                logger.debug(
+                    f"[{sym}] Position check: NOT FOUND ❌ (Checked {len(positions)} positions)"
+                )
+                return False
+        except Exception as ex:
+            logger.error(f"[{sym}] Error checking positions: {ex}")
+            return False
+
     # STARTUP SIGNAL DETECTION: Check if there's a recent 15m signal we should act on
     try:
-        now_et = get_us_et_now()
-        if is_us_market_open():
-            df5_startup, df15_startup = await bar_manager.get_resampled()
-            if not df5_startup.empty and not df15_startup.empty:
-                startup_bias = detect_15m_bias(df15_startup)
-                if startup_bias:
-                    # Calculate how old this signal is
-                    latest_15m_time = df15_startup.index[-1]
-                    time_since_signal = (
-                        now_et.replace(tzinfo=None) - latest_15m_time
-                    ).total_seconds() / 60
-
-                    # If signal is recent (within last 30 minutes), act on it
-                    if time_since_signal <= 30:
+        if await has_position(symbol):
+            logger.info(
+                "[%s] ⏸️ Position already exists at startup, skipping startup entry search",
+                symbol,
+            )
+        else:
+            now_et = get_us_et_now()
+            if is_us_market_open():
+                df5_startup, df15_startup = await bar_manager.get_resampled()
+                if not df5_startup.empty and not df15_startup.empty:
+                    startup_bias = detect_15m_bias(df15_startup)
+                    if startup_bias:
+                        # We have a valid 15m bias on the most recent closed candle
+                        # Jump directly into 5m entry search
                         logger.info(
-                            "[%s] 🔍 STARTUP: Found recent 15m %s signal from %d mins ago - Starting 5m entry search",
+                            "[%s] 🔍 STARTUP: Detected 15m %s bias - Starting 5m entry search",
                             symbol,
                             startup_bias,
-                            int(time_since_signal),
                         )
                         send_telegram(
-                            f"🔍 [IBKR] [{symbol}] Startup detected recent 15m {startup_bias} signal "
-                            f"({int(time_since_signal)}m ago). Searching for entry..."
+                            f"🔍 [IBKR] [{symbol}] Startup detected 15m {startup_bias} bias. Searching for entry..."
                         )
                         last_15m_signal_time = now_et
 
-                        # Jump directly into 5m entry search
                         checks = 0
                         entered = False
 
@@ -236,11 +258,22 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
                                     symbol, "STOCK"
                                 )
                                 if stock_price:
-                                    option_info = await find_ibkr_option_contract(
-                                        ibkr_client, symbol, startup_bias, stock_price
+                                    option_info, reason = (
+                                        await find_ibkr_option_contract(
+                                            ibkr_client,
+                                            symbol,
+                                            startup_bias,
+                                            stock_price,
+                                        )
                                     )
 
-                                    if option_info:
+                                    if not option_info:
+                                        logger.warning(
+                                            "[%s] ⚠️ Startup: No option found: %s",
+                                            symbol,
+                                            reason,
+                                        )
+                                    else:
                                         premium = option_info.get("premium", 0)
                                         if premium > 0:
                                             stop_loss = premium * 0.8
@@ -258,12 +291,6 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
                                                 f"Target: ${target:.2f}"
                                             )
                                 entered = True
-                    else:
-                        logger.debug(
-                            "[%s] Recent 15m signal is %d mins old (too old)",
-                            symbol,
-                            int(time_since_signal),
-                        )
     except Exception as e:
         logger.exception("[%s] Error in startup signal detection: %s", symbol, e)
 
@@ -425,12 +452,12 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
                     continue
 
                 # Find option
-                option_info = await find_ibkr_option_contract(
+                option_info, reason = await find_ibkr_option_contract(
                     ibkr_client, symbol, bias, stock_price
                 )
 
                 if not option_info:
-                    logger.error("[%s] ❌ No suitable option found", symbol)
+                    logger.error("[%s] ❌ No suitable option found: %s", symbol, reason)
                     continue
 
                 premium = option_info.get("premium", 0)
