@@ -4,7 +4,7 @@ IBKR broker worker implementation.
 Handles US market trading with options via Interactive Brokers.
 """
 import asyncio
-from datetime import time, timedelta
+from datetime import time
 
 from core.config import IBKR_SYMBOLS
 from core.logger import logger
@@ -123,9 +123,250 @@ async def ibkr_data_fetcher(symbol, ibkr_client, bar_manager, symbol_index):
             await asyncio.sleep(60)
 
 
+async def execute_entry_order(symbol, bias, ibkr_client, context="ENTRY"):
+    """
+    Execute entry order with option selection and bracket order placement.
+
+    Args:
+        symbol: Stock symbol
+        bias: BULL or BEAR
+        ibkr_client: IBKR API client
+        context: "STARTUP" or "ENTRY" for logging
+
+    Returns:
+        True if order placed successfully, False otherwise
+    """
+    from core.ibkr_option_selector import find_ibkr_option_contract
+    from core.config import RR_RATIO, IBKR_QUANTITY
+
+    # Get stock price
+    stock_price = await ibkr_client.get_last_price(symbol, "STOCK")
+    if not stock_price:
+        logger.error("[%s] ❌ Failed to get stock price", symbol)
+        return False
+
+    # Find option
+    option_info, reason = await find_ibkr_option_contract(
+        ibkr_client, symbol, bias, stock_price
+    )
+
+    if not option_info:
+        logger.warning("[%s] ⚠️ %s: No option found: %s", symbol, context, reason)
+        return False
+
+    premium = option_info.get("premium", 0)
+    if premium <= 0:
+        logger.error("[%s] ❌ Invalid premium: $%.2f", symbol, premium)
+        return False
+
+    # Calculate bracket levels
+    stop_loss = premium * 0.8
+    target = premium * (1 + (0.2 * RR_RATIO))
+
+    logger.info(
+        f"[IBKR] [{symbol}] 📈 {context} Entry: ${premium:.2f}, "
+        f"SL: ${stop_loss:.2f}, Target: ${target:.2f}"
+    )
+
+    send_telegram(
+        f"🎯 [IBKR] {symbol} {bias} ({context})\n"
+        f"Entry: ${premium:.2f}\n"
+        f"SL: ${stop_loss:.2f}\n"
+        f"Target: ${target:.2f}"
+    )
+
+    # Place bracket order
+    logger.info(f"[IBKR] [{symbol}] 🚀 Placing {context} Bracket Order...")
+    order_ids = await ibkr_client.place_bracket_order(
+        option_info["contract"],
+        IBKR_QUANTITY,
+        stop_loss,
+        target,
+    )
+
+    if not order_ids:
+        logger.error(f"[IBKR] ❌ Failed to place {context} order for {symbol}")
+        send_telegram(f"🚨 [IBKR] {context} Order Placement Failed for {symbol}!")
+        return False
+
+    logger.info(f"[IBKR] ✅ Order placed! Entry ID: {order_ids.get('entry_order_id')}")
+    send_telegram(
+        f"🚀 [IBKR] {context} ORDER PLACED!\n"
+        f"Symbol: {symbol}\n"
+        f"Contract: {option_info['symbol']}\n"
+        f"Entry ID: {order_ids.get('entry_order_id')}\n"
+        f"SL ID: {order_ids.get('sl_order_id')}\n"
+        f"Target ID: {order_ids.get('target_order_id')}"
+    )
+
+    # Report balance
+    try:
+        summary = await ibkr_client.get_account_summary_async()
+        funds = summary.get("AvailableFunds", 0.0)
+        net_liq = summary.get("NetLiquidation", 0.0)
+        logger.info(f"[IBKR] Cash Balance: ${funds:,.2f} | Net Liq: ${net_liq:,.2f}")
+        send_telegram(
+            f"💰 [IBKR] Balance Update:\nCash: ${funds:,.2f}\nNet Liq: ${net_liq:,.2f}"
+        )
+    except Exception as exc:
+        logger.error(f"[IBKR] Failed to fetch balance: {exc}")
+
+    return True
+
+
+async def search_5m_entry(symbol, bias, ibkr_client, bar_manager, context="ENTRY"):
+    """
+    Search for 5m entry confirmation over multiple candles.
+
+    Args:
+        symbol: Stock symbol
+        bias: BULL or BEAR from 15m detection
+        ibkr_client: IBKR API client
+        bar_manager: Bar manager for this symbol
+        context: "STARTUP" or "ENTRY" for logging
+
+    Returns:
+        True if entry executed, False otherwise
+    """
+    from core.signal_engine import (
+        detect_15m_bias,
+        detect_5m_entry,
+        get_next_candle_close_time,
+        get_seconds_until_next_close,
+    )
+    from core.config import MAX_5M_CHECKS
+
+    global _STOP
+    checks = 0
+
+    while checks < MAX_5M_CHECKS and not _STOP:
+        checks += 1
+        now_et = get_us_et_now()
+
+        # Market close check
+        if now_et.time() >= time(16, 0):
+            logger.info(
+                "[%s] 🛑 Market closed, stopping %s entry search", symbol, context
+            )
+            return False
+
+        # Wait for next 5m candle close
+        next_5m_close = get_next_candle_close_time(now_et, "5min")
+        sleep_seconds = get_seconds_until_next_close(now_et, "5min")
+
+        logger.info(
+            "[%s] ⏰ %s 5m check #%d - waiting for %s ET (sleeping %ds)",
+            symbol,
+            context,
+            checks,
+            next_5m_close.strftime("%H:%M:%S"),
+            sleep_seconds,
+        )
+        await asyncio.sleep(sleep_seconds)
+
+        now_et = get_us_et_now()
+        if now_et.time() >= time(16, 0):
+            return False
+
+        # Get fresh data
+        df5_new, df15_new = await bar_manager.get_resampled()
+        if df5_new.empty or df15_new.empty:
+            logger.debug("[%s] ⚠️ Empty dataframe at 5m check #%d", symbol, checks)
+            continue
+
+        # Revalidate 15m bias
+        bias_now = detect_15m_bias(df15_new)
+        if bias_now != bias:
+            logger.warning(
+                "[%s] ⚠️ 15m bias changed %s → %s, aborting %s entry search",
+                symbol,
+                bias,
+                bias_now,
+                context,
+            )
+            send_telegram(
+                f"⚠️ [IBKR] [{symbol}] {context}: 15m bias changed {bias} → {bias_now}, aborting"
+            )
+            return False
+
+        # Check 5m entry
+        entry_ok, details = detect_5m_entry(df5_new, bias)
+        if not entry_ok:
+            continue
+
+        # Entry confirmed!
+        logger.info(
+            "[%s] ✅ %s: 5m entry confirmed for %s - %s",
+            symbol,
+            context,
+            bias,
+            details,
+        )
+
+        # Execute order
+        success = await execute_entry_order(symbol, bias, ibkr_client, context)
+        return success
+
+    logger.info("[%s] ⛔ No %s entry after %d checks", symbol, context, checks)
+    return False
+
+
+async def handle_startup_signal(symbol, ibkr_client, bar_manager, has_position_fn):
+    """
+    Check for recent 15m signal on startup and search for entry if found.
+
+    Args:
+        symbol: Stock symbol
+        ibkr_client: IBKR API client
+        bar_manager: Bar manager for this symbol
+        has_position_fn: Async function to check for existing position
+    """
+    from core.signal_engine import detect_15m_bias
+
+    try:
+        # Check for existing position
+        if await has_position_fn(symbol):
+            logger.info(
+                "[%s] ⏸️ Position already exists at startup, skipping startup entry search",
+                symbol,
+            )
+            return
+
+        # Check if market is open
+        now_et = get_us_et_now()
+        if not is_us_market_open():
+            return
+
+        # Get current data
+        df5_startup, df15_startup = await bar_manager.get_resampled()
+        if df5_startup.empty or df15_startup.empty:
+            return
+
+        # Detect 15m bias
+        startup_bias = detect_15m_bias(df15_startup)
+        if not startup_bias:
+            return
+
+        # We have a valid 15m bias - search for 5m entry
+        logger.info(
+            "[%s] 🔍 STARTUP: Detected 15m %s bias - Starting 5m entry search",
+            symbol,
+            startup_bias,
+        )
+        send_telegram(
+            f"🔍 [IBKR] [{symbol}] Startup detected 15m {startup_bias} bias. Searching for entry..."
+        )
+
+        # Search for 5m entry
+        await search_5m_entry(symbol, startup_bias, ibkr_client, bar_manager, "STARTUP")
+
+    except Exception as e:
+        logger.exception("[%s] Error in startup signal detection: %s", symbol, e)
+
+
 async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
     """
-    Monitor for trading signals on a symbol (matching Angel One's logic).
+    Monitor for trading signals on a symbol.
 
     Args:
         symbol: Symbol to monitor
@@ -134,17 +375,13 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
     """
     from core.signal_engine import (
         detect_15m_bias,
-        detect_5m_entry,
         get_next_candle_close_time,
         get_seconds_until_next_close,
     )
-    from core.ibkr_option_selector import find_ibkr_option_contract
-    from core.config import RR_RATIO, MAX_5M_CHECKS, IBKR_QUANTITY
 
     global _STOP
 
     logger.info("[%s] 👀 Signal monitor started", symbol)
-    last_15m_signal_time = None
 
     # Helper function to check if we already have a position for this symbol
     async def has_position(sym):
@@ -171,184 +408,10 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
             logger.error(f"[{sym}] Error checking positions: {ex}")
             return False
 
-    # STARTUP SIGNAL DETECTION: Check if there's a recent 15m signal we should act on
-    try:
-        if await has_position(symbol):
-            logger.info(
-                "[%s] ⏸️ Position already exists at startup, skipping startup entry search",
-                symbol,
-            )
-        else:
-            now_et = get_us_et_now()
-            if is_us_market_open():
-                df5_startup, df15_startup = await bar_manager.get_resampled()
-                if not df5_startup.empty and not df15_startup.empty:
-                    startup_bias = detect_15m_bias(df15_startup)
-                    if startup_bias:
-                        # We have a valid 15m bias on the most recent closed candle
-                        # Jump directly into 5m entry search
-                        logger.info(
-                            "[%s] 🔍 STARTUP: Detected 15m %s bias - Starting 5m entry search",
-                            symbol,
-                            startup_bias,
-                        )
-                        send_telegram(
-                            f"🔍 [IBKR] [{symbol}] Startup detected 15m {startup_bias} bias. Searching for entry..."
-                        )
-                        last_15m_signal_time = now_et
+    # STARTUP: Check for recent 15m signal and search for entry
+    await handle_startup_signal(symbol, ibkr_client, bar_manager, has_position)
 
-                        checks = 0
-                        entered = False
-
-                        while checks < MAX_5M_CHECKS and not entered and not _STOP:
-                            checks += 1
-                            now_et = get_us_et_now()
-
-                            if now_et.time() >= time(16, 0):
-                                break
-
-                            next_5m_close = get_next_candle_close_time(now_et, "5min")
-                            sleep_seconds = get_seconds_until_next_close(now_et, "5min")
-
-                            logger.info(
-                                "[%s] ⏰ STARTUP 5m check #%d - waiting for %s ET (sleeping %ds)",
-                                symbol,
-                                checks,
-                                next_5m_close.strftime("%H:%M:%S"),
-                                sleep_seconds,
-                            )
-                            await asyncio.sleep(sleep_seconds)
-
-                            now_et = get_us_et_now()
-                            if now_et.time() >= time(16, 0):
-                                break
-
-                            df5_new, df15_new = await bar_manager.get_resampled()
-                            if df5_new.empty or df15_new.empty:
-                                continue
-
-                            # Revalidate 15m bias
-                            bias_now = detect_15m_bias(df15_new)
-                            if bias_now != startup_bias:
-                                logger.warning(
-                                    "[%s] ⚠️ 15m bias changed %s → %s, aborting startup entry search",
-                                    symbol,
-                                    startup_bias,
-                                    bias_now,
-                                )
-                                send_telegram(
-                                    f"⚠️ [IBKR] [{symbol}] Startup: 15m bias changed {startup_bias} → {bias_now}, aborting entry search"
-                                )
-                                break
-
-                            # Check 5m entry
-                            entry_ok, details = detect_5m_entry(df5_new, startup_bias)
-                            if entry_ok:
-                                # Entry found!
-                                logger.info(
-                                    "[%s] ✅ STARTUP: 5m entry confirmed for %s - %s",
-                                    symbol,
-                                    startup_bias,
-                                    details,
-                                )
-
-                                # Get stock price and find option (same as main loop)
-                                stock_price = await ibkr_client.get_last_price(
-                                    symbol, "STOCK"
-                                )
-                                if stock_price:
-                                    option_info, reason = (
-                                        await find_ibkr_option_contract(
-                                            ibkr_client,
-                                            symbol,
-                                            startup_bias,
-                                            stock_price,
-                                        )
-                                    )
-
-                                    if not option_info:
-                                        logger.warning(
-                                            "[%s] ⚠️ Startup: No option found: %s",
-                                            symbol,
-                                            reason,
-                                        )
-                                    else:
-                                        premium = option_info.get("premium", 0)
-                                        if premium > 0:
-                                            stop_loss = premium * 0.8
-                                            target = premium * (1 + (0.2 * RR_RATIO))
-
-                                            logger.info(
-                                                f"[IBKR] [{symbol}] 📈 STARTUP Entry: ${premium:.2f}, "
-                                                f"SL: ${stop_loss:.2f}, Target: ${target:.2f}"
-                                            )
-
-                                            send_telegram(
-                                                f"🎯 [IBKR] {symbol} {startup_bias} (Startup)\n"
-                                                f"Entry: ${premium:.2f}\n"
-                                                f"SL: ${stop_loss:.2f}\n"
-                                                f"Target: ${target:.2f}"
-                                            )
-
-                                            # PLACE BRACKET ORDER
-                                            logger.info(
-                                                f"[IBKR] [{symbol}] 🚀 Placing STARTUP Bracket Order..."
-                                            )
-                                            order_ids = (
-                                                await ibkr_client.place_bracket_order(
-                                                    option_info["contract"],
-                                                    IBKR_QUANTITY,
-                                                    stop_loss,
-                                                    target,
-                                                )
-                                            )
-
-                                            if order_ids:
-                                                logger.info(
-                                                    f"[IBKR] ✅ Order placed! Entry ID: {order_ids.get('entry_order_id')}"
-                                                )
-                                                send_telegram(
-                                                    f"🚀 [IBKR] STARTUP ORDER PLACED!\n"
-                                                    f"Symbol: {symbol}\n"
-                                                    f"Contract: {option_info['symbol']}\n"
-                                                    f"Entry ID: {order_ids.get('entry_order_id')}\n"
-                                                    f"SL ID: {order_ids.get('sl_order_id')}\n"
-                                                    f"Target ID: {order_ids.get('target_order_id')}"
-                                                )
-
-                                                # Report Cash Balance
-                                                try:
-                                                    summary = (
-                                                        await ibkr_client.get_account_summary_async()
-                                                    )
-                                                    funds = summary.get(
-                                                        "AvailableFunds", 0.0
-                                                    )
-                                                    net_liq = summary.get(
-                                                        "NetLiquidation", 0.0
-                                                    )
-                                                    logger.info(
-                                                        f"[IBKR] Cash Balance: ${funds:,.2f} | Net Liq: ${net_liq:,.2f}"
-                                                    )
-                                                    send_telegram(
-                                                        f"💰 [IBKR] Balance Update:\nCash: ${funds:,.2f}\nNet Liq: ${net_liq:,.2f}"
-                                                    )
-                                                except Exception as exc:
-                                                    logger.error(
-                                                        f"[IBKR] Failed to fetch balance: {exc}"
-                                                    )
-                                            else:
-                                                logger.error(
-                                                    f"[IBKR] ❌ Failed to place startup order for {symbol}"
-                                                )
-                                                send_telegram(
-                                                    f"🚨 [IBKR] Startup Order Placement Failed for {symbol}!"
-                                                )
-
-                                entered = True
-    except Exception as e:
-        logger.exception("[%s] Error in startup signal detection: %s", symbol, e)
-
+    # MAIN LOOP: Monitor for new 15m signals
     while not _STOP:
         try:
             now_et = get_us_et_now()
@@ -421,168 +484,9 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
             send_telegram(
                 f"📊 [IBKR] [{symbol}] 15m Trend: {bias} at {now_et.strftime('%H:%M')} ET. Looking for 5m entry..."
             )
-            last_15m_signal_time = now_et
 
-            checks = 0
-            entered = False
-
-            # Look for 5m entry confirmation at 5m candle closes
-            logger.info(
-                "[%s] 🔎 Monitoring 5m entries (max %d checks)...",
-                symbol,
-                MAX_5M_CHECKS,
-            )
-            while checks < MAX_5M_CHECKS and not entered and not _STOP:
-                checks += 1
-
-                # Wait for next 5m candle close
-                now_et = get_us_et_now()
-
-                # Strict Market Close Check inside inner loop
-                if now_et.time() >= time(16, 0):
-                    logger.info(
-                        "[%s] 🛑 Market closed (16:00 reached), stopping entry search",
-                        symbol,
-                    )
-                    break
-
-                next_5m_close = get_next_candle_close_time(now_et, "5min")
-                sleep_seconds = get_seconds_until_next_close(now_et, "5min")
-
-                logger.info(
-                    "[%s] ⏰ 5m check #%d - waiting for %s ET (sleeping %ds)",
-                    symbol,
-                    checks,
-                    next_5m_close.strftime("%H:%M:%S"),
-                    sleep_seconds,
-                )
-                await asyncio.sleep(sleep_seconds)
-
-                # Get fresh data at 5m boundary
-                now_et = get_us_et_now()
-
-                # Double check market close after waking up
-                if now_et.time() >= time(16, 0):
-                    logger.info(
-                        "[%s] 🛑 Market closed (16:00 reached), stopping entry search",
-                        symbol,
-                    )
-                    break
-
-                df5_new, df15_new = await bar_manager.get_resampled()
-                if df5_new.empty or df15_new.empty:
-                    logger.debug(
-                        "[%s] ⚠️ Empty dataframe at 5m check #%d", symbol, checks
-                    )
-                    continue
-
-                # Revalidate 15m bias hasn't flipped
-                bias_now = detect_15m_bias(df15_new)
-
-                if bias_now != bias:
-                    logger.warning(
-                        "[%s] ⚠️ 15m bias changed %s → %s, aborting entry search",
-                        symbol,
-                        bias,
-                        bias_now,
-                    )
-                    send_telegram(
-                        f"⚠️ [IBKR] {symbol} 15m bias changed {bias} → {bias_now}, aborting"
-                    )
-                    break
-
-                # Check 5m entry conditions at candle close
-                logger.info(
-                    "[%s] 🔎 Checking 5m entry conditions for %s bias...", symbol, bias
-                )
-                entry_ok, details = detect_5m_entry(df5_new, bias)
-
-                if not entry_ok:
-                    continue  # No entry yet
-
-                # Entry signal confirmed!
-                logger.info(
-                    f"[{symbol}] ✅ 5m ENTRY SIGNAL CONFIRMED: {bias} - {details}"
-                )
-
-                # Get underlying price
-                stock_price = await ibkr_client.get_last_price(symbol, "STOCK")
-
-                if not stock_price:
-                    logger.error("[%s] ❌ Failed to get stock price", symbol)
-                    continue
-
-                # Find option
-                option_info, reason = await find_ibkr_option_contract(
-                    ibkr_client, symbol, bias, stock_price
-                )
-
-                if not option_info:
-                    logger.error("[%s] ❌ No suitable option found: %s", symbol, reason)
-                    continue
-
-                premium = option_info.get("premium", 0)
-
-                if premium <= 0:
-                    logger.error("[%s] ❌ Invalid premium: $%.2f", symbol, premium)
-                    continue
-
-                # Calculate bracket levels (1:2 RR)
-                stop_loss = premium * 0.8  # 20% SL
-                target = premium * (1 + (0.2 * RR_RATIO))  # 40% target for 1:2 RR
-
-                logger.info(
-                    f"[IBKR] [{symbol}] 📈 Entry: ${premium:.2f}, "
-                    f"SL: ${stop_loss:.2f}, Target: ${target:.2f}"
-                )
-
-                send_telegram(
-                    f"🎯 [IBKR] {symbol} {bias}\n"
-                    f"Entry: ${premium:.2f}\n"
-                    f"SL: ${stop_loss:.2f}\n"
-                    f"Target: ${target:.2f}"
-                )
-
-                # PLACE BRACKET ORDER
-                logger.info(f"[IBKR] [{symbol}] 🚀 Placing Bracket Order...")
-                order_ids = await ibkr_client.place_bracket_order(
-                    option_info["contract"],
-                    IBKR_QUANTITY,
-                    stop_loss,
-                    target,
-                )
-
-                if order_ids:
-                    logger.info(
-                        f"[IBKR] ✅ Order placed! Entry ID: {order_ids.get('entry_order_id')}"
-                    )
-                    send_telegram(
-                        f"🚀 [IBKR] ORDER PLACED!\n"
-                        f"Symbol: {symbol}\n"
-                        f"Contract: {option_info['symbol']}\n"
-                        f"Entry ID: {order_ids.get('entry_order_id')}\n"
-                        f"SL ID: {order_ids.get('sl_order_id')}\n"
-                        f"Target ID: {order_ids.get('target_order_id')}"
-                    )
-
-                    # Report Cash Balance
-                    try:
-                        summary = await ibkr_client.get_account_summary_async()
-                        funds = summary.get("AvailableFunds", 0.0)
-                        net_liq = summary.get("NetLiquidation", 0.0)
-                        logger.info(
-                            f"[IBKR] Cash Balance: ${funds:,.2f} | Net Liq: ${net_liq:,.2f}"
-                        )
-                        send_telegram(
-                            f"💰 [IBKR] Balance Update:\nCash: ${funds:,.2f}\nNet Liq: ${net_liq:,.2f}"
-                        )
-                    except Exception as exc:
-                        logger.error(f"[IBKR] Failed to fetch balance: {exc}")
-                else:
-                    logger.error(f"[IBKR] ❌ Failed to place order for {symbol}")
-                    send_telegram(f"🚨 [IBKR] Order Placement Failed for {symbol}!")
-
-                entered = True
+            # Search for 5m entry confirmation
+            await search_5m_entry(symbol, bias, ibkr_client, bar_manager, "ENTRY")
 
         except Exception as e:
             logger.exception("[%s] ❌ Signal monitor exception: %s", symbol, e)

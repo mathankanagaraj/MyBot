@@ -70,123 +70,315 @@ async def heartbeat_task():
     logger.info("💓 Heartbeat task stopped")
 
 
+async def execute_angel_entry_order(
+    symbol, bias, angel_client, cash_mgr, underlying_price
+):
+    """
+    Execute entry order with option selection and bracket order placement for Angel One.
+
+    Args:
+        symbol: Stock symbol
+        bias: BULL or BEAR
+        angel_client: Angel One API client
+        cash_mgr: Cash manager instance
+        underlying_price: Current underlying price
+
+    Returns:
+        True if order placed successfully, False otherwise
+    """
+    from core.config import INDEX_FUTURES
+
+    # Select option contract
+    logger.info("[%s] 🔍 Selecting option contract...", symbol)
+    opt_contract, reason = await find_option_contract_async(
+        angel_client, symbol, bias, underlying_price
+    )
+    if not opt_contract:
+        logger.error("[%s] ❌ Option selection failed: %s", symbol, reason)
+        send_telegram(f"❌ {symbol} option selection failed: {reason}")
+        return False
+
+    logger.info("[%s] ✅ Selected option: %s", symbol, opt_contract["symbol"])
+
+    # Get option premium
+    logger.info("[%s] 💰 Fetching option premium...", symbol)
+    prem = await angel_client.get_last_price(opt_contract["symbol"], exchange="NFO")
+    if prem is None or prem < MIN_PREMIUM:
+        logger.error(
+            "[%s] ❌ Premium too low: ₹%s (min: ₹%.2f)", symbol, prem, MIN_PREMIUM
+        )
+        send_telegram(f"❌ {symbol} premium too low: ₹{prem}")
+        return False
+
+    logger.info("[%s] 💰 Option premium: ₹%.2f", symbol, prem)
+
+    # Calculate position size
+    lot_size = opt_contract.get("lot_size", 1)
+    per_lot_cost = float(prem) * float(lot_size)
+    qty = MAX_CONTRACTS_PER_TRADE
+    est_cost = per_lot_cost * qty
+
+    logger.info(
+        "[%s] 📊 Position sizing: %d lots × %d qty × ₹%.2f = ₹%.2f",
+        symbol,
+        qty,
+        lot_size,
+        prem,
+        est_cost,
+    )
+
+    # Check if we can open position
+    can_open = await cash_mgr.can_open_position(symbol, est_cost)
+    if not can_open:
+        logger.error("[%s] ❌ Insufficient funds or risk limit reached", symbol)
+        send_telegram(f"❌ {symbol} insufficient funds or risk limit reached")
+        return False
+
+    # Register position
+    cash_mgr.register_open(symbol, est_cost)
+
+    # Calculate stop loss and target
+    risk_amt = prem * RISK_PCT_OF_PREMIUM
+    stop_price = prem - risk_amt
+    target_price = prem + (risk_amt * RR_RATIO)
+
+    if stop_price < 1.0:
+        stop_price = 1.0
+
+    # Place bracket order
+    logger.info(
+        f"[{symbol}] 📤 Placing bracket order: {bias} "
+        f"Entry=₹{prem:.2f}, SL=₹{stop_price:.2f}, TP=₹{target_price:.2f}"
+    )
+
+    bracket = await angel_client.place_bracket_order(
+        option_symbol=opt_contract["symbol"],
+        option_token=opt_contract["token"],
+        quantity=qty * lot_size,
+        stop_loss_price=stop_price,
+        target_price=target_price,
+        exchange="NFO",
+    )
+
+    if bracket is None:
+        logger.error("[%s] ❌ Order placement failed", symbol)
+        send_telegram(f"❌ {symbol} order placement failed")
+        cash_mgr.force_release(symbol)
+        return False
+
+    logger.info("[%s] ✅ Order placed successfully!", symbol)
+    send_telegram(
+        f"✅ Entered {symbol} {bias}\n"
+        f"Option: {opt_contract['symbol']}\n"
+        f"Entry: ₹{prem:.2f} | SL: ₹{stop_price:.2f} | TP: ₹{target_price:.2f}"
+    )
+
+    # Write audit
+    write_audit_row(
+        timestamp=get_ist_now().isoformat(),
+        symbol=symbol,
+        bias=bias,
+        option=opt_contract["symbol"],
+        entry_price=prem,
+        stop=stop_price,
+        target=target_price,
+        exit_price=0,
+        outcome="OPEN",
+        holding_seconds=0,
+        details="Entry confirmed",
+    )
+
+    return True
+
+
+async def search_angel_5m_entry(
+    symbol, bias, angel_client, cash_mgr, bar_manager, context="ENTRY"
+):
+    """
+    Search for 5m entry confirmation over multiple candles for Angel One.
+
+    Args:
+        symbol: Stock symbol
+        bias: BULL or BEAR from 15m detection
+        angel_client: Angel One API client
+        cash_mgr: Cash manager instance
+        bar_manager: Bar manager for this symbol
+        context: "STARTUP" or "ENTRY" for logging
+
+    Returns:
+        True if entry executed, False otherwise
+    """
+    from core.config import INDEX_FUTURES
+
+    global _STOP
+    checks = 0
+
+    while checks < MAX_5M_CHECKS and not _STOP:
+        checks += 1
+        now_ist = get_ist_now()
+
+        # Market close check
+        if now_ist.time() >= time(15, 30):
+            logger.info(
+                "[%s] 🛑 Market closed, stopping %s entry search", symbol, context
+            )
+            return False
+
+        # Wait for next 5m candle close
+        next_5m_close = get_next_candle_close_time(now_ist, "5min")
+        sleep_seconds = get_seconds_until_next_close(now_ist, "5min")
+
+        logger.info(
+            "[%s] ⏰ %s 5m check #%d - waiting for %s IST (sleeping %ds)",
+            symbol,
+            context,
+            checks,
+            next_5m_close.strftime("%H:%M:%S"),
+            sleep_seconds,
+        )
+        await asyncio.sleep(sleep_seconds)
+
+        now_ist = get_ist_now()
+        if now_ist.time() >= time(15, 30):
+            return False
+
+        # Get fresh data
+        now_utc = now_ist.astimezone(pytz.UTC).replace(tzinfo=None)
+        df5_new, df15_new = await bar_manager.get_resampled(current_time=now_utc)
+        if df5_new.empty or df15_new.empty:
+            logger.debug("[%s] ⚠️ Empty dataframe at 5m check #%d", symbol, checks)
+            continue
+
+        # Revalidate 15m bias
+        bias_now = detect_15m_bias(df15_new)
+        if bias_now != bias:
+            logger.warning(
+                "[%s] ⚠️ 15m bias changed %s → %s, aborting %s entry search",
+                symbol,
+                bias,
+                bias_now,
+                context,
+            )
+            send_telegram(
+                f"⚠️ [{symbol}] {context}: 15m bias changed {bias} → {bias_now}, aborting"
+            )
+            return False
+
+        # Check 5m entry
+        entry_ok, details = detect_5m_entry(df5_new, bias)
+        if not entry_ok:
+            continue
+
+        # Entry confirmed!
+        logger.info(
+            "[%s] ✅ %s: 5m entry confirmed for %s - %s",
+            symbol,
+            context,
+            bias,
+            details,
+        )
+
+        # Get underlying price
+        if symbol in INDEX_FUTURES:
+            logger.info("[%s] 📊 Fetching futures price for index...", symbol)
+            underlying = await angel_client.get_futures_price(symbol)
+        else:
+            logger.info("[%s] 📊 Fetching stock price...", symbol)
+            underlying = await angel_client.get_last_price(symbol, exchange="NSE")
+
+        if not underlying:
+            logger.error("[%s] ❌ Failed to get underlying price", symbol)
+            send_telegram(f"❌ {symbol} failed to get underlying price")
+            return False
+
+        logger.info("[%s] 💰 Underlying price: ₹%.2f", symbol, underlying)
+
+        # Execute order
+        success = await execute_angel_entry_order(
+            symbol, bias, angel_client, cash_mgr, underlying
+        )
+        return success
+
+    logger.info("[%s] ⛔ No %s entry after %d checks", symbol, context, checks)
+    return False
+
+
+async def handle_angel_startup_signal(symbol, angel_client, cash_mgr, bar_manager):
+    """
+    Check for recent 15m signal on startup and search for entry if found.
+
+    Args:
+        symbol: Stock symbol
+        angel_client: Angel One API client
+        cash_mgr: Cash manager instance
+        bar_manager: Bar manager for this symbol
+    """
+    try:
+        now_ist = get_ist_now()
+        if not is_market_open():
+            return
+
+        # Get current data
+        df5_startup, df15_startup = await bar_manager.get_resampled()
+        if df5_startup.empty or df15_startup.empty:
+            return
+
+        # Detect 15m bias
+        startup_bias = detect_15m_bias(df15_startup)
+        if not startup_bias:
+            return
+
+        # Calculate how old this signal is
+        latest_15m_time = df15_startup.index[-1]
+        time_since_signal = (
+            now_ist.replace(tzinfo=None) - latest_15m_time
+        ).total_seconds() / 60
+
+        # If signal is recent (within last 30 minutes), act on it
+        if time_since_signal <= 30:
+            logger.info(
+                "[%s] 🔍 STARTUP: Found recent 15m %s signal from %d mins ago - Starting 5m entry search",
+                symbol,
+                startup_bias,
+                int(time_since_signal),
+            )
+            send_telegram(
+                f"🔍 [{symbol}] Startup detected recent 15m {startup_bias} signal "
+                f"({int(time_since_signal)}m ago). Searching for entry..."
+            )
+
+            # Search for 5m entry
+            await search_angel_5m_entry(
+                symbol, startup_bias, angel_client, cash_mgr, bar_manager, "STARTUP"
+            )
+        else:
+            logger.debug(
+                "[%s] Recent 15m signal is %d mins old (too old)",
+                symbol,
+                int(time_since_signal),
+            )
+    except Exception as e:
+        logger.exception("[%s] Error in startup signal detection: %s", symbol, e)
+
+
 async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
     """
     Main worker loop for each symbol.
     Monitors market, detects signals, and executes trades.
-    Ensures 15m boundary checks happen at proper times regardless of bot start time.
     """
+    global _STOP
+
     logger.info("[%s] 🚀 Worker started", symbol)
-    last_15m_signal_time = None
 
-    # STARTUP SIGNAL DETECTION: Check if there's a recent 15m signal we should act on
-    try:
-        now_ist = get_ist_now()
-        if is_market_open():
-            df5_startup, df15_startup = await bar_manager.get_resampled()
-            if not df5_startup.empty and not df15_startup.empty:
-                startup_bias = detect_15m_bias(df15_startup)
-                if startup_bias:
-                    # Calculate how old this signal is
-                    latest_15m_time = df15_startup.index[-1]
-                    time_since_signal = (
-                        now_ist.replace(tzinfo=None) - latest_15m_time
-                    ).total_seconds() / 60
+    # STARTUP: Check for recent 15m signal and search for entry
+    await handle_angel_startup_signal(symbol, angel_client, cash_mgr, bar_manager)
 
-                    # If signal is recent (within last 30 minutes), act on it
-                    if time_since_signal <= 30:
-                        logger.info(
-                            "[%s] 🔍 STARTUP: Found recent 15m %s signal from %d mins ago - Starting 5m entry search",
-                            symbol,
-                            startup_bias,
-                            int(time_since_signal),
-                        )
-                        send_telegram(
-                            f"🔍 [{symbol}] Startup detected recent 15m {startup_bias} signal "
-                            f"({int(time_since_signal)}m ago). Searching for entry..."
-                        )
-                        last_15m_signal_time = now_ist
-
-                        # Jump directly into 5m entry search (same logic as main loop)
-
-                        checks = 0
-                        entered = False
-
-                        while checks < MAX_5M_CHECKS and not entered and not _STOP:
-                            checks += 1
-                            now_ist = get_ist_now()
-
-                            if now_ist.time() >= time(15, 30):
-                                break
-
-                            next_5m_close = get_next_candle_close_time(now_ist, "5min")
-                            sleep_seconds = get_seconds_until_next_close(
-                                now_ist, "5min"
-                            )
-
-                            logger.info(
-                                "[%s] ⏰ STARTUP 5m check #%d - waiting for %s IST (sleeping %ds)",
-                                symbol,
-                                checks,
-                                next_5m_close.strftime("%H:%M:%S"),
-                                sleep_seconds,
-                            )
-                            await asyncio.sleep(sleep_seconds)
-
-                            now_ist = get_ist_now()
-                            if now_ist.time() >= time(15, 30):
-                                break
-
-                            now_utc = now_ist.astimezone(pytz.UTC).replace(tzinfo=None)
-                            df5_new, df15_new = await bar_manager.get_resampled(
-                                current_time=now_utc
-                            )
-                            if df5_new.empty or df15_new.empty:
-                                continue
-
-                            # Revalidate 15m bias
-                            bias_now = detect_15m_bias(df15_new)
-                            if bias_now != startup_bias:
-                                logger.warning(
-                                    "[%s] ⚠️ 15m bias changed %s → %s, aborting startup entry search",
-                                    symbol,
-                                    startup_bias,
-                                    bias_now,
-                                )
-                                send_telegram(
-                                    f"⚠️ [{symbol}] Startup: 15m bias changed {startup_bias} → {bias_now}, aborting entry search"
-                                )
-                                break
-
-                            # Check 5m entry
-                            entry_ok, details = detect_5m_entry(df5_new, startup_bias)
-                            if entry_ok:
-                                # Entry found! This would trigger the full entry logic
-                                # For now, just log and set entered flag
-                                logger.info(
-                                    "[%s] ✅ STARTUP: 5m entry confirmed for %s - %s",
-                                    symbol,
-                                    startup_bias,
-                                    details,
-                                )
-                                entered = True
-                                # The actual order placement logic would go here
-                                # (same as in main loop around line 250-350)
-                    else:
-                        logger.debug(
-                            "[%s] Recent 15m signal is %d mins old (too old)",
-                            symbol,
-                            int(time_since_signal),
-                        )
-    except Exception as e:
-        logger.exception("[%s] Error in startup signal detection: %s", symbol, e)
-
+    # MAIN LOOP: Monitor for new 15m signals
     while not _STOP:
         try:
             now_ist = get_ist_now()
 
             # Strict Market Close Check
-            # If it's past 15:30, stop immediately
             if now_ist.time() >= time(15, 30):
                 logger.info(
                     "[%s] 🛑 Market closed (15:30 reached), stopping worker", symbol
@@ -200,21 +392,18 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
             from core.config import MARKET_HOURS_ONLY
 
             if MARKET_HOURS_ONLY and not is_open:
-                # Calculate sleep until next 9:15 AM or just sleep 1 minute
                 logger.debug("[%s] 💤 Market closed, sleeping 1 minute...", symbol)
                 await asyncio.sleep(60)
                 continue
 
             # Check if we already have an open position for this symbol
-            # 1. Check local cache
             has_position = symbol in cash_mgr.open_positions
 
-            # 2. Check API directly (to handle restarts or out-of-sync state)
+            # Also check API directly (to handle restarts or out-of-sync state)
             if not has_position:
                 try:
                     positions = await angel_client.get_positions()
                     for p in positions:
-                        # Check for non-zero quantity and matching symbol
                         if (
                             symbol in p.get("tradingsymbol", "")
                             and int(p.get("netqty", 0)) != 0
@@ -224,12 +413,11 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                                 "[%s] ⚠️ Found existing position in API not in cache. Syncing...",
                                 symbol,
                             )
-                            # Register in cash manager to track it (approximate)
-                            # We don't have entry price, but we can prevent new trades
+                            # Register in cash manager
                             cash_mgr.open_positions[symbol] = {
                                 "symbol": p.get("tradingsymbol"),
                                 "quantity": int(p.get("netqty", 0)),
-                                "entry_price": float(p.get("avgnetprice", 0)),  # Approx
+                                "entry_price": float(p.get("avgnetprice", 0)),
                                 "entry_time": datetime.now(),
                             }
                             break
@@ -237,7 +425,7 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                     logger.error("[%s] Error checking positions: %s", symbol, e)
 
             if has_position:
-                # Poll for position closure via Angel API
+                # Poll for position closure
                 positions = await angel_client.get_positions()
                 has_pos = False
 
@@ -261,8 +449,7 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
-            # CRITICAL: Wait until next 15m candle close before checking bias
-            # This ensures we always check at proper 15m boundaries (09:15, 09:30, 09:45, etc.)
+            # Wait until next 15m candle close before checking bias
             next_15m_close = get_next_candle_close_time(now_ist, "15min")
             sleep_seconds = get_seconds_until_next_close(now_ist, "15min")
 
@@ -274,7 +461,7 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
             )
             await asyncio.sleep(sleep_seconds)
 
-            # Now we're at a 15m boundary - get latest bars with complete candles only
+            # Get latest bars at 15m boundary
             now_ist = get_ist_now()
 
             # Double check market close after waking up
@@ -284,7 +471,7 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 )
                 break
 
-            # Convert IST to UTC for bar_manager (it expects UTC)
+            # Convert IST to UTC for bar_manager
             now_utc = now_ist.astimezone(pytz.UTC).replace(tzinfo=None)
             df5, df15 = await bar_manager.get_resampled(current_time=now_utc)
 
@@ -304,7 +491,7 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
             bias = detect_15m_bias(df15)
 
             if not bias:
-                continue  # No bias, loop will wait for next 15m close
+                continue
 
             logger.info(
                 "[%s] ✅ 15m bias detected: %s at %s IST",
@@ -312,20 +499,6 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 bias,
                 now_ist.strftime("%H:%M:%S"),
             )
-
-            # Avoid duplicate triggers
-            now_ist = get_ist_now()
-            if last_15m_signal_time and (now_ist - last_15m_signal_time) < timedelta(
-                minutes=15
-            ):
-                time_since_last = (now_ist - last_15m_signal_time).total_seconds() / 60
-                logger.info(
-                    "[%s] ⏭️ Skipping duplicate signal (%.1f min since last), sleeping 60s...",
-                    symbol,
-                    time_since_last,
-                )
-                await asyncio.sleep(60)
-                continue
 
             # Notify 15m bias found
             logger.info(
@@ -337,225 +510,11 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
             send_telegram(
                 f"📊 [{symbol}] 15m Trend: {bias} at {now_ist.strftime('%H:%M')} IST. Looking for 5m entry..."
             )
-            last_15m_signal_time = now_ist
 
-            checks = 0
-            entered = False
-
-            # Look for 5m entry confirmation at 5m candle closes
-            logger.info(
-                "[%s] 🔎 Monitoring 5m entries (max %d checks)...",
-                symbol,
-                MAX_5M_CHECKS,
+            # Search for 5m entry confirmation
+            await search_angel_5m_entry(
+                symbol, bias, angel_client, cash_mgr, bar_manager, "ENTRY"
             )
-            while checks < MAX_5M_CHECKS and not entered and not _STOP:
-                checks += 1
-
-                # Wait for next 5m candle close (use IST for display)
-                now_ist = get_ist_now()
-
-                # Strict Market Close Check inside inner loop
-                if now_ist.time() >= time(15, 30):
-                    logger.info(
-                        "[%s] 🛑 Market closed (15:30 reached), stopping entry search",
-                        symbol,
-                    )
-                    break
-
-                next_5m_close = get_next_candle_close_time(now_ist, "5min")
-                sleep_seconds = get_seconds_until_next_close(now_ist, "5min")
-
-                logger.info(
-                    "[%s] ⏰ 5m check #%d - waiting for %s IST (sleeping %ds)",
-                    symbol,
-                    checks,
-                    next_5m_close.strftime("%H:%M:%S"),
-                    sleep_seconds,
-                )
-                await asyncio.sleep(sleep_seconds)
-
-                # Get fresh data at 5m boundary with complete candles only
-                now_ist = get_ist_now()
-
-                # Double check market close after waking up
-                if now_ist.time() >= time(15, 30):
-                    logger.info(
-                        "[%s] 🛑 Market closed (15:30 reached), stopping entry search",
-                        symbol,
-                    )
-                    break
-
-                now_utc = now_ist.astimezone(pytz.UTC).replace(tzinfo=None)
-                df5_new, df15_new = await bar_manager.get_resampled(
-                    current_time=now_utc
-                )
-                if df5_new.empty or df15_new.empty:
-                    logger.debug(
-                        "[%s] ⚠️ Empty dataframe at 5m check #%d", symbol, checks
-                    )
-                    continue
-
-                # Revalidate 15m bias hasn't flipped
-                bias_now = detect_15m_bias(df15_new)
-
-                if bias_now != bias:
-                    logger.warning(
-                        "[%s] ⚠️ 15m bias changed %s → %s, aborting entry search",
-                        symbol,
-                        bias,
-                        bias_now,
-                    )
-                    send_telegram(
-                        f"⚠️ {symbol} 15m bias changed {bias} → {bias_now}, aborting"
-                    )
-                    break
-
-                # Check 5m entry conditions at candle close
-                entry_ok, details = detect_5m_entry(df5_new, bias)
-
-                if not entry_ok:
-                    continue  # No entry yet
-
-                # Entry signal confirmed!
-                logger.info(
-                    f"[{symbol}] ✅ 5m ENTRY SIGNAL CONFIRMED: {bias} - {details}"
-                )
-
-                # Get underlying price
-                from core.config import INDEX_FUTURES
-
-                if symbol in INDEX_FUTURES:
-                    logger.info("[%s] 📊 Fetching futures price for index...", symbol)
-                    underlying = await angel_client.get_futures_price(symbol)
-                else:
-                    logger.info("[%s] 📊 Fetching stock price...", symbol)
-                    underlying = await angel_client.get_last_price(
-                        symbol, exchange="NSE"
-                    )
-
-                if not underlying:
-                    logger.error("[%s] ❌ Failed to get underlying price", symbol)
-                    send_telegram(f"❌ {symbol} failed to get underlying price")
-                    break
-
-                logger.info("[%s] 💰 Underlying price: ₹%.2f", symbol, underlying)
-
-                # Select option contract
-                logger.info("[%s] 🔍 Selecting option contract...", symbol)
-                opt_contract, reason = await find_option_contract_async(
-                    angel_client, symbol, bias, underlying
-                )
-                if not opt_contract:
-                    logger.error("[%s] ❌ Option selection failed: %s", symbol, reason)
-                    send_telegram(f"❌ {symbol} option selection failed: {reason}")
-                    break
-
-                logger.info(
-                    "[%s] ✅ Selected option: %s", symbol, opt_contract["symbol"]
-                )
-
-                # Get option premium
-                logger.info("[%s] 💰 Fetching option premium...", symbol)
-                prem = await angel_client.get_last_price(
-                    opt_contract["symbol"], exchange="NFO"
-                )
-                if prem is None or prem < MIN_PREMIUM:
-                    logger.error(
-                        "[%s] ❌ Premium too low: ₹%s (min: ₹%.2f)",
-                        symbol,
-                        prem,
-                        MIN_PREMIUM,
-                    )
-                    send_telegram(f"❌ {symbol} premium too low: ₹{prem}")
-                    break
-
-                logger.info("[%s] 💰 Option premium: ₹%.2f", symbol, prem)
-
-                # Calculate position size
-                lot_size = opt_contract.get("lot_size", 1)
-                per_lot_cost = float(prem) * float(lot_size)
-                qty = MAX_CONTRACTS_PER_TRADE
-                est_cost = per_lot_cost * qty
-
-                logger.info(
-                    "[%s] 📊 Position sizing: %d lots × %d qty × ₹%.2f = ₹%.2f",
-                    symbol,
-                    qty,
-                    lot_size,
-                    prem,
-                    est_cost,
-                )
-
-                # Check if we can open position
-                can_open = await cash_mgr.can_open_position(symbol, est_cost)
-                if not can_open:
-                    logger.error(
-                        "[%s] ❌ Insufficient funds or risk limit reached", symbol
-                    )
-                    send_telegram(
-                        f"❌ {symbol} insufficient funds or risk limit reached"
-                    )
-                    break
-
-                # Register position
-                cash_mgr.register_open(symbol, est_cost)
-
-                # Calculate stop loss and target
-                risk_amt = prem * RISK_PCT_OF_PREMIUM
-                stop_price = prem - risk_amt
-                target_price = prem + (risk_amt * RR_RATIO)
-
-                if stop_price < 1.0:
-                    stop_price = 1.0
-
-                # Place bracket order
-                logger.info(
-                    f"[{symbol}] 📤 Placing bracket order: {bias} "
-                    f"Entry=₹{prem:.2f}, SL=₹{stop_price:.2f}, TP=₹{target_price:.2f}"
-                )
-
-                bracket = await angel_client.place_bracket_order(
-                    option_symbol=opt_contract["symbol"],
-                    option_token=opt_contract["token"],
-                    quantity=qty * lot_size,
-                    stop_loss_price=stop_price,
-                    target_price=target_price,
-                    exchange="NFO",
-                )
-
-                if bracket is None:
-                    logger.error("[%s] ❌ Order placement failed", symbol)
-                    send_telegram(f"❌ {symbol} order placement failed")
-                    cash_mgr.force_release(symbol)
-                    break
-
-                logger.info("[%s] ✅ Order placed successfully!", symbol)
-                send_telegram(
-                    f"✅ Entered {symbol} {bias}\n"
-                    f"Option: {opt_contract['symbol']}\n"
-                    f"Entry: ₹{prem:.2f} | SL: ₹{stop_price:.2f} | TP: ₹{target_price:.2f}"
-                )
-
-                # Write audit
-                write_audit_row(
-                    timestamp=get_ist_now().isoformat(),
-                    symbol=symbol,
-                    bias=bias,
-                    option=opt_contract["symbol"],
-                    entry_price=prem,
-                    stop=stop_price,
-                    target=target_price,
-                    exit_price=0,
-                    outcome="OPEN",
-                    holding_seconds=0,
-                    details=details,
-                )
-
-                entered = True
-
-            if not entered:
-                logger.info("[%s] ⛔ No entry after %d checks", symbol, checks)
-            # Loop will continue and wait for next 15m candle close
 
         except Exception as e:
             logger.exception("[%s] ❌ Worker exception: %s", symbol, e)
