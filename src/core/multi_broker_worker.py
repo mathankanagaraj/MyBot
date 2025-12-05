@@ -290,6 +290,62 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
                                                 f"SL: ${stop_loss:.2f}\n"
                                                 f"Target: ${target:.2f}"
                                             )
+
+                                            # PLACE BRACKET ORDER
+                                            logger.info(
+                                                f"[IBKR] [{symbol}] 🚀 Placing STARTUP Bracket Order..."
+                                            )
+                                            order_ids = (
+                                                await ibkr_client.place_bracket_order(
+                                                    option_info["contract"],
+                                                    IBKR_QUANTITY,
+                                                    stop_loss,
+                                                    target,
+                                                )
+                                            )
+
+                                            if order_ids:
+                                                logger.info(
+                                                    f"[IBKR] ✅ Order placed! Entry ID: {order_ids.get('entry_order_id')}"
+                                                )
+                                                send_telegram(
+                                                    f"🚀 [IBKR] STARTUP ORDER PLACED!\n"
+                                                    f"Symbol: {symbol}\n"
+                                                    f"Contract: {option_info['symbol']}\n"
+                                                    f"Entry ID: {order_ids.get('entry_order_id')}\n"
+                                                    f"SL ID: {order_ids.get('sl_order_id')}\n"
+                                                    f"Target ID: {order_ids.get('target_order_id')}"
+                                                )
+
+                                                # Report Cash Balance
+                                                try:
+                                                    summary = (
+                                                        await ibkr_client.get_account_summary_async()
+                                                    )
+                                                    funds = summary.get(
+                                                        "AvailableFunds", 0.0
+                                                    )
+                                                    net_liq = summary.get(
+                                                        "NetLiquidation", 0.0
+                                                    )
+                                                    logger.info(
+                                                        f"[IBKR] Cash Balance: ${funds:,.2f} | Net Liq: ${net_liq:,.2f}"
+                                                    )
+                                                    send_telegram(
+                                                        f"💰 [IBKR] Balance Update:\nCash: ${funds:,.2f}\nNet Liq: ${net_liq:,.2f}"
+                                                    )
+                                                except Exception as exc:
+                                                    logger.error(
+                                                        f"[IBKR] Failed to fetch balance: {exc}"
+                                                    )
+                                            else:
+                                                logger.error(
+                                                    f"[IBKR] ❌ Failed to place startup order for {symbol}"
+                                                )
+                                                send_telegram(
+                                                    f"🚨 [IBKR] Startup Order Placement Failed for {symbol}!"
+                                                )
+
                                 entered = True
     except Exception as e:
         logger.exception("[%s] Error in startup signal detection: %s", symbol, e)
@@ -310,6 +366,12 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
             if not is_us_market_open():
                 logger.debug("[%s] 💤 Market closed, signal monitor sleeping", symbol)
                 await asyncio.sleep(300)
+                continue
+
+            # Check if we already have a position for this symbol
+            if await has_position(symbol):
+                logger.info("[%s] ⏸️ Position exists, pausing signal monitoring", symbol)
+                await asyncio.sleep(60)
                 continue
 
             # Wait for next 15m candle close
@@ -482,8 +544,46 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
                     f"Target: ${target:.2f}"
                 )
 
+                # PLACE BRACKET ORDER
+                logger.info(f"[IBKR] [{symbol}] 🚀 Placing Bracket Order...")
+                order_ids = await ibkr_client.place_bracket_order(
+                    option_info["contract"],
+                    IBKR_QUANTITY,
+                    stop_loss,
+                    target,
+                )
+
+                if order_ids:
+                    logger.info(
+                        f"[IBKR] ✅ Order placed! Entry ID: {order_ids.get('entry_order_id')}"
+                    )
+                    send_telegram(
+                        f"🚀 [IBKR] ORDER PLACED!\n"
+                        f"Symbol: {symbol}\n"
+                        f"Contract: {option_info['symbol']}\n"
+                        f"Entry ID: {order_ids.get('entry_order_id')}\n"
+                        f"SL ID: {order_ids.get('sl_order_id')}\n"
+                        f"Target ID: {order_ids.get('target_order_id')}"
+                    )
+
+                    # Report Cash Balance
+                    try:
+                        summary = await ibkr_client.get_account_summary_async()
+                        funds = summary.get("AvailableFunds", 0.0)
+                        net_liq = summary.get("NetLiquidation", 0.0)
+                        logger.info(
+                            f"[IBKR] Cash Balance: ${funds:,.2f} | Net Liq: ${net_liq:,.2f}"
+                        )
+                        send_telegram(
+                            f"💰 [IBKR] Balance Update:\nCash: ${funds:,.2f}\nNet Liq: ${net_liq:,.2f}"
+                        )
+                    except Exception as exc:
+                        logger.error(f"[IBKR] Failed to fetch balance: {exc}")
+                else:
+                    logger.error(f"[IBKR] ❌ Failed to place order for {symbol}")
+                    send_telegram(f"🚨 [IBKR] Order Placement Failed for {symbol}!")
+
                 entered = True
-                # Note: Actual order placement logic would go here
 
         except Exception as e:
             logger.exception("[%s] ❌ Signal monitor exception: %s", symbol, e)
