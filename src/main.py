@@ -4,7 +4,7 @@ import signal
 from core.config import BROKER, ANGEL_MODE, IBKR_MODE
 from core.logger import setup_logging
 from core.utils import send_telegram
-from core.multi_broker_worker import run_multi_broker, stop_all_workers
+from core.broker_orchestrator import run_multi_broker, stop_all_workers
 
 logger = setup_logging()
 
