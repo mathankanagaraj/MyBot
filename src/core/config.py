@@ -86,7 +86,7 @@ MODE = ANGEL_MODE  # For existing Angel One code
 # ============================================================================
 MAX_CONTRACTS_PER_TRADE = int(os.getenv("MAX_CONTRACTS_PER_TRADE", "1"))
 RISK_PER_CONTRACT = float(os.getenv("RISK_PER_CONTRACT", "0.0"))
-RISK_PCT_OF_PREMIUM = float(os.getenv("RISK_PCT_OF_PREMIUM", "0.20"))
+RISK_PCT_OF_PREMIUM = float(os.getenv("RISK_PCT_OF_PREMIUM", "0.10"))
 RR_RATIO = float(os.getenv("RR_RATIO", "2.0"))
 MIN_PREMIUM = float(os.getenv("MIN_PREMIUM", "5.0"))  # ₹5 for Indian, $5 for US
 

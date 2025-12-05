@@ -108,7 +108,6 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                         last_15m_signal_time = now_ist
 
                         # Jump directly into 5m entry search (same logic as main loop)
-                        from core.config import MAX_5M_CHECKS
 
                         checks = 0
                         entered = False
@@ -207,13 +206,46 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 continue
 
             # Check if we already have an open position for this symbol
-            if symbol in cash_mgr.open_positions:
+            # 1. Check local cache
+            has_position = symbol in cash_mgr.open_positions
+
+            # 2. Check API directly (to handle restarts or out-of-sync state)
+            if not has_position:
+                try:
+                    positions = await angel_client.get_positions()
+                    for p in positions:
+                        # Check for non-zero quantity and matching symbol
+                        if (
+                            symbol in p.get("tradingsymbol", "")
+                            and int(p.get("netqty", 0)) != 0
+                        ):
+                            has_position = True
+                            logger.warning(
+                                "[%s] ⚠️ Found existing position in API not in cache. Syncing...",
+                                symbol,
+                            )
+                            # Register in cash manager to track it (approximate)
+                            # We don't have entry price, but we can prevent new trades
+                            cash_mgr.open_positions[symbol] = {
+                                "symbol": p.get("tradingsymbol"),
+                                "quantity": int(p.get("netqty", 0)),
+                                "entry_price": float(p.get("avgnetprice", 0)),  # Approx
+                                "entry_time": datetime.now(),
+                            }
+                            break
+                except Exception as e:
+                    logger.error("[%s] Error checking positions: %s", symbol, e)
+
+            if has_position:
                 # Poll for position closure via Angel API
                 positions = await angel_client.get_positions()
                 has_pos = False
 
                 for p in positions:
-                    if symbol in p.get("tradingsymbol", ""):
+                    if (
+                        symbol in p.get("tradingsymbol", "")
+                        and int(p.get("netqty", 0)) != 0
+                    ):
                         has_pos = True
                         break
 
@@ -221,6 +253,10 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                     logger.info("[%s] ✅ Position closed", symbol)
                     cash_mgr.force_release(symbol)
                     send_telegram(f"✅ {symbol} position closed")
+                else:
+                    logger.info(
+                        "[%s] ⚠️ Position still open, skipping signal check...", symbol
+                    )
 
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
@@ -529,137 +565,6 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
     logger.info("[%s] 🛑 Worker exiting", symbol)
 
 
-async def data_fetcher_loop(symbol, angel_client, bar_manager, symbol_index=0):
-    """
-    Background task that fetches new 1-minute bars aligned to 5-minute boundaries.
-    Only fetches during market hours to avoid wasting API calls.
-    Fetches 15 minutes of data with overlap to ensure no gaps.
-
-    Args:
-        symbol: Symbol to fetch data for
-        angel_client: Angel API client
-        bar_manager: Bar manager for this symbol
-        symbol_index: Index of symbol in list (for staggered startup)
-    """
-    from core.config import MARKET_HOURS_ONLY
-
-    # Stagger initial startup to prevent hitting rate limits during initialization
-    startup_delay = symbol_index * 0.4
-    if startup_delay > 0:
-        logger.info(
-            "[%s] 📡 Data fetcher starting in %.1fs (staggered)", symbol, startup_delay
-        )
-        await asyncio.sleep(startup_delay)
-
-    logger.info("[%s] 📡 Data fetcher started", symbol)
-    retry_count = 0
-
-    while not _STOP:
-        try:
-            now_ist = get_ist_now()
-
-            # Strict Market Close Check
-            if now_ist.time() >= time(15, 30):
-                logger.info(
-                    "[%s] 🛑 Market closed (15:30 reached), stopping data fetcher",
-                    symbol,
-                )
-                break
-
-            # Check if market is open (only fetch during market hours)
-            if MARKET_HOURS_ONLY and not is_market_open():
-                # Market is closed, sleep until next 5-minute boundary
-                next_check = get_next_candle_close_time(now_ist, "5min")
-                sleep_seconds = get_seconds_until_next_close(now_ist, "5min")
-
-                logger.debug(
-                    "[%s] 💤 Market closed, data fetcher sleeping until %s IST",
-                    symbol,
-                    next_check.strftime("%H:%M:%S"),
-                )
-                await asyncio.sleep(sleep_seconds)
-                continue
-
-            # Market is open - fetch data
-            # Fetch last 15 minutes of data to ensure we don't miss any bars
-            df_new = await angel_client.req_historic_1m(symbol, duration_days=0.0104)
-
-            if df_new is not None and not df_new.empty:
-                # Add new bars to BarManager
-                for idx, row in df_new.iterrows():
-                    bar_dict = {
-                        "datetime": idx,
-                        "open": row["open"],
-                        "high": row["high"],
-                        "low": row["low"],
-                        "close": row["close"],
-                        "volume": row["volume"],
-                    }
-                    await bar_manager.add_bar(bar_dict)
-
-                logger.info(
-                    "[%s] 📊 Fetched %d 1m candles at %s IST",
-                    symbol,
-                    len(df_new),
-                    now_ist.strftime("%H:%M:%S"),
-                )
-                retry_count = 0  # Reset retry counter on success
-            else:
-                logger.warning(
-                    "[%s] ⚠️ No data returned from API at %s IST (market open)",
-                    symbol,
-                    now_ist.strftime("%H:%M:%S"),
-                )
-
-            # Sleep until next 5-minute boundary (00, 05, 10, 15, 20, 25, etc.)
-            now_ist = get_ist_now()
-
-            # Strict check again before sleeping
-            if now_ist.time() >= time(15, 30):
-                logger.info(
-                    "[%s] 🛑 Market closed (15:30 reached), stopping data fetcher",
-                    symbol,
-                )
-                break
-
-            next_fetch = get_next_candle_close_time(now_ist, "5min")
-            sleep_seconds = get_seconds_until_next_close(now_ist, "5min")
-
-            logger.debug(
-                "[%s] ⏰ Next data fetch at %s IST (sleeping %ds)",
-                symbol,
-                next_fetch.strftime("%H:%M:%S"),
-                sleep_seconds,
-            )
-            await asyncio.sleep(sleep_seconds)
-
-        except Exception as e:
-            retry_count += 1
-            logger.exception(
-                "[%s] ❌ Data fetcher exception (retry #%d) at %s IST: %s",
-                symbol,
-                retry_count,
-                get_ist_now().strftime("%H:%M:%S"),
-                e,
-            )
-
-            # Check if it's a rate limiting error
-            error_str = str(e).lower()
-            if "ab1004" in error_str or "try after sometime" in error_str:
-                logger.warning(
-                    "[%s] 🚫 API rate limit detected, waiting 2 minutes before retry...",
-                    symbol,
-                )
-                await asyncio.sleep(120)  # Wait 2 minutes for rate limiting
-            else:
-                # For other errors, wait until next 5-minute boundary
-                now_ist = get_ist_now()
-                sleep_seconds = get_seconds_until_next_close(now_ist, "5min")
-                await asyncio.sleep(sleep_seconds)
-
-    logger.info("[%s] 🛑 Data fetcher exiting", symbol)
-
-
 async def pre_market_check(cash_mgr):
     """
     Perform pre-market balance check and notification.
@@ -778,19 +683,24 @@ async def run_all_workers():
             start_time = time(9, 0)
             end_time = time(15, 30)
 
-            # Check if we are in the active window
-            is_active_window = start_time <= current_time < end_time
+            # Check if we are in the active window (Mon-Fri, 09:00-15:30)
+            is_weekday = now_ist.weekday() <= 4  # 0=Mon, 4=Fri
+            is_active_window = is_weekday and (start_time <= current_time < end_time)
 
             if not is_active_window:
                 # Calculate wait time until next start (09:00 AM)
-                if current_time >= end_time:
-                    # Wait until tomorrow 09:00
+                if current_time >= end_time or not is_weekday:
+                    # Wait until tomorrow 09:00 (start point)
                     next_start = datetime.combine(
                         now_ist.date() + timedelta(days=1), start_time
                     )
                 else:
-                    # Wait until today 09:00
+                    # Wait until today 09:00 (if started before market open)
                     next_start = datetime.combine(now_ist.date(), start_time)
+
+                # Skip weekends
+                while next_start.weekday() > 4:  # If Sat(5) or Sun(6)
+                    next_start += timedelta(days=1)
 
                 # Make next_start timezone aware
                 tz = pytz.timezone("Asia/Kolkata")
@@ -863,32 +773,35 @@ async def run_all_workers():
             logger.info("🔍 Checking account balance...")
             await pre_market_check(cash_mgr)
 
-            # Start worker tasks AND data fetcher tasks
+            # Start worker tasks
             tasks = []
 
-            # Heartbeat is already running globally
+            # Initialize WebSocket
+            from core.angel_client import AngelWebSocket
 
-            # Start end-of-day report scheduler
-            # Note: The scheduler itself waits for 15:30, but since we are now handling the daily loop here,
-            # we might not strictly need a separate scheduler if we just run it at the end of this block.
-            # However, keeping it as a task ensures it runs in parallel if we want it to.
-            # But simpler is better: let's run the report explicitly after workers exit (at 15:30).
-            # So we WON'T start the scheduler task, we'll just call the report function at the end.
-
-            # Start data fetcher for each symbol
-            logger.info(
-                "🚀 Starting background data fetchers (5-minute interval, staggered startup)..."
+            logger.info("🚀 Starting Angel WebSocket...")
+            ws_client = AngelWebSocket(
+                auth_token=angel_client.auth_token,
+                api_key=angel_client.api_key,
+                client_code=angel_client.client_code,
+                feed_token=angel_client.feed_token,
+                bar_managers=bar_managers,
+                loop=asyncio.get_running_loop(),
             )
-            for idx, symbol in enumerate(SYMBOLS):
-                bar_mgr = bar_managers.get(symbol)
-                tasks.append(
-                    data_fetcher_loop(symbol, angel_client, bar_mgr, symbol_index=idx)
-                )
-                logger.info(
-                    "[%s] 📡 Data fetcher thread queued (delay: %.1fs)",
-                    symbol,
-                    idx * 0.4,
-                )
+
+            # Add symbols to WebSocket
+            for symbol in SYMBOLS:
+                token = angel_client.get_symbol_token(symbol, "NSE")
+                if token:
+                    ws_client.add_symbol(symbol, token, "NSE")
+                else:
+                    logger.error(f"Could not find token for {symbol} to subscribe")
+
+            # Start WebSocket in a separate thread (it's blocking)
+            import threading
+
+            ws_thread = threading.Thread(target=ws_client.connect, daemon=True)
+            ws_thread.start()
 
             # Start worker loop for each symbol
             logger.info("🚀 Starting worker loops...")

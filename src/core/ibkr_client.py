@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import pandas as pd
-from ib_insync import IB, Stock, Option, MarketOrder, LimitOrder, util
+from ib_insync import IB, Stock, Option, MarketOrder, LimitOrder, StopOrder, util
 
 from core.config import (
     IB_HOST,
@@ -421,40 +421,79 @@ class IBKRClient:
             Dict with order IDs or None
         """
         try:
-            # Place entry order (Market BUY)
-            entry = await self.place_order(
-                option_contract, action="BUY", quantity=quantity, order_type="MARKET"
+            # 1. Create Parent Order (Entry)
+            parent = MarketOrder("BUY", quantity)
+            parent.transmit = False  # Don't send yet
+
+            # 2. Create Stop Loss Order
+            sl = LimitOrder("SELL", quantity, stop_loss_price)
+            sl.parentId = parent.orderId
+            sl.transmit = False
+
+            # 3. Create Take Profit Order
+            tp = LimitOrder("SELL", quantity, target_price)
+            tp.parentId = parent.orderId
+            tp.transmit = True  # Transmit all
+
+            # Place orders
+            # Note: We need to qualify contracts first?
+            # placeOrder returns a Trade object immediately
+
+            # We need to ensure orderIds are assigned.
+            # ib_insync usually handles this if we use ib.placeOrder
+
+            # Let's use the bracketOrder helper from ib_insync if available,
+            # or manually construct as above.
+            # Manual construction is safer for custom logic.
+
+            # We need to get next valid order ID?
+            # ib_insync manages this.
+
+            # However, we need to place them.
+            # Since we can't easily get the parent ID before placing in some APIs,
+            # ib_insync allows setting parentId if we know it.
+            # Actually, ib.bracketOrder() is the best way.
+
+            bracket = self.ib.bracketOrder(
+                "BUY",
+                quantity,
+                limitPrice=0,  # Market order
+                takeProfitPrice=target_price,
+                stopLossPrice=stop_loss_price,
             )
 
-            if not entry:
-                logger.error("[IBKR] Entry order failed")
-                return None
+            # bracketOrder returns [parent, takeProfit, stopLoss]
+            # But parent is LimitOrder by default in some versions?
+            # Let's check signature: bracketOrder(action, quantity, limitPrice, takeProfitPrice, stopLossPrice)
+            # If limitPrice=0, is it Market? No, it's Limit.
+            # We want Market Entry.
 
-            # Wait for fill
-            await asyncio.sleep(2)
+            # Let's stick to manual parent-child construction which is robust.
 
-            # Place stop-loss order
-            sl_order = await self.place_order(
-                option_contract,
-                action="SELL",
-                quantity=quantity,
-                order_type="LIMIT",
-                limit_price=stop_loss_price,
-            )
+            parent = MarketOrder("BUY", quantity)
+            parent.transmit = False
 
-            # Place target order
-            target_order = await self.place_order(
-                option_contract,
-                action="SELL",
-                quantity=quantity,
-                order_type="LIMIT",
-                limit_price=target_price,
-            )
+            trade_parent = self.ib.placeOrder(option_contract, parent)
+            # We need the orderId. It might be 0 initially until processed?
+            # ib_insync usually assigns a temp ID or valid ID.
+
+            await asyncio.sleep(0.5)  # Wait for ID assignment
+
+            sl = StopOrder("SELL", quantity, stop_loss_price)
+            sl.parentId = trade_parent.order.orderId
+            sl.transmit = False
+
+            tp = LimitOrder("SELL", quantity, target_price)
+            tp.parentId = trade_parent.order.orderId
+            tp.transmit = True
+
+            trade_sl = self.ib.placeOrder(option_contract, sl)
+            trade_tp = self.ib.placeOrder(option_contract, tp)
 
             result = {
-                "entry_order_id": entry["order_id"],
-                "sl_order_id": sl_order["order_id"] if sl_order else None,
-                "target_order_id": target_order["order_id"] if target_order else None,
+                "entry_order_id": trade_parent.order.orderId,
+                "sl_order_id": trade_sl.order.orderId,
+                "target_order_id": trade_tp.order.orderId,
             }
 
             logger.info(f"[IBKR] Bracket order placed: {result}")

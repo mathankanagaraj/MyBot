@@ -514,8 +514,29 @@ async def run_ibkr_workers():
             # Check for Market Close / Sleep Time FIRST
             # This ensures we sleep even if disconnected (e.g. Gateway restart at close)
             now_et = get_us_et_now()
-            if now_et.time() >= time(16, 0):
-                logger.info("[IBKR] 🌙 Market closed. Calculating sleep time...")
+
+            # Sleep if:
+            # 1. It's the weekend (Sat/Sun)
+            # 2. It's past market close (>= 16:00)
+            # 3. It's before market open (e.g. 05:00 AM) - wait, we want to wake up at 09:30.
+            #    But if we just sleep until next open, that covers it.
+
+            is_weekend = now_et.weekday() > 4
+            is_market_closed = now_et.time() >= time(16, 0)
+
+            # Note: We don't strictly check "before market open" here because we might want to connect early?
+            # But the logic below calculates "next_open".
+            # If we are at 08:00 AM, next_open is Today 09:30. Sleep is 1.5h.
+            # So we should enter this block if we are NOT in active hours.
+
+            # Active hours: 09:30 to 16:00 (approx, maybe start earlier for pre-market)
+            # Let's say we want to be active from 09:00 to 16:00.
+            is_active_hours = time(9, 0) <= now_et.time() < time(16, 0)
+
+            if is_weekend or not is_active_hours:
+                logger.info(
+                    "[IBKR] 🌙 Market closed/Weekend. Calculating sleep time..."
+                )
 
                 next_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
 

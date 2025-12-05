@@ -7,6 +7,7 @@ import pandas as pd
 import pyotp
 import requests
 from SmartApi import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 from core.config import (
     ANGEL_API_KEY,
@@ -44,9 +45,11 @@ class AngelClient:
         self.symbol_cache = {}
 
         self.alert_sent = False
-        
+
         # API Rate Limiter (90% of official limits for safety)
-        self.rate_limiter = APIRateLimiter(enabled=enable_rate_limiting, safety_margin=0.9)
+        self.rate_limiter = APIRateLimiter(
+            enabled=enable_rate_limiting, safety_margin=0.9
+        )
 
     async def connect_async(self, retry_backoff=1.0, max_backoff=60.0):
         """
@@ -74,9 +77,13 @@ class AngelClient:
                 # Fallback to password login if MPIN not used or failed (and no data returned yet)
                 if not data:
                     if self.pin:
-                        logger.warning("MPIN login failed or returned no data, trying password login...")
+                        logger.warning(
+                            "MPIN login failed or returned no data, trying password login..."
+                        )
                     # Generate session with password
-                    data = self.smart_api.generateSession(self.client_code, self.password, totp)
+                    data = self.smart_api.generateSession(
+                        self.client_code, self.password, totp
+                    )
 
                 if data and data.get("status"):
                     self.auth_token = data["data"]["jwtToken"]
@@ -111,7 +118,9 @@ class AngelClient:
                     try:
                         from core.utils import send_telegram
 
-                        send_telegram(f"⚠️ Angel Broker connection failed: {str(e)[:100]}")
+                        send_telegram(
+                            f"⚠️ Angel Broker connection failed: {str(e)[:100]}"
+                        )
                     except Exception:
                         pass
                     self.alert_sent = True
@@ -127,7 +136,9 @@ class AngelClient:
         try:
             # Add the MPIN route if not present
             if "api.login.mpin" not in self.smart_api._routes:
-                self.smart_api._routes["api.login.mpin"] = "/rest/auth/angelbroking/user/v1/loginByMPIN"
+                self.smart_api._routes["api.login.mpin"] = (
+                    "/rest/auth/angelbroking/user/v1/loginByMPIN"
+                )
 
             # Prepare payload - assuming 'mpin' key based on standard practices
             # If this fails, we might need to try 'password' key with MPIN value
@@ -202,7 +213,9 @@ class AngelClient:
             response.raise_for_status()
 
             self.scrip_master = response.json()
-            logger.info(f"Loaded {len(self.scrip_master)} instruments from Scrip Master")
+            logger.info(
+                f"Loaded {len(self.scrip_master)} instruments from Scrip Master"
+            )
 
             # Build symbol cache for quick lookup
             for instrument in self.scrip_master:
@@ -242,7 +255,10 @@ class AngelClient:
             # Search in scrip master
             for instrument in self.scrip_master or []:
                 # Check against 'name' (underlying) OR 'symbol' (trading symbol)
-                if (instrument.get("name") == symbol or instrument.get("symbol") == symbol) and instrument.get("exch_seg") == exchange:
+                if (
+                    instrument.get("name") == symbol
+                    or instrument.get("symbol") == symbol
+                ) and instrument.get("exch_seg") == exchange:
                     token = instrument.get("token")
                     self.symbol_cache[key] = instrument
                     return token
@@ -271,7 +287,9 @@ class AngelClient:
         try:
             symbol_token = self.get_symbol_token(symbol, exchange)
             if not symbol_token:
-                logger.error(f"Cannot fetch history: symbol token not found for {symbol}")
+                logger.error(
+                    f"Cannot fetch history: symbol token not found for {symbol}"
+                )
                 return None
 
             # Calculate from/to dates
@@ -296,12 +314,12 @@ class AngelClient:
             )
 
             # Rate limiting for getCandleData (3/sec, 180/min, 5000/hour)
-            await self.rate_limiter.acquire('getCandleData')
-            
+            await self.rate_limiter.acquire("getCandleData")
+
             # Add timeout to prevent indefinite blocking
             data = await asyncio.wait_for(
                 asyncio.to_thread(self.smart_api.getCandleData, historic_param),
-                timeout=10.0
+                timeout=10.0,
             )
 
             if not data or not data.get("data"):
@@ -309,7 +327,7 @@ class AngelClient:
                 if data and data.get("errorcode"):
                     error_code = data.get("errorcode")
                     error_msg = data.get("message", "Unknown error")
-                    
+
                     if error_code == "AB1004":
                         logger.warning(
                             f"[{symbol}] ⚠️ API Rate Limit (AB1004): {error_msg}. "
@@ -326,7 +344,9 @@ class AngelClient:
 
             # Convert to DataFrame
             candles = data["data"]
-            df = pd.DataFrame(candles, columns=["datetime", "open", "high", "low", "close", "volume"])
+            df = pd.DataFrame(
+                candles, columns=["datetime", "open", "high", "low", "close", "volume"]
+            )
 
             # Convert datetime to pandas datetime
             df["datetime"] = pd.to_datetime(df["datetime"])
@@ -334,9 +354,16 @@ class AngelClient:
             # Convert to UTC (Angel returns IST)
             # Check if datetime is already timezone aware
             if df["datetime"].dt.tz is None:
-                df["datetime"] = df["datetime"].dt.tz_localize("Asia/Kolkata").dt.tz_convert("UTC").dt.tz_localize(None)
+                df["datetime"] = (
+                    df["datetime"]
+                    .dt.tz_localize("Asia/Kolkata")
+                    .dt.tz_convert("UTC")
+                    .dt.tz_localize(None)
+                )
             else:
-                df["datetime"] = df["datetime"].dt.tz_convert("UTC").dt.tz_localize(None)
+                df["datetime"] = (
+                    df["datetime"].dt.tz_convert("UTC").dt.tz_localize(None)
+                )
 
             # Set index and select OHLCV columns
             df = df.set_index("datetime")[["open", "high", "low", "close", "volume"]]
@@ -350,9 +377,13 @@ class AngelClient:
 
         except Exception as e:
             error_str = str(e)
-            
+
             # Detect rate limiting in exception message
-            if "AB1004" in error_str or "Try After Sometime" in error_str:
+            if (
+                "AB1004" in error_str
+                or "Try After Sometime" in error_str
+                or "Access denied" in error_str
+            ):
                 logger.error(
                     f"[{symbol}] 🚫 API Rate Limit Exception: {error_str[:200]}"
                 )
@@ -360,7 +391,9 @@ class AngelClient:
                 logger.exception(f"Error fetching historical data for {symbol}: {e}")
             return None
 
-    async def get_last_price(self, symbol: str, exchange: str = "NSE") -> Optional[float]:
+    async def get_last_price(
+        self, symbol: str, exchange: str = "NSE"
+    ) -> Optional[float]:
         """
         Get current last traded price for a symbol.
 
@@ -377,12 +410,14 @@ class AngelClient:
                 return None
 
             # Rate limiting for ltpData (10/sec, 500/min, 5000/hour)
-            await self.rate_limiter.acquire('ltpData')
-            
+            await self.rate_limiter.acquire("ltpData")
+
             # Use LTP API with timeout
             ltp_data = await asyncio.wait_for(
-                asyncio.to_thread(self.smart_api.ltpData, exchange, symbol, symbol_token),
-                timeout=5.0
+                asyncio.to_thread(
+                    self.smart_api.ltpData, exchange, symbol, symbol_token
+                ),
+                timeout=5.0,
             )
 
             if ltp_data and ltp_data.get("data"):
@@ -429,12 +464,17 @@ class AngelClient:
                         expiry_date = datetime.strptime(expiry_str, "%d%b%Y").date()
                     except ValueError:
                         try:
-                            expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+                            expiry_date = datetime.strptime(
+                                expiry_str, "%Y-%m-%d"
+                            ).date()
                         except ValueError:
                             continue
 
                     # Check if current month
-                    if expiry_date.month == current_month and expiry_date.year == current_year:
+                    if (
+                        expiry_date.month == current_month
+                        and expiry_date.year == current_year
+                    ):
                         futures_symbol = instrument.get("symbol")
                         futures_token = instrument.get("token")
                         break
@@ -444,8 +484,8 @@ class AngelClient:
                 return None
 
             # Rate limiting for ltpData (10/sec, 500/min, 5000/hour)
-            await self.rate_limiter.acquire('ltpData')
-            
+            await self.rate_limiter.acquire("ltpData")
+
             # Get LTP for futures
             ltp_data = self.smart_api.ltpData("NFO", futures_symbol, futures_token)
 
@@ -504,15 +544,29 @@ class AngelClient:
                 order_params["price"] = str(price)
 
             response = await asyncio.wait_for(
-                asyncio.to_thread(self.smart_api.placeOrder, order_params),
-                timeout=10.0
+                asyncio.to_thread(self.smart_api.placeOrder, order_params), timeout=10.0
             )
 
-            if response and response.get("status"):
-                logger.info(f"Order placed: {response}")
-                return response
-            else:
+            if response:
+                # Handle case where response is a string (e.g. order ID)
+                if isinstance(response, str):
+                    logger.info(f"Order placed (ID only): {response}")
+                    # Construct a fake response dict so callers don't break
+                    return {
+                        "status": True,
+                        "message": "SUCCESS",
+                        "data": {"orderid": response},
+                    }
+
+                # Handle standard dict response
+                if isinstance(response, dict) and response.get("status"):
+                    logger.info(f"Order placed: {response}")
+                    return response
+
                 logger.error(f"Order placement failed: {response}")
+                return None
+            else:
+                logger.error("Order placement failed: No response")
                 return None
 
         except Exception as e:
@@ -590,8 +644,14 @@ class AngelClient:
 
             result = {
                 "entry_order_id": entry_order_id,
-                "sl_order_id": sl_order.get("data", {}).get("orderid") if sl_order else None,
-                "target_order_id": target_order.get("data", {}).get("orderid") if target_order else None,
+                "sl_order_id": (
+                    sl_order.get("data", {}).get("orderid") if sl_order else None
+                ),
+                "target_order_id": (
+                    target_order.get("data", {}).get("orderid")
+                    if target_order
+                    else None
+                ),
             }
 
             logger.info(f"Bracket order placed: {result}")
@@ -609,8 +669,8 @@ class AngelClient:
         """
         try:
             # Rate limiting for getPosition (1/sec)
-            await self.rate_limiter.acquire('getPosition')
-            
+            await self.rate_limiter.acquire("getPosition")
+
             response = self.smart_api.position()
 
             if response and response.get("data"):
@@ -631,8 +691,8 @@ class AngelClient:
         """
         try:
             # Rate limiting for getRMS (2/sec)
-            await self.rate_limiter.acquire('getRMS')
-            
+            await self.rate_limiter.acquire("getRMS")
+
             # Get RMS Limits (Risk Management System)
             rms = self.smart_api.rmsLimit()
 
@@ -656,10 +716,137 @@ class AngelClient:
         Note: Angel WebSocket implementation would go here.
         For now, we'll use polling as a simpler alternative.
         """
-        logger.warning("Real-time WebSocket streaming not yet implemented for Angel Broker")
+        logger.warning(
+            "Real-time WebSocket streaming not yet implemented for Angel Broker"
+        )
         logger.info(f"Using polling mode for {symbol}")
         return None
 
     def unsubscribe_realtime_bars(self, subscription):
         """Unsubscribe from real-time data"""
         pass
+
+
+class AngelWebSocket:
+    """
+    Wrapper for Angel One WebSocket V2.
+    Handles real-time data streaming and updates BarManagers.
+    """
+
+    def __init__(
+        self, auth_token, api_key, client_code, feed_token, bar_managers, loop=None
+    ):
+        """
+        Args:
+            auth_token: JWT auth token
+            api_key: API Key
+            client_code: Client Code
+            feed_token: Feed Token
+            bar_managers: Dict mapping symbol -> BarManager
+            loop: Asyncio event loop (required for thread-safe updates)
+        """
+        self.sws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token)
+        self.bar_managers = bar_managers
+        self.loop = loop or asyncio.get_event_loop()
+        self.token_map = {}  # Map token -> symbol
+        self.subscribed_tokens = set()
+
+    def _on_data(self, wsapp, message):
+        """Callback for incoming tick data"""
+        try:
+            # Message is a dict with 'token', 'last_traded_price', 'last_traded_time', etc.
+            token = message.get("token")
+            if not token:
+                return
+
+            symbol = self.token_map.get(token)
+            if not symbol:
+                return
+
+            bar_manager = self.bar_managers.get(symbol)
+            if not bar_manager:
+                return
+
+            price = float(message.get("last_traded_price", 0))
+            if price == 0:
+                return
+
+            # Angel One WebSocket V2 sends price in paise (integer) for some segments?
+            # User logs show NIFTY ~ 2600000, which is 100x.
+            # We need to detect if it's in paise and convert to rupees.
+            # Heuristic: If price is > 100000 (e.g. 1 lakh) for a stock/index that shouldn't be, it's likely paise.
+            # NIFTY is ~24000. 2400000 is paise.
+            # MRF is ~1.3 Lakh. 13000000 is paise.
+            # Let's assume if it's > 200000 it MIGHT be paise, but MRF is an exception.
+            # Better approach: The API doc says "last_traded_price" is in paise for some, rupees for others?
+            # Actually, SmartAPI V2 usually sends in paise.
+            # Let's divide by 100.
+
+            # WAIT: If we divide blindly, what if it IS rupees?
+            # Let's look at the logs again: NIFTY 2619395.00.
+            # If we divide by 100 -> 26193.95. This matches current Nifty levels.
+            # INFY 161510.00 -> 1615.10. Matches INFY levels.
+            # So it IS consistently 100x.
+
+            price = price / 100.0
+
+            # Timestamp handling
+            ts_raw = message.get("exchange_timestamp") or message.get(
+                "last_traded_time"
+            )
+            if isinstance(ts_raw, int):
+                # Check if timestamp is in milliseconds (13 digits)
+                if ts_raw > 9999999999:
+                    timestamp = datetime.fromtimestamp(ts_raw / 1000)
+                else:
+                    timestamp = datetime.fromtimestamp(ts_raw)
+            else:
+                timestamp = datetime.now()
+
+            # Pass to BarManager using thread-safe scheduling
+            if self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    bar_manager.process_tick(price, timestamp, 0), self.loop
+                )
+            else:
+                logger.error("Event loop is not running, cannot process tick")
+
+        except Exception as e:
+            logger.error(f"WebSocket data error: {e}")
+
+    def _on_open(self, wsapp):
+        logger.info("✅ Angel WebSocket Connected")
+
+        # Subscribe to all tokens
+        if self.token_map:
+            tokens = list(self.token_map.keys())
+            # Mode 1: LTP (Fastest)
+            correlation_id = "subscribe_all"
+            mode = 1
+
+            # Split tokens by exchange (NSE vs NFO)
+            # This is a simplification; ideally we store exchange info
+            # For now, let's assume all are NSE (1) or NFO (2)
+            # We'll try subscribing as NSE first
+            token_list = [{"exchangeType": 1, "tokens": tokens}]
+
+            self.sws.subscribe(correlation_id, mode, token_list)
+            logger.info(f"Subscribed to {len(tokens)} tokens")
+
+    def _on_close(self, wsapp):
+        logger.warning("Angel WebSocket Closed")
+
+    def _on_error(self, wsapp, error):
+        logger.error(f"Angel WebSocket Error: {error}")
+
+    def connect(self):
+        """Start the WebSocket connection (blocking)"""
+        self.sws.on_data = self._on_data
+        self.sws.on_open = self._on_open
+        self.sws.on_close = self._on_close
+        self.sws.on_error = self._on_error
+        self.sws.connect()
+
+    def add_symbol(self, symbol, token, exchange="NSE"):
+        """Add a symbol to be tracked"""
+        self.token_map[token] = symbol

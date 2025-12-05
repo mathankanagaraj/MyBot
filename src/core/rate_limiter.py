@@ -160,23 +160,35 @@ class APIRateLimiter:
         self.limiters = {
             # Historical data - MOST CRITICAL (3/sec, 180/min, 5000/hour)
             "getCandleData": TokenBucket(
-                per_second=3, per_minute=180, per_hour=5000, safety_margin=safety_margin
+                per_second=1, per_minute=180, per_hour=5000, safety_margin=safety_margin
             ),
             # Get LTP - HIGH USAGE (10/sec, 500/min, 5000/hour)
             "ltpData": TokenBucket(
-                per_second=10, per_minute=500, per_hour=5000, safety_margin=safety_margin
+                per_second=10,
+                per_minute=500,
+                per_hour=5000,
+                safety_margin=safety_margin,
             ),
             # Place order (20/sec, 500/min, 1000/hour)
             "placeOrder": TokenBucket(
-                per_second=20, per_minute=500, per_hour=1000, safety_margin=safety_margin
+                per_second=20,
+                per_minute=500,
+                per_hour=1000,
+                safety_margin=safety_margin,
             ),
             # Modify order (20/sec, 500/min, 1000/hour)
             "modifyOrder": TokenBucket(
-                per_second=20, per_minute=500, per_hour=1000, safety_margin=safety_margin
+                per_second=20,
+                per_minute=500,
+                per_hour=1000,
+                safety_margin=safety_margin,
             ),
             # Cancel order (20/sec, 500/min, 1000/hour)
             "cancelOrder": TokenBucket(
-                per_second=20, per_minute=500, per_hour=1000, safety_margin=safety_margin
+                per_second=20,
+                per_minute=500,
+                per_hour=1000,
+                safety_margin=safety_margin,
             ),
             # Get positions (1/sec)
             "getPosition": TokenBucket(per_second=1, safety_margin=safety_margin),
@@ -186,7 +198,10 @@ class APIRateLimiter:
             "getOrderBook": TokenBucket(per_second=1, safety_margin=safety_margin),
             # Quote/market data (10/sec, 500/min, 5000/hour)
             "quote": TokenBucket(
-                per_second=10, per_minute=500, per_hour=5000, safety_margin=safety_margin
+                per_second=10,
+                per_minute=500,
+                per_hour=5000,
+                safety_margin=safety_margin,
             ),
         }
 
