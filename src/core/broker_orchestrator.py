@@ -21,7 +21,7 @@ async def run_multi_broker():
 
     # With separate containers, run only the configured broker
     if BROKER == "ANGEL":
-        logger.info("[ANGEL] 🇮🇳 Starting Angel One worker...")
+        logger.info("🇮🇳 Starting Angel One worker...")
         try:
             from core.angelone.worker import run_angel_workers
 
@@ -33,7 +33,7 @@ async def run_multi_broker():
             logger.info("👋 Angel worker shutdown complete")
 
     elif BROKER == "IBKR":
-        logger.info("[IBKR] 🇺🇸 Starting IBKR worker...")
+        logger.info("🇺🇸 Starting IBKR worker...")
         try:
             from core.ibkr.worker import run_ibkr_workers
 

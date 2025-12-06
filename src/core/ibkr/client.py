@@ -302,9 +302,7 @@ class IBKRClient:
             else:
                 # For options, symbol should be the full option symbol
                 # This is simplified - would need proper parsing
-                logger.warning(
-                    f"[IBKR] Option price lookup not fully implemented: {symbol}"
-                )
+                logger.warning(f"Option price lookup not fully implemented: {symbol}")
                 return None
 
             await self.ib.qualifyContractsAsync(contract)
@@ -319,7 +317,7 @@ class IBKRClient:
             elif ticker.close > 0:
                 price = ticker.close
             else:
-                logger.warning(f"[IBKR] [{symbol}] No valid price data")
+                logger.warning(f"[{symbol}] No valid price data")
                 return None
 
             # Cancel market data
@@ -328,7 +326,7 @@ class IBKRClient:
             return float(price)
 
         except Exception as e:
-            logger.exception(f"[IBKR] Error getting last price for {symbol}: {e}")
+            logger.exception(f"Error getting last price for {symbol}: {e}")
             return None
 
     async def place_bracket_order(
@@ -495,7 +493,7 @@ class IBKRClient:
             return result
 
         except Exception as e:
-            logger.exception(f"[IBKR] Error getting positions: {e}")
+            logger.exception(f"Error getting positions: {e}")
             return []
 
     async def get_account_summary_async(self) -> Dict:
@@ -521,5 +519,5 @@ class IBKRClient:
             return summary
 
         except Exception as e:
-            logger.exception(f"[IBKR] Error getting account summary: {e}")
+            logger.exception(f"Error getting account summary: {e}")
             return {}

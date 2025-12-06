@@ -596,7 +596,7 @@ async def run_ibkr_workers():
                 wait_hours = wait_seconds / 3600
 
                 logger.info(
-                    f"[IBKR] 💤 Market closed. Sleeping {wait_hours:.1f} hours until "
+                    f"💤 Market closed. Sleeping {wait_hours:.1f} hours until "
                     f"{next_start.strftime('%Y-%m-%d %H:%M')} ET (09:00 market open)"
                 )
 
@@ -697,4 +697,4 @@ def stop_ibkr_workers():
     """Stop all IBKR workers"""
     global _STOP
     _STOP = True
-    logger.info("[IBKR] 🛑 Stop signal sent to all workers")
+    logger.info("🛑 Stop signal sent to all workers")
