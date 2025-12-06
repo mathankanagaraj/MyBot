@@ -30,7 +30,7 @@ async def find_ibkr_option_contract(
     """
     try:
         logger.info(
-            f"[IBKR] [{symbol}] Selecting option: Bias={bias}, Price=${underlying_price:.2f}"
+            f"[{symbol}] Selecting option: Bias={bias}, Price=${underlying_price:.2f}"
         )
 
         # Get option chain
@@ -75,7 +75,7 @@ async def find_ibkr_option_contract(
                     itm_options, key=lambda x: x["strike"]
                 )  # Highest strike below price
             else:
-                # No ATM available, use ATM
+                # No ITM available, use ATM
                 selected = min(
                     valid_options, key=lambda x: abs(x["strike"] - underlying_price)
                 )
@@ -110,19 +110,21 @@ async def find_ibkr_option_contract(
             "right": selected["right"],
             "dte": selected["dte"],
             "premium": premium,
-            "lot_size": 100,  # US options are always 100 shares per contract
+            "lot_size": int(
+                selected["contract"].multiplier or 100
+            ),  # Get multiplier from contract
             "token": selected["symbol"],  # Use symbol as token for consistency
         }
 
         logger.info(
-            f"[IBKR] [{symbol}] Selected: {result['symbol']} "
+            f"[{symbol}] Selected: {result['symbol']} "
             f"Strike=${result['strike']:.2f} DTE={result['dte']} Premium=${premium:.2f}"
         )
 
         return result, "Success"
 
     except Exception as e:
-        logger.exception(f"[IBKR] Error selecting option for {symbol}: {e}")
+        logger.exception(f"Error selecting option for {symbol}: {e}")
         return None, str(e)
 
 
@@ -157,7 +159,7 @@ async def get_option_price(ibkr_client, contract) -> Optional[float]:
         elif ticker.close > 0:
             price = ticker.close
         else:
-            logger.warning(f"[IBKR] No valid price data for {contract.symbol}")
+            logger.warning(f"No valid price data for {contract.symbol}")
             ibkr_client.ib.cancelMktData(contract)
             return None
 
@@ -167,5 +169,5 @@ async def get_option_price(ibkr_client, contract) -> Optional[float]:
         return float(price)
 
     except Exception as e:
-        logger.exception(f"[IBKR] Error getting option price: {e}")
+        logger.exception(f"Error getting option price: {e}")
         return None

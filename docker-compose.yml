@@ -4,7 +4,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile # Uses shared image
-    image: trading_bot:latest # Shared image name
+    image: angel_bot:latest # Unique image name
     container_name: angel_options_bot
     env_file: .env
     environment:
@@ -20,7 +20,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile # Uses same shared image
-    image: trading_bot:latest # Same shared image name
+    image: ibkr_bot:latest # Unique image name
     container_name: ibkr_options_bot
     env_file: .env
     environment:

@@ -9,11 +9,31 @@ from datetime import time
 from core.config import IBKR_SYMBOLS
 from core.logger import logger
 from core.utils import send_telegram
-from core.ibkr_utils import is_us_market_open, get_us_et_now
+from core.ibkr.utils import is_us_market_open, get_us_et_now
 
 
 # Global stop flag
 _STOP = False
+
+
+async def heartbeat_task():
+    """
+    Continuous heartbeat to show the bot is alive.
+    Runs 24/7, even when markets are closed.
+    """
+    logger.info("💓 Heartbeat task started")
+    while not _STOP:
+        try:
+            # Use UTC for global heartbeat
+            from datetime import datetime
+
+            now_utc = datetime.utcnow()
+            logger.info(f"💓 Heartbeat: {now_utc.strftime('%H:%M:%S')} UTC")
+            await asyncio.sleep(60)  # Every minute
+        except Exception as e:
+            logger.exception(f"Heartbeat error: {e}")
+            await asyncio.sleep(60)
+    logger.info("💓 Heartbeat task stopped")
 
 
 async def ibkr_data_fetcher(symbol, ibkr_client, bar_manager, symbol_index):
@@ -136,7 +156,7 @@ async def execute_entry_order(symbol, bias, ibkr_client, context="ENTRY"):
     Returns:
         True if order placed successfully, False otherwise
     """
-    from core.ibkr_option_selector import find_ibkr_option_contract
+    from core.ibkr.option_selector import find_ibkr_option_contract
     from core.config import RR_RATIO, IBKR_QUANTITY
 
     # Get stock price
@@ -164,7 +184,7 @@ async def execute_entry_order(symbol, bias, ibkr_client, context="ENTRY"):
     target = premium * (1 + (0.2 * RR_RATIO))
 
     logger.info(
-        f"[IBKR] [{symbol}] 📈 {context} Entry: ${premium:.2f}, "
+        f"[{symbol}] 📈 {context} Entry: ${premium:.2f}, "
         f"SL: ${stop_loss:.2f}, Target: ${target:.2f}"
     )
 
@@ -176,27 +196,48 @@ async def execute_entry_order(symbol, bias, ibkr_client, context="ENTRY"):
     )
 
     # Place bracket order
-    logger.info(f"[IBKR] [{symbol}] 🚀 Placing {context} Bracket Order...")
-    order_ids = await ibkr_client.place_bracket_order(
-        option_info["contract"],
-        IBKR_QUANTITY,
-        stop_loss,
-        target,
-    )
-
-    if not order_ids:
-        logger.error(f"[IBKR] ❌ Failed to place {context} order for {symbol}")
-        send_telegram(f"🚨 [IBKR] {context} Order Placement Failed for {symbol}!")
+    logger.info(f"[{symbol}] 🚀 Placing {context} Bracket Order...")
+    try:
+        # Note: IBKR_QUANTITY = number of option contracts to buy (e.g., 1 contract)
+        # option_info["lot_size"] = shares per contract (always 100 for US options)
+        # Total shares exposure = IBKR_QUANTITY × lot_size (e.g., 1 × 100 = 100 shares)
+        order_ids = await ibkr_client.place_bracket_order(
+            option_info["contract"],
+            IBKR_QUANTITY,
+            stop_loss,
+            target,
+        )
+    except Exception as e:
+        logger.exception(f"[{symbol}] ❌ Exception during place_bracket_order: {e}")
+        send_telegram(
+            f"🚨 [IBKR] [{symbol}] Bracket order exception: {type(e).__name__}: {e}"
+        )
         return False
 
-    logger.info(f"[IBKR] ✅ Order placed! Entry ID: {order_ids.get('entry_order_id')}")
+    # Check if order placement succeeded and has valid entry order ID
+    if not order_ids or not order_ids.get("entry_order_id"):
+        logger.error(
+            f"[{symbol}] ❌ Failed to place {context} order " f"(returned: {order_ids})"
+        )
+        send_telegram(f"🚨 [IBKR] [{symbol}] {context} Order Placement Failed!")
+        return False
+
+    # Success - log and notify
+    logger.info(
+        f"[{symbol}] ✅ {context} Order placed! "
+        f"Entry: {order_ids.get('entry_order_id')}, "
+        f"SL: {order_ids.get('sl_order_id')}, "
+        f"Target: {order_ids.get('target_order_id')}, "
+        f"OCA: {order_ids.get('oca_group', 'N/A')}"
+    )
     send_telegram(
         f"🚀 [IBKR] {context} ORDER PLACED!\n"
         f"Symbol: {symbol}\n"
         f"Contract: {option_info['symbol']}\n"
         f"Entry ID: {order_ids.get('entry_order_id')}\n"
         f"SL ID: {order_ids.get('sl_order_id')}\n"
-        f"Target ID: {order_ids.get('target_order_id')}"
+        f"Target ID: {order_ids.get('target_order_id')}\n"
+        f"OCA Group: {order_ids.get('oca_group', 'N/A')}"
     )
 
     # Report balance
@@ -204,12 +245,12 @@ async def execute_entry_order(symbol, bias, ibkr_client, context="ENTRY"):
         summary = await ibkr_client.get_account_summary_async()
         funds = summary.get("AvailableFunds", 0.0)
         net_liq = summary.get("NetLiquidation", 0.0)
-        logger.info(f"[IBKR] Cash Balance: ${funds:,.2f} | Net Liq: ${net_liq:,.2f}")
+        logger.info(f"Cash Balance: ${funds:,.2f} | Net Liq: ${net_liq:,.2f}")
         send_telegram(
             f"💰 [IBKR] Balance Update:\nCash: ${funds:,.2f}\nNet Liq: ${net_liq:,.2f}"
         )
     except Exception as exc:
-        logger.error(f"[IBKR] Failed to fetch balance: {exc}")
+        logger.error(f"Failed to fetch balance: {exc}")
 
     return True
 
@@ -397,10 +438,10 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
                     break
 
             if found:
-                logger.debug(f"[{sym}] Position check: FOUND ✅")
+                logger.info(f"[{sym}] Position check: FOUND ✅")
                 return True
             else:
-                logger.debug(
+                logger.info(
                     f"[{sym}] Position check: NOT FOUND ❌ (Checked {len(positions)} positions)"
                 )
                 return False
@@ -499,84 +540,157 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
 async def run_ibkr_workers():
     """
     Run IBKR worker for US market with full trading logic.
+    Features:
+    - Daily loop (starts fresh each day)
+    - Smart sleep (waits for market open)
+    - Heartbeat (keeps container alive)
     """
-    from core.ibkr_client import IBKRClient
+    from core.ibkr.client import IBKRClient
     from core.bar_manager import BarManager
+    from datetime import datetime, timedelta
+    import pytz
 
     global _STOP
 
-    logger.info("[IBKR] 🚀 Starting IBKR workers...")
-    send_telegram("🚀 [IBKR] Starting IBKR workers...")
+    logger.info("🤖 IBKR Bot process started")
 
-    # Initialize IBKR client
-    ibkr_client = IBKRClient()
+    # Start heartbeat task immediately and continuously
+    heartbeat = asyncio.create_task(heartbeat_task())
 
-    # Connect to IBKR
-    await ibkr_client.connect_async()
+    while not _STOP:
+        try:
+            # --- 1. Check Market Hours & Sleep Logic ---
+            now_et = get_us_et_now()
+            current_time = now_et.time()
 
-    if not ibkr_client.connected:
-        logger.error("[IBKR] ❌ Failed to connect to IBKR")
-        send_telegram("❌ [IBKR] Failed to connect to IBKR")
-        return
+            # Define active window: 09:00 ET to 16:00 ET
+            # We start at 09:00 to allow 30 mins for pre-market checks/sync
+            start_time = time(9, 0)
+            end_time = time(16, 0)
 
-    logger.info("[IBKR] ✅ Connected to IBKR")
-    send_telegram("✅ [IBKR] Connected to IBKR")
+            # Check if we are in the active window (Mon-Fri)
+            is_weekday = now_et.weekday() <= 4  # 0=Mon, 4=Fri
+            is_active_window = is_weekday and (start_time <= current_time < end_time)
 
-    # Wait for portfolio sync
-    logger.info("[IBKR] ⏳ Waiting 5s for portfolio sync...")
-    await asyncio.sleep(5)
+            if not is_active_window:
+                # Calculate wait time until next start (09:00 ET)
+                if current_time >= end_time or not is_weekday:
+                    # Wait until tomorrow 09:00 (start point)
+                    next_start = datetime.combine(
+                        now_et.date() + timedelta(days=1), start_time
+                    )
+                else:
+                    # Wait until today 09:00 (if started before market open)
+                    next_start = datetime.combine(now_et.date(), start_time)
 
-    # Initialize BarManagers for each symbol
-    bar_managers = {}
+                # Skip weekends
+                while next_start.weekday() > 4:  # If Sat(5) or Sun(6)
+                    next_start += timedelta(days=1)
 
-    logger.info("[IBKR] Initializing BarManagers and loading historical data...")
+                # Make next_start timezone aware
+                tz = pytz.timezone("America/New_York")
+                if next_start.tzinfo is None:
+                    next_start = tz.localize(next_start)
 
-    for symbol in IBKR_SYMBOLS:
-        # Create BarManager
-        bar_mgr = BarManager(symbol, max_bars=2880)  # 2 days of 1m bars
-        bar_managers[symbol] = bar_mgr
+                wait_seconds = (next_start - now_et).total_seconds()
+                wait_hours = wait_seconds / 3600
 
-        # Load initial historical data
-        logger.info("[IBKR] [%s] Loading historical data...", symbol)
-        df_hist = await ibkr_client.req_historic_1m(symbol, duration_days=2)
+                logger.info(
+                    f"[IBKR] 💤 Market closed. Sleeping {wait_hours:.1f} hours until "
+                    f"{next_start.strftime('%Y-%m-%d %H:%M')} ET (09:00 market open)"
+                )
 
-        if df_hist is not None and not df_hist.empty:
-            await bar_mgr.initialize_from_historical(df_hist)
-            logger.info("[IBKR] [%s] Loaded %d historical bars", symbol, len(df_hist))
-        else:
-            logger.warning("[IBKR] [%s] Failed to load historical data", symbol)
+                # Sleep in chunks to allow for graceful shutdown
+                while wait_seconds > 0 and not _STOP:
+                    sleep_chunk = min(wait_seconds, 60)
+                    await asyncio.sleep(sleep_chunk)
+                    wait_seconds -= sleep_chunk
 
-    # Start worker tasks
-    tasks = []
+                if _STOP:
+                    break
 
-    # Start data fetchers and signal monitors for each symbol
-    logger.info("[IBKR] 🚀 Starting data fetchers and signal monitors...")
-    for idx, symbol in enumerate(IBKR_SYMBOLS):
-        bar_mgr = bar_managers.get(symbol)
+            # --- 2. Start Daily Trading Session ---
+            logger.info("🌅 Starting daily trading cycle...")
+            send_telegram("🌅 [IBKR] Bot waking up for trading day...")
 
-        # Start data fetcher
-        logger.info("[IBKR] Starting data fetcher for %s", symbol)
-        tasks.append(ibkr_data_fetcher(symbol, ibkr_client, bar_mgr, idx))
+            # Initialize IBKR client
+            ibkr_client = IBKRClient()
 
-        # Start signal monitor
-        logger.info("[IBKR] Starting signal monitor for %s", symbol)
-        tasks.append(ibkr_signal_monitor(symbol, ibkr_client, bar_mgr))
+            # Connect to IBKR
+            await ibkr_client.connect_async()
 
-    send_telegram("🚀 [IBKR] Bot Started")
+            if not ibkr_client.connected:
+                logger.error("❌ Failed to connect to IBKR. Retrying in 1 minute...")
+                await asyncio.sleep(60)
+                continue
 
-    # Wait for all tasks to complete
-    # The workers are designed to exit at 16:00 ET
-    try:
-        await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        logger.info("[IBKR] Tasks cancelled")
-    except Exception as e:
-        logger.exception("[IBKR] Error in task group: %s", e)
+            logger.info("✅ Connected to IBKR")
+            send_telegram("✅ Connected to IBKR")
 
-    # Cleanup
-    logger.info("[IBKR] 🏁 Trading session ended (16:00 ET reached)")
-    ibkr_client.disconnect()
-    logger.info("[IBKR] 👋 Disconnected from IBKR")
+            # Wait for portfolio sync
+            logger.info("⏳ Waiting 5s for portfolio sync...")
+            await asyncio.sleep(5)
+
+            # Initialize BarManagers for each symbol
+            bar_managers = {}
+
+            logger.info("Initializing BarManagers and loading historical data...")
+
+            for symbol in IBKR_SYMBOLS:
+                # Create BarManager (fresh instance each day)
+                bar_mgr = BarManager(symbol, max_bars=2880)  # 2 days of 1m bars
+                bar_managers[symbol] = bar_mgr
+
+                # Load initial historical data
+                logger.info("[%s] Loading historical data...", symbol)
+                df_hist = await ibkr_client.req_historic_1m(symbol, duration_days=2)
+
+                if df_hist is not None and not df_hist.empty:
+                    await bar_mgr.initialize_from_historical(df_hist)
+                    logger.info("[%s] Loaded %d historical bars", symbol, len(df_hist))
+                else:
+                    logger.warning("[%s] Failed to load historical data", symbol)
+
+            # Start worker tasks
+            tasks = []
+
+            # Start data fetchers and signal monitors for each symbol
+            logger.info("🚀 Starting data fetchers and signal monitors...")
+            for idx, symbol in enumerate(IBKR_SYMBOLS):
+                bar_mgr = bar_managers.get(symbol)
+
+                # Start data fetcher
+                logger.info("Starting data fetcher for %s", symbol)
+                tasks.append(ibkr_data_fetcher(symbol, ibkr_client, bar_mgr, idx))
+
+                # Start signal monitor
+                logger.info("Starting signal monitor for %s", symbol)
+                tasks.append(ibkr_signal_monitor(symbol, ibkr_client, bar_mgr))
+
+            send_telegram("🚀 [IBKR] Bot Started (Session Active)")
+
+            # Wait for all tasks to complete
+            # The workers are designed to exit at 16:00 ET
+            try:
+                await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                logger.info("Tasks cancelled")
+            except Exception as e:
+                logger.exception("Error in task group: %s", e)
+
+            # Cleanup after session ends
+            logger.info("🏁 Trading session ended (16:00 ET reached)")
+            ibkr_client.disconnect()
+            logger.info("👋 Disconnected from IBKR")
+
+        except Exception as e:
+            logger.exception("CRITICAL: Error in main daily loop: %s", e)
+            send_telegram(f"🚨 CRITICAL: IBKR Bot daily loop error: {str(e)[:100]}")
+            await asyncio.sleep(60)  # Prevent tight loop on error
+
+    # Wait for heartbeat to finish if stopped
+    if not heartbeat.done():
+        await heartbeat
 
 
 def stop_ibkr_workers():

@@ -23,7 +23,7 @@ async def run_multi_broker():
     if BROKER == "ANGEL":
         logger.info("[ANGEL] 🇮🇳 Starting Angel One worker...")
         try:
-            from core.angel_worker import run_angel_workers
+            from core.angelone.worker import run_angel_workers
 
             await run_angel_workers()
         except Exception as e:
@@ -35,7 +35,7 @@ async def run_multi_broker():
     elif BROKER == "IBKR":
         logger.info("[IBKR] 🇺🇸 Starting IBKR worker...")
         try:
-            from core.ibkr_worker import run_ibkr_workers
+            from core.ibkr.worker import run_ibkr_workers
 
             await run_ibkr_workers()
         except Exception as e:
@@ -55,10 +55,10 @@ def stop_all_workers():
     from core.config import BROKER
 
     if BROKER == "ANGEL":
-        from core.angel_worker import stop_angel_workers
+        from core.angelone.worker import stop_angel_workers
 
         stop_angel_workers()
     elif BROKER == "IBKR":
-        from core.ibkr_worker import stop_ibkr_workers
+        from core.ibkr.worker import stop_ibkr_workers
 
         stop_ibkr_workers()

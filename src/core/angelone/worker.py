@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime, timedelta, time
 import pytz
 
-from core.angel_client import AngelClient
+from core.angelone.client import AngelClient
 from core.bar_manager import BarManager
 from core.cash_manager import create_cash_manager
 from core.config import (
@@ -20,7 +20,7 @@ from core.config import (
     SYMBOLS,
 )
 from core.logger import logger
-from core.angelone_option_selector import find_option_contract_async
+from core.angelone.option_selector import find_option_contract_async
 from core.signal_engine import (
     detect_5m_entry,
     detect_15m_bias,
@@ -736,7 +736,7 @@ async def run_angel_workers():
             tasks = []
 
             # Initialize WebSocket
-            from core.angel_client import AngelWebSocket
+            from core.angelone.client import AngelWebSocket
 
             logger.info("🚀 Starting Angel WebSocket...")
             ws_client = AngelWebSocket(

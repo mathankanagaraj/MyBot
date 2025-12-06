@@ -18,7 +18,7 @@ from core.config import (
     SCRIP_MASTER_URL,
 )
 from core.logger import logger
-from core.rate_limiter import APIRateLimiter
+from core.angelone.rate_limiter import APIRateLimiter
 
 
 class AngelClient:
