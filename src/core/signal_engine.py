@@ -4,56 +4,20 @@ from datetime import timedelta
 from core.indicators import add_indicators
 
 
-def is_candle_complete(candle_time, timeframe, current_time):
+def is_candle_complete(candle_time, timeframe, current_time, buffer_sec=2):
     """
-    Check if a candle is complete based on timeframe.
-
-    Args:
-        candle_time: Timestamp of the candle (pandas Timestamp or datetime)
-        timeframe: '5min' or '15min'
-        current_time: Current datetime to compare against
-
-    Returns:
-        bool: True if candle is complete, False otherwise
-
-    Example:
-        candle_time = 09:25:00 (5m candle for 09:20-09:25)
-        current_time = 09:26:30
-        timeframe = '5min'
-        Returns: True (candle closed at 09:25, we're past that)
-
-        candle_time = 09:25:00
-        current_time = 09:24:30
-        timeframe = '5min'
-        Returns: False (candle hasn't closed yet)
+    Check if a candle is complete based on its timeframe and current time.
+    Adds a small buffer to account for feed delays.
     """
     if isinstance(candle_time, pd.Timestamp):
         candle_time = candle_time.to_pydatetime()
-
-    # Candle is complete if current time is past the candle's close time
-    return current_time >= candle_time
+    return current_time >= (candle_time + timedelta(seconds=buffer_sec))
 
 
 def get_next_candle_close_time(current_time, timeframe):
     """
-    Calculate the next candle close time for a given timeframe.
-    Works with both naive and timezone-aware datetimes.
-
-    Args:
-        current_time: Current datetime (naive or timezone-aware)
-        timeframe: '5min' or '15min'
-
-    Returns:
-        datetime: Next candle close time (preserves timezone if input was aware)
-
-    Example:
-        current_time = 14:37:30 IST
-        timeframe = '5min'
-        Returns: 14:40:00 IST (next 5m boundary)
-
-        current_time = 14:37:30 IST
-        timeframe = '15min'
-        Returns: 14:45:00 IST (next 15m boundary)
+    Compute next candle close time given a timeframe.
+    Handles both naive and timezone-aware datetimes.
     """
     if timeframe == "5min":
         interval_minutes = 5
@@ -63,314 +27,196 @@ def get_next_candle_close_time(current_time, timeframe):
         raise ValueError(f"Unsupported timeframe: {timeframe}")
 
     # Round up to next interval
-    minutes = current_time.minute
-    next_boundary = ((minutes // interval_minutes) + 1) * interval_minutes
-
-    if next_boundary >= 60:
-        # Move to next hour
-        next_close = current_time.replace(
-            minute=0, second=0, microsecond=0
-        ) + timedelta(hours=1)
-    else:
-        next_close = current_time.replace(minute=next_boundary, second=0, microsecond=0)
-
+    delta_min = interval_minutes - (current_time.minute % interval_minutes)
+    next_close = current_time.replace(second=0, microsecond=0) + timedelta(
+        minutes=delta_min
+    )
     return next_close
 
 
 def get_seconds_until_next_close(current_time, timeframe):
     """
-    Get seconds to wait until next candle close.
-    Works with both naive and timezone-aware datetimes.
-
-    Args:
-        current_time: Current datetime (naive or timezone-aware)
-        timeframe: '5min' or '15min'
-
-    Returns:
-        int: Seconds to wait (minimum 5 seconds to avoid edge cases)
-
-    Example:
-        current_time = 14:37:30 IST
-        timeframe = '5min'
-        next_close = 14:40:00 IST
-        Returns: 155 seconds (150 + 5 buffer)
+    Get seconds until next candle close, with minimum 5 seconds buffer.
     """
     next_close = get_next_candle_close_time(current_time, timeframe)
     seconds = (next_close - current_time).total_seconds()
+    return max(5, int(seconds) + 2)  # small extra buffer
 
-    # Add small buffer to ensure we're past the boundary
-    # and add minimum wait to avoid tight loops
-    return max(5, int(seconds) + 5)
+
+# --- Resampling & Indicator Pipeline --- #
 
 
 def resample_from_1m(df1m: pd.DataFrame, current_time=None):
     """
-    Resample 1m bars to 5m and 15m, excluding incomplete candles.
-
-    Args:
-        df1m: DataFrame with 1-minute bars
-        current_time: Current datetime (if None, includes all bars including incomplete)
-
-    Returns:
-        Tuple of (df5m, df15m) with indicators added
-
-    Example:
-        current_time = 09:22:30
-        df1m has bars up to 09:22
-
-        Without filtering:
-        - df5 includes incomplete 09:20-09:22 bar ❌
-        - df15 includes incomplete 09:15-09:22 bar ❌
-
-        With filtering:
-        - df5 last bar is 09:20 (complete 09:15-09:20) ✅
-        - df15 last bar is 09:15 (complete 09:00-09:15) ✅
+    Resample 1-minute bars to 5-minute and 15-minute, removing incomplete candles.
+    Calculates standard indicators (EMA, SMA, VWAP, MACD, RSI, OBV) for complete bars only.
     """
-    df5 = (
-        df1m.resample("5min", label="right", closed="right")
-        .agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
+    df = df1m.copy()
+
+    # Remove last 1m candle if incomplete
+    if current_time is not None and not df.empty:
+        last_1m = df.index[-1]
+        if last_1m > current_time - timedelta(seconds=60):
+            df = df.iloc[:-1]
+
+    # --- Resample --- #
+    def resample(df, timeframe):
+        rule = "5min" if timeframe == "5min" else "15min"
+        df_resampled = (
+            df.resample(rule, label="right", closed="right")
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna()
         )
-        .dropna()
-    )
+        # Remove last candle if incomplete
+        if current_time is not None and not df_resampled.empty:
+            last_time = df_resampled.index[-1]
+            if not is_candle_complete(last_time, timeframe, current_time):
+                df_resampled = df_resampled.iloc[:-1]
+        return df_resampled
 
-    df15 = (
-        df1m.resample("15min", label="right", closed="right")
-        .agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
-        )
-        .dropna()
-    )
+    df5m = resample(df, "5min")
+    df15m = resample(df, "15min")
 
-    # Filter out incomplete candles if current_time is provided
-    if current_time is not None:
-        if not df5.empty:
-            last_5m_time = df5.index[-1]
-            if not is_candle_complete(last_5m_time, "5min", current_time):
-                df5 = df5.iloc[:-1]  # Remove incomplete candle
+    if not df5m.empty:
+        df5m = add_indicators(df5m)
+    if not df15m.empty:
+        df15m = add_indicators(df15m)
 
-        if not df15.empty:
-            last_15m_time = df15.index[-1]
-            if not is_candle_complete(last_15m_time, "15min", current_time):
-                df15 = df15.iloc[:-1]  # Remove incomplete candle
-
-    # Add indicators to complete candles only
-    if not df5.empty:
-        df5 = add_indicators(df5)
-    if not df15.empty:
-        df15 = add_indicators(df15)
-
-    return df5, df15
+    return df5m, df15m
 
 
 def detect_15m_bias(df15):
-    if df15 is None or len(df15) < 3:
+    if df15 is None or len(df15) < 10:
         return None
-    last = df15.iloc[-2]  # Closed candle
-    prev = df15.iloc[-3]
 
-    # Common conditions
-    # VWAP > close (for BEAR) / VWAP < close (for BULL) - Wait, user said VWAP > close for BULL?
-    # Let's re-read user request carefully:
-    # BULL: VWAP > close ?? No, usually Close > VWAP for Bull.
-    # User Request: "VWAP > close" for BULL. This is unusual. Usually Price > VWAP is Bullish.
-    # Let's check the request again: "VWAP > close" listed under BULL.
-    # Wait, "VWAP > close" means Price is BELOW VWAP. That is usually Bearish.
-    # "EMA(50) > close" -> Price below EMA50. Bearish.
-    # "SuperTrend > close" -> Price below SuperTrend. Bearish.
-    # "MACD crossing > 0" -> MACD Line > 0? Or Crossover?
-    # "MACD Histogram = GREEN trend" -> Histogram increasing?
-    # "OBV = UpTrend"
-    # "RSI > 55"
-    # "Make sure the overall trend is bullish"
+    last = df15.iloc[-2]  # last closed candle
+    prev5 = df15.iloc[-7:-2]  # for slopes (5-bar window)
 
-    # Logic Check:
-    # If user wrote "VWAP > close" for BULL, they might mean "Close > VWAP".
-    # Standard Bullish: Close > VWAP, Close > EMA50, SuperTrend Bullish (Close > ST).
-    # I will assume standard Bullish interpretation unless "VWAP > close" is strictly literal.
-    # Literal "VWAP > close" means Price is LOWER than VWAP.
-    # Literal "EMA(50) > close" means Price is LOWER than EMA50.
-    # If all these are "> close", then the price is below everything. That is BEARISH.
-    # But the user labeled it "BULL".
-    # CONTRADICTION DETECTED.
-    # However, "MACD crossing > 0" and "RSI > 55" are Bullish indicators.
-    # "OBV = UpTrend" is Bullish.
-    # So it seems the user might have swapped the comparison operators or meant "Close > VWAP".
-    # I will assume "Close > VWAP" and "Close > EMA50" for BULL based on "RSI > 55" and "OBV UpTrend".
-    # Wait, let's look at the BEAR section: "For BEAR analysis - the entire logic is opposite."
-    # So if BULL is "Close > VWAP", then BEAR is "Close < VWAP".
+    # -------------------------------
+    # TIER 1: Trend Structure (must match)
+    # -------------------------------
+    bull_structure = last["close"] > last["ema50"]
+    bear_structure = last["close"] < last["ema50"]
 
-    # Let's implement Standard Bullish Logic for "BULL" task, but I should probably clarify.
-    # Given I am in non-interactive mode mostly, I will stick to Standard Technical Analysis for "BULL":
-    # Close > VWAP
-    # Close > EMA50
-    # SuperTrend == True (Green)
-    # MACD > 0 (or crossover)
-    # RSI > 55
+    # If structure is ambiguous, no trend
+    if not (bull_structure or bear_structure):
+        return None
 
-    # Re-reading: "VWAP > close"
-    # Maybe they mean the LINE is above the close? Yes, that is Price < VWAP.
-    # If they want that for BULL, it's a mean reversion strategy?
-    # But "RSI > 55" is momentum bullish.
-    # "MACD Histogram = GREEN" is momentum bullish.
-    # "OBV = UpTrend" is momentum bullish.
-    # "Make sure the overall trend is bullish".
-    # A trend is bullish if Price is ABOVE moving averages.
-    # I will assume it's a typo in the user prompt and implement Close > VWAP for Bull.
-
-    # BULLISH CONDITIONS
-    cond_bull_vwap = last["close"] > last["vwap"]
-    cond_bull_ema = last["close"] > last["ema50"]
-    cond_bull_st = last["supertrend"]
-    cond_bull_macd = (last["macd"] > 0) and (
-        last["macd_hist"] > 0
-    )  # Histogram Green usually means > 0 or increasing. Let's go with > 0 and increasing for strong trend.
-    cond_bull_obv = last["obv"] > prev["obv"]
-    cond_bull_rsi = last["rsi"] > 55
-
-    is_bull = all(
+    # -------------------------------
+    # TIER 2: Confirmation (need 2 out of 3)
+    # -------------------------------
+    bull_confirms = sum(
         [
-            cond_bull_vwap,
-            cond_bull_ema,
-            cond_bull_st,
-            cond_bull_macd,
-            cond_bull_obv,
-            cond_bull_rsi,
+            last["close"] > last["vwap"],
+            bool(last["supertrend"]),  # Ensure boolean
+            last["macd_hist"] > 0 and prev5["macd_hist"].mean() < last["macd_hist"],
         ]
     )
 
-    # BEARISH CONDITIONS
-    cond_bear_vwap = last["close"] < last["vwap"]
-    cond_bear_ema = last["close"] < last["ema50"]
-    cond_bear_st = not last["supertrend"]
-    cond_bear_macd = (last["macd"] < 0) and (last["macd_hist"] < 0)
-    cond_bear_obv = last["obv"] < prev["obv"]
-    cond_bear_rsi = (
-        last["rsi"] < 45
-    )  # Opposite of > 55 is < 45 usually, or < 50. Let's use 45 for symmetry/buffer.
-
-    is_bear = all(
+    bear_confirms = sum(
         [
-            cond_bear_vwap,
-            cond_bear_ema,
-            cond_bear_st,
-            cond_bear_macd,
-            cond_bear_obv,
-            cond_bear_rsi,
+            last["close"] < last["vwap"],
+            not bool(last["supertrend"]),  # Ensure boolean
+            last["macd_hist"] < 0 and prev5["macd_hist"].mean() > last["macd_hist"],
         ]
     )
 
-    if is_bull:
+    # -------------------------------
+    # TIER 3: Momentum Filter
+    # -------------------------------
+    bull_momentum = last["rsi"] > 52
+    bear_momentum = last["rsi"] < 48
+
+    # -------------------------------
+    # OBV Trend (5-bar slope)
+    # -------------------------------
+    obv_slope = df15["obv"].iloc[-5:].diff().mean()
+
+    bull_obv = obv_slope > 0
+    bear_obv = obv_slope < 0
+
+    # -------------------------------
+    # FINAL DECISION
+    # -------------------------------
+    if bull_structure and bull_confirms >= 2 and bull_momentum and bull_obv:
         return "BULL"
-    if is_bear:
+
+    if bear_structure and bear_confirms >= 2 and bear_momentum and bear_obv:
         return "BEAR"
+
     return None
 
 
 def detect_5m_entry(df5, bias):
-    if df5 is None or len(df5) < 4:
+    if df5 is None or len(df5) < 30:
         return False, {"reason": "insufficient_data"}
 
-    last = df5.iloc[-2]  # Closed candle
-    prev = df5.iloc[-3]  # Previous closed candle
+    last = df5.iloc[-2]
+    prev = df5.iloc[-3]
 
-    # 5m Confirmation Logic
-    # We use a strict "double confirmation" to avoid fakeouts.
-    # 1. Trend must match bias (Price vs VWAP/MA)
-    # 2. MOMENTUM: MACD must support the move
-    # 3. PRICE ACTION:
-    #    - Current candle must be colored correctly (Green for Bull, Red for Bear)
-    #    - PREVIOUS candle must ALSO be colored correctly (Stronger signal)
-    #    - Both candles should ideally be on the correct side of SMA20
+    # Compute SMA20 if missing
+    if "sma20" not in df5.columns:
+        df5["sma20"] = df5["close"].rolling(20).mean()
 
-    # Calculate SMA20 if not present (using EMA21 as proxy in previous code, but let's be precise if possible)
-    # If indicators didn't add SMA20, we calculate it on the fly.
-    sma20_series = df5["close"].rolling(window=20).mean()
-    sma20_last = sma20_series.iloc[-2]
-    sma20_prev = sma20_series.iloc[-3]
+    sma20_last = df5["sma20"].iloc[-2]
+    sma20_prev = df5["sma20"].iloc[-3]
 
+    # ---- STRUCTURE (must match bias) ----
     if bias == "BULL":
-        # --- BULLISH ENTRY CONDITIONS ---
+        structure_ok = last["close"] > sma20_last
+    else:
+        structure_ok = last["close"] < sma20_last
 
-        # 1. Price above VWAP
-        cond_vwap = last["close"] > last["vwap"]
+    if not structure_ok:
+        return False, {"reason": "trend_structure_fail"}
 
-        # 2. EMA Stacking (9 > 21) indicating short-term uptrend
-        cond_ema_stack = last["ema9"] > last["ema21"]
+    # ---- CORE CONFIRMATIONS (2 out of 3) ----
+    if bias == "BULL":
+        confirm_list = [
+            last["close"] > last["vwap"],
+            last["ema9"] > last["ema21"],
+            last["macd_hist"] > 0,
+        ]
+    else:
+        confirm_list = [
+            last["close"] < last["vwap"],
+            last["ema9"] < last["ema21"],
+            last["macd_hist"] < 0,
+        ]
 
-        # 3. Price above SMA20 (Trend baseline)
-        cond_sma = last["close"] > sma20_last
+    confirmations = sum(confirm_list)
+    if confirmations < 2:
+        return False, {"reason": "core_confirmations_fail"}
 
-        # 4. MACD Bullish (Histogram Green + MACD > Signal)
-        cond_macd = (last["macd_hist"] > 0) and (last["macd"] > last["macd_sig"])
+    # ---- PRICE ACTION FILTER ----
+    # Instead of requiring both candles to be green/red,
+    # check for breakout or trend-continuation structure.
+    if bias == "BULL":
+        pa_ok = (
+            last["close"] > prev["high"]  # breakout
+            or last["close"] > last["open"]  # bullish body
+        )
+    else:
+        pa_ok = (
+            last["close"] < prev["low"]  # breakdown
+            or last["close"] < last["open"]  # bearish body
+        )
 
-        # 5. CANDLE COLOR & CONFIRMATION
-        # Current candle Green?
-        cond_candle_color = last["close"] > last["open"]
-        # Previous candle Green? (Avoid buying on first green after red)
-        cond_prev_color = prev["close"] > prev["open"]
-        # Previous price also above SMA20? (Avoid buying immediately on the crossover candle, wait for hold)
-        cond_prev_sma = prev["close"] > sma20_prev
+    if not pa_ok:
+        return False, {"reason": "price_action_fail"}
 
-        if all(
-            [
-                cond_vwap,
-                cond_ema_stack,
-                cond_sma,
-                cond_macd,
-                cond_candle_color,
-                cond_prev_color,
-                cond_prev_sma,
-            ]
-        ):
-            return True, {"price": last["close"], "type": "BULL"}
+    # ---- FINAL CHECK: PREVIOUS HOLD OF TREND ----
+    if bias == "BULL" and prev["close"] < sma20_prev:
+        return False, {"reason": "previous_candle_not_trending"}
+    if bias == "BEAR" and prev["close"] > sma20_prev:
+        return False, {"reason": "previous_candle_not_trending"}
 
-    elif bias == "BEAR":
-        # --- BEARISH ENTRY CONDITIONS ---
-
-        # 1. Price below VWAP
-        cond_vwap = last["close"] < last["vwap"]
-
-        # 2. EMA Stacking (9 < 21)
-        cond_ema_stack = last["ema9"] < last["ema21"]
-
-        # 3. Price below SMA20
-        cond_sma = last["close"] < sma20_last
-
-        # 4. MACD Bearish
-        cond_macd = (last["macd_hist"] < 0) and (last["macd"] < last["macd_sig"])
-
-        # 5. CANDLE COLOR & CONFIRMATION
-        # Current candle Red?
-        cond_candle_color = last["close"] < last["open"]
-        # Previous candle Red?
-        cond_prev_color = prev["close"] < prev["open"]
-        # Previous price also below SMA20?
-        cond_prev_sma = prev["close"] < sma20_prev
-
-        if all(
-            [
-                cond_vwap,
-                cond_ema_stack,
-                cond_sma,
-                cond_macd,
-                cond_candle_color,
-                cond_prev_color,
-                cond_prev_sma,
-            ]
-        ):
-            return True, {"price": last["close"], "type": "BEAR"}
-
-    return False, {"reason": "conditions_not_met"}
+    return True, {"type": bias, "price": last["close"]}

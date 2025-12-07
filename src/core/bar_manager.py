@@ -138,6 +138,24 @@ class BarManager:
             df = df.set_index("datetime")[["open", "high", "low", "close", "volume"]]
             return df
 
+    async def finalize_bar(self):
+        """
+        Force finalize the current bar if it exists.
+        Useful for end-of-day processing to ensure the last minute is captured
+        even if no new tick arrives to trigger the closure.
+        """
+        async with self.lock:
+            if self.current_bar and self.current_bar_start:
+                logger.debug(
+                    "[%s] 🕯️ Force finalizing last bar: %s",
+                    self.symbol,
+                    self.current_bar_start.strftime("%H:%M:%S"),
+                )
+                self.bars.append(self.current_bar)
+                self.last_bar_time = self.current_bar_start
+                self.current_bar = None
+                self.current_bar_start = None
+
     async def get_resampled(self, lookback_minutes=None, current_time=None):
         """
         Get 5m and 15m resampled bars with indicators.

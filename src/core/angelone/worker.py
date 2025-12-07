@@ -785,6 +785,11 @@ async def run_angel_workers():
             # 🏁 End of Day Cleanup
             logger.info("🏁 Daily trading session ended (15:30 reached)")
 
+            # Finalize any pending bars (crucial for capturing the 15:29 minute)
+            logger.info("💾 Finalizing last minute bars...")
+            for symbol, bar_mgr in bar_managers.items():
+                await bar_mgr.finalize_bar()
+
             # Generate End of Day Report
             await end_of_day_report(cash_mgr, angel_client)
 

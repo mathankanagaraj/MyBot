@@ -1,33 +1,33 @@
 services:
-  # Angel One Trading Bot - Indian Markets (IST)
   angel_bot:
+    image: options_bot:latest
     build:
       context: .
-      dockerfile: Dockerfile # Uses shared image
-    image: angel_bot:latest # Unique image name
-    container_name: angel_options_bot
+      dockerfile: Dockerfile
+    container_name: angel_bot
     env_file: .env
     environment:
-      - TZ=Asia/Kolkata # Override timezone at runtime
-      - BROKER=ANGEL # Override broker at runtime
+      - TZ=Asia/Kolkata
+      - BROKER=ANGEL
     volumes:
       - ./logs:/app/logs
       - ./audit:/app/audit
-    restart: "unless-stopped" # Auto-restart on crash/reboot
+    restart: unless-stopped
 
-  # IBKR Trading Bot - US Markets (ET)
   ibkr_bot:
+    image: options_bot:latest
     build:
       context: .
-      dockerfile: Dockerfile # Uses same shared image
-    image: ibkr_bot:latest # Unique image name
-    container_name: ibkr_options_bot
+      dockerfile: Dockerfile
+    depends_on:
+      - angel_bot
+    container_name: ibkr_bot
     env_file: .env
     environment:
-      - TZ=America/New_York # Override timezone at runtime
-      - BROKER=IBKR # Override broker at runtime
+      - TZ=America/New_York
+      - BROKER=IBKR
       - IB_HOST=host.docker.internal
     volumes:
       - ./logs:/app/logs
       - ./audit:/app/audit
-    restart: "unless-stopped" # Auto-restart on crash/reboot
+    restart: unless-stopped
