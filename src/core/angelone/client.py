@@ -509,27 +509,31 @@ class AngelClient:
         quantity: int,
         order_type: str = "MARKET",
         price: float = 0.0,
+        triggerprice: Optional[float] = None,
         product_type: str = "INTRADAY",
+        variety: str = "NORMAL",
     ) -> Optional[Dict]:
         """
-        Place an order on Angel Broker.
+        Place a single order on Angel One.
 
         Args:
             symbol: Trading symbol
             token: Symbol token
-            exchange: Exchange (NSE, NFO, etc.)
+            exchange: NSE/NFO/etc.
             transaction_type: BUY or SELL
             quantity: Order quantity
-            order_type: MARKET or LIMIT
+            order_type: MARKET, LIMIT, STOPLOSS_LIMIT
             price: Limit price (for LIMIT orders)
+            triggerprice: Trigger price (for stop-loss)
             product_type: INTRADAY, DELIVERY, etc.
+            variety: Order variety (NORMAL, STOPLOSS, AMO, etc.)
 
         Returns:
-            Order response dict or None
+            Dict with order response or None
         """
         try:
             order_params = {
-                "variety": "NORMAL",
+                "variety": variety,
                 "tradingsymbol": symbol,
                 "symboltoken": token,
                 "transactiontype": transaction_type,
@@ -540,31 +544,31 @@ class AngelClient:
                 "quantity": str(quantity),
             }
 
-            if order_type == "LIMIT":
+            if order_type in ["LIMIT", "STOPLOSS_LIMIT"] and price > 0:
                 order_params["price"] = str(price)
+            if triggerprice:
+                order_params["triggerprice"] = str(triggerprice)
 
+            # Place order in a thread to avoid blocking
             response = await asyncio.wait_for(
-                asyncio.to_thread(self.smart_api.placeOrder, order_params), timeout=10.0
+                asyncio.to_thread(self.smart_api.placeOrder, order_params),
+                timeout=10.0,
             )
 
             if response:
-                # Handle case where response is a string (e.g. order ID)
                 if isinstance(response, str):
                     logger.info(f"Order placed (ID only): {response}")
-                    # Construct a fake response dict so callers don't break
                     return {
                         "status": True,
                         "message": "SUCCESS",
                         "data": {"orderid": response},
                     }
-
-                # Handle standard dict response
-                if isinstance(response, dict) and response.get("status"):
+                elif isinstance(response, dict) and response.get("status"):
                     logger.info(f"Order placed: {response}")
                     return response
-
-                logger.error(f"Order placement failed: {response}")
-                return None
+                else:
+                    logger.error(f"Order placement failed: {response}")
+                    return None
             else:
                 logger.error("Order placement failed: No response")
                 return None
@@ -572,6 +576,48 @@ class AngelClient:
         except Exception as e:
             logger.exception(f"Error placing order: {e}")
             return None
+
+    async def wait_for_fill(self, order_id: str, timeout: float = 10.0) -> bool:
+        """
+        Poll Angel One API until the order is filled or timeout.
+
+        Args:
+            order_id: Order ID to check
+            timeout: Max seconds to wait
+
+        Returns:
+            True if filled, False if timeout
+        """
+        import time
+
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                # API Call to fetch order book is distinct from order history usually
+                # orderBook() returns list of all orders. getOrderHistory returns history of specific order?
+                # SmartAPI typically uses orderBook() to get status of all orders.
+                # Let's use orderBook() and filter as it's more reliable.
+
+                # Note: self.smart_api.orderBook() is blocking
+                book = await asyncio.to_thread(self.smart_api.orderBook)
+
+                if book and book.get("data"):
+                    for order in book["data"]:
+                        if order.get("orderid") == order_id:
+                            status = order.get("status")  # 'complete', 'rejected', etc.
+                            if status == "complete":
+                                return True
+                            elif status == "rejected":
+                                logger.error(
+                                    f"Order {order_id} rejected: {order.get('text')}"
+                                )
+                                return False
+            except Exception:
+                pass
+
+            await asyncio.sleep(1.0)
+
+        return False
 
     async def place_bracket_order(
         self,
@@ -581,27 +627,32 @@ class AngelClient:
         stop_loss_price: float,
         target_price: float,
         exchange: str = "NFO",
+        product_type: str = "INTRADAY",
     ) -> Optional[Dict]:
         """
-        Simulate bracket order using separate entry, SL, and target orders.
-        Angel Broker doesn't support true bracket orders, so we place:
-        1. Market BUY order (entry)
-        2. Stop-loss SELL order
-        3. Limit SELL order (target)
+        Simulate a bracket order.
+        1. Market BUY entry
+        2. Wait for Fill
+        3. Stop-loss SELL
+        4. Target SELL
+
+        NOTE: This does NOT link SL and Target (No native OCO).
+        The worker loop MUST monitor these and cancel the other when one fills.
 
         Args:
             option_symbol: Option trading symbol
             option_token: Option symbol token
-            quantity: Number of lots
-            stop_loss_price: Stop loss price
+            quantity: Lots
+            stop_loss_price: Stop-loss trigger/limit
             target_price: Target price
             exchange: Exchange (usually NFO for options)
+            product_type: INTRADAY/DELIVERY
 
         Returns:
-            Dict with order IDs or None
+            Dict with entry, SL, target order IDs
         """
         try:
-            # Place entry order (Market BUY)
+            # --- Place Entry ---
             entry_order = await self.place_order(
                 symbol=option_symbol,
                 token=option_token,
@@ -609,18 +660,28 @@ class AngelClient:
                 transaction_type="BUY",
                 quantity=quantity,
                 order_type="MARKET",
+                product_type=product_type,
             )
-
             if not entry_order or not entry_order.get("data"):
                 logger.error("Entry order failed")
                 return None
-
             entry_order_id = entry_order["data"]["orderid"]
 
-            # Wait a bit for entry order to fill
-            await asyncio.sleep(1)
+            # --- Wait for Entry Fill ---
+            logger.info(f"Entry {entry_order_id} placed. Waiting for fill...")
+            filled = await self.wait_for_fill(entry_order_id, timeout=15.0)
 
-            # Place stop-loss order (Stop-loss SELL)
+            if not filled:
+                logger.error(
+                    "Entry order not filled within timeout; cancelling SL/TP placement logic."
+                )
+                # We do NOT cancel the entry order here automatically to avoid race conditions,
+                # but we return what we have. Worker should handle this.
+                return {"entry_order_id": entry_order_id}
+
+            # --- Place Stop-loss ---
+            # Angel One 'STOPLOSS_LIMIT' requires 'triggerprice' and 'price'
+            # variety must be 'STOPLOSS' usually for trigger orders
             sl_order = await self.place_order(
                 symbol=option_symbol,
                 token=option_token,
@@ -629,9 +690,15 @@ class AngelClient:
                 quantity=quantity,
                 order_type="STOPLOSS_LIMIT",
                 price=stop_loss_price,
+                triggerprice=stop_loss_price,
+                product_type=product_type,
+                variety="STOPLOSS",  # Important: usually STOPLOSS variety for SL orders
             )
+            sl_order_id = sl_order.get("data", {}).get("orderid") if sl_order else None
+            if not sl_order_id:
+                logger.warning("Stop-loss order placement failed")
 
-            # Place target order (Limit SELL)
+            # --- Place Target ---
             target_order = await self.place_order(
                 symbol=option_symbol,
                 token=option_token,
@@ -640,22 +707,24 @@ class AngelClient:
                 quantity=quantity,
                 order_type="LIMIT",
                 price=target_price,
+                product_type=product_type,
+                variety="NORMAL",
             )
+            target_order_id = (
+                target_order.get("data", {}).get("orderid") if target_order else None
+            )
+            if not target_order_id:
+                logger.warning("Target order placement failed")
 
             result = {
                 "entry_order_id": entry_order_id,
-                "sl_order_id": (
-                    sl_order.get("data", {}).get("orderid") if sl_order else None
-                ),
-                "target_order_id": (
-                    target_order.get("data", {}).get("orderid")
-                    if target_order
-                    else None
-                ),
+                "sl_order_id": sl_order_id,
+                "target_order_id": target_order_id,
             }
 
-            logger.info(f"Bracket order placed: {result}")
+            logger.info(f"Bracket order setup complete: {result}")
             return result
+
         except Exception as e:
             logger.exception(f"Error placing bracket order: {e}")
             return None
@@ -709,22 +778,6 @@ class AngelClient:
         except Exception as e:
             logger.exception(f"Error getting account summary: {e}")
             return {}
-
-    def subscribe_realtime_bars(self, symbol: str, bar_manager):
-        """
-        Subscribe to real-time data for a symbol.
-        Note: Angel WebSocket implementation would go here.
-        For now, we'll use polling as a simpler alternative.
-        """
-        logger.warning(
-            "Real-time WebSocket streaming not yet implemented for Angel Broker"
-        )
-        logger.info(f"Using polling mode for {symbol}")
-        return None
-
-    def unsubscribe_realtime_bars(self, subscription):
-        """Unsubscribe from real-time data"""
-        pass
 
 
 class AngelWebSocket:

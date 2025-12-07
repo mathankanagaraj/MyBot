@@ -1,6 +1,12 @@
-# core/worker.py
+# core/angelone/worker.py
+"""
+Fully refactored Angel One broker worker implementation.
+Handles NSE market trading with options via Angel One.
+Async-safe, cancellation-aware, with heartbeat, data fetchers, signal monitors, and startup checks.
+"""
 import asyncio
-from datetime import datetime, timedelta, time
+from datetime import datetime, time, timedelta
+
 import pytz
 
 from core.angelone.client import AngelClient
@@ -18,6 +24,8 @@ from core.config import (
     RISK_PER_CONTRACT,
     RR_RATIO,
     SYMBOLS,
+    MARKET_HOURS_ONLY,
+    INDEX_FUTURES,
 )
 from core.logger import logger
 from core.angelone.option_selector import find_option_contract_async
@@ -35,10 +43,25 @@ from core.utils import (
 from core.angelone.utils import (
     is_market_open,
     get_ist_now,
+    get_seconds_until_market_close,
 )
 
-_STOP = False
+_STOP_EVENT = asyncio.Event()  # Global stop event
 _LAST_MARKET_OPEN_STATE = None
+
+# OCO Order Tracking: symbol -> {'sl_id': str, 'target_id': str}
+ACTIVE_OCO_ORDERS = {}
+
+
+# -----------------------------
+# Helper Functions
+# -----------------------------
+async def sleep_until_next(seconds):
+    """Sleep for a period but allow cancellation."""
+    try:
+        await asyncio.wait_for(asyncio.sleep(seconds), timeout=seconds)
+    except asyncio.CancelledError:
+        return
 
 
 def compute_stop_target(entry_price):
@@ -48,28 +71,204 @@ def compute_stop_target(entry_price):
     else:
         risk = float(RISK_PCT_OF_PREMIUM) * float(entry_price)
 
-    stop = max(1.0, float(entry_price) - risk)  # Minimum ₹1 for Indian market
+    # Minimum stop price cannot be negative or zero (set min to 0.05 or similar for valid output)
+    stop = max(0.05, float(entry_price) - risk)
     target = float(entry_price) + RR_RATIO * risk
     return stop, target, risk
 
 
-async def heartbeat_task():
-    """
-    Continuous heartbeat to show the bot is alive.
-    Runs 24/7, even when markets are closed.
-    Uses UTC for global monitoring.
-    """
+# -----------------------------
+# Heartbeat
+# -----------------------------
+async def heartbeat_task(interval=60):
+    """Continuous heartbeat to show bot is alive."""
     logger.info("💓 Heartbeat task started")
-    while not _STOP:
-        try:
-            # Use UTC for global heartbeat
-            now_utc = datetime.utcnow()
-            logger.info(f"💓 Heartbeat: {now_utc.strftime('%H:%M:%S')} UTC")
-            await asyncio.sleep(60)  # Every minute
-        except Exception as e:
-            logger.exception(f"Heartbeat error: {e}")
-            await asyncio.sleep(60)
+    while not _STOP_EVENT.is_set():
+        now_utc = datetime.utcnow()
+        logger.info(f"💓 Heartbeat: {now_utc.strftime('%H:%M:%S')} UTC")
+        await sleep_until_next(interval)
     logger.info("💓 Heartbeat task stopped")
+
+
+# -----------------------------
+# End of Day Reporting
+# -----------------------------
+async def end_of_day_report(cash_mgr, angel_client):
+    """
+    Generate and send end-of-day trading report.
+    Includes balance, P&L, trade count, and position status.
+    """
+    logger.info("📊 Generating end-of-day report...")
+
+    try:
+        # Get daily statistics
+        stats = await cash_mgr.get_daily_statistics()
+
+        # Get open positions from Angel API
+        positions = await angel_client.get_positions()
+        open_positions = [p for p in positions if p.get("netqty", "0") != "0"]
+
+        # Calculate P&L percentage
+        start_bal = stats["start_balance"]
+        pnl = stats["daily_pnl"]
+        pnl_pct = (pnl / start_bal * 100) if start_bal > 0 else 0.0
+
+        # Build report message
+        msg = (
+            f"📊 **End of Day Report**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Start Balance: ₹{start_bal:,.2f}\n"
+            f"💰 End Balance: ₹{stats['current_balance']:,.2f}\n"
+            f"📈 Daily P&L: ₹{pnl:,.2f} ({pnl_pct:+.2f}%)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Total Trades: {stats['total_trades']}\n"
+            f"📂 Open Positions: {len(open_positions)}\n"
+        )
+
+        # Add open position details if any
+        if open_positions:
+            msg += "\n🔓 Open Positions:\n"
+            for pos in open_positions:
+                symbol = pos.get("tradingsymbol", "Unknown")
+                qty = pos.get("netqty", "0")
+                pnl_pos = float(pos.get("pnl", 0))
+                msg += f"  • {symbol}: Qty {qty} | P&L ₹{pnl_pos:,.2f}\n"
+        else:
+            msg += "\n✅ All positions closed\n"
+
+        msg += "━━━━━━━━━━━━━━━━━━━━"
+
+        logger.info(msg.replace("**", "").replace("━", "-"))
+        send_telegram(msg)
+
+    except Exception as e:
+        logger.exception("Error generating end-of-day report: %s", e)
+        send_telegram(f"⚠️ Error generating end-of-day report: {str(e)[:100]}")
+
+
+async def eod_scheduler_task(cash_mgr, angel_client, bar_managers):
+    """
+    Background task that schedules end-of-day report at market close.
+    """
+    logger.info("📅 End-of-day report scheduler started")
+
+    while not _STOP_EVENT.is_set():
+        try:
+            # Calculate wait time until market close (15:30 IST)
+            wait_seconds = get_seconds_until_market_close()
+
+            # If market is already closed, wait_seconds might be large (until next day),
+            # or negative if we are just past close.
+            # get_seconds_until_market_close usually returns seconds from NOW until today's 15:30.
+            # If it's past 15:30, it might return 0 or negative.
+
+            now_ist = get_ist_now()
+            if now_ist.time() >= time(15, 30):
+                # Market already closed today
+                await sleep_until_next(60)
+                continue
+
+            logger.info(
+                f"⏰ End-of-day report scheduled in {wait_seconds/3600:.1f} hours"
+            )
+
+            # Wait until market close
+            # Use sleep_until_next to handle cancellation
+            await sleep_until_next(wait_seconds)
+
+            if _STOP_EVENT.is_set():
+                break
+
+            logger.info("🏁 Daily trading session ended (15:30 reached)")
+
+            # Finalize any pending bars
+            logger.info("💾 Finalizing last minute bars...")
+            for symbol, bar_mgr in bar_managers.items():
+                await bar_mgr.finalize_bar()
+
+            # Generate report
+            await end_of_day_report(cash_mgr, angel_client)
+
+            # Wait a bit to avoid repeat
+            await sleep_until_next(300)
+
+        except Exception as e:
+            logger.exception("Error in end-of-day scheduler: %s", e)
+            await sleep_until_next(60)
+
+    logger.info("📅 End-of-day report scheduler exiting")
+
+
+# -----------------------------
+# Execute Order
+# -----------------------------
+async def manage_oco_orders(symbol, angel_client):
+    """
+    Check status of SL and Target orders.
+    If one is filled (complete), cancel the other.
+    """
+    if symbol not in ACTIVE_OCO_ORDERS:
+        return
+
+    txn_ids = ACTIVE_OCO_ORDERS[symbol]
+    sl_id = txn_ids.get("sl_order_id")
+    tp_id = txn_ids.get("target_order_id")
+
+    if not sl_id or not tp_id:
+        return
+
+    try:
+        # Fetch status of all orders
+        # Note: Optimization would be to fetch individual status if API allows, but orderBook is standard
+        book = await asyncio.to_thread(angel_client.smart_api.orderBook)
+
+        sl_status = None
+        tp_status = None
+
+        if book and book.get("data"):
+            for order in book["data"]:
+                oid = order.get("orderid")
+                status = order.get(
+                    "status"
+                )  # complete, cancelled, rejected, open, trigger pending
+
+                if oid == sl_id:
+                    sl_status = status
+                elif oid == tp_id:
+                    tp_status = status
+
+        # Logic: One Cancels Other
+        if sl_status == "complete":
+            logger.info(f"[{symbol}] 🛑 SL Hit! Cancelling Target {tp_id}")
+            try:
+                await asyncio.to_thread(
+                    angel_client.smart_api.cancelOrder, tp_id, "NORMAL"
+                )
+            except Exception as e:
+                logger.error(f"[{symbol}] Failed to cancel Target: {e}")
+            del ACTIVE_OCO_ORDERS[symbol]
+
+        elif tp_status == "complete":
+            logger.info(f"[{symbol}] 🎯 Target Hit! Cancelling SL {sl_id}")
+            try:
+                await asyncio.to_thread(
+                    angel_client.smart_api.cancelOrder, sl_id, "STOPLOSS"
+                )
+            except Exception as e:
+                logger.error(f"[{symbol}] Failed to cancel SL: {e}")
+            del ACTIVE_OCO_ORDERS[symbol]
+
+        elif sl_status in ["cancelled", "rejected"] and tp_status in [
+            "cancelled",
+            "rejected",
+        ]:
+            logger.info(
+                f"[{symbol}] Both SL and Target cancelled/rejected. Cleaning up OCO."
+            )
+            del ACTIVE_OCO_ORDERS[symbol]
+
+    except Exception as e:
+        logger.error(f"[{symbol}] OCO Check Error: {e}")
 
 
 async def execute_angel_entry_order(
@@ -77,34 +276,22 @@ async def execute_angel_entry_order(
 ):
     """
     Execute entry order with option selection and bracket order placement for Angel One.
-
-    Args:
-        symbol: Stock symbol
-        bias: BULL or BEAR
-        angel_client: Angel One API client
-        cash_mgr: Cash manager instance
-        underlying_price: Current underlying price
-
-    Returns:
-        True if order placed successfully, False otherwise
     """
-    from core.config import INDEX_FUTURES
-
     # Select option contract
     logger.info("[%s] 🔍 Selecting option contract...", symbol)
-    opt_contract, reason = await find_option_contract_async(
+    opt_selection, reason = await find_option_contract_async(
         angel_client, symbol, bias, underlying_price
     )
-    if not opt_contract:
+    if not opt_selection:
         logger.error("[%s] ❌ Option selection failed: %s", symbol, reason)
         send_telegram(f"❌ {symbol} option selection failed: {reason}")
         return False
 
-    logger.info("[%s] ✅ Selected option: %s", symbol, opt_contract["symbol"])
+    logger.info("[%s] ✅ Selected option: %s", symbol, opt_selection.symbol)
 
     # Get option premium
     logger.info("[%s] 💰 Fetching option premium...", symbol)
-    prem = await angel_client.get_last_price(opt_contract["symbol"], exchange="NFO")
+    prem = await angel_client.get_last_price(opt_selection.symbol, exchange="NFO")
     if prem is None or prem < MIN_PREMIUM:
         logger.error(
             "[%s] ❌ Premium too low: ₹%s (min: ₹%.2f)", symbol, prem, MIN_PREMIUM
@@ -115,7 +302,7 @@ async def execute_angel_entry_order(
     logger.info("[%s] 💰 Option premium: ₹%.2f", symbol, prem)
 
     # Calculate position size
-    lot_size = opt_contract.get("lot_size", 1)
+    lot_size = opt_selection.lot_size
     per_lot_cost = float(prem) * float(lot_size)
     qty = MAX_CONTRACTS_PER_TRADE
     est_cost = per_lot_cost * qty
@@ -144,8 +331,8 @@ async def execute_angel_entry_order(
     stop_price = prem - risk_amt
     target_price = prem + (risk_amt * RR_RATIO)
 
-    if stop_price < 1.0:
-        stop_price = 1.0
+    if stop_price < 0.05:
+        stop_price = 0.05
 
     # Place bracket order
     logger.info(
@@ -154,8 +341,8 @@ async def execute_angel_entry_order(
     )
 
     bracket = await angel_client.place_bracket_order(
-        option_symbol=opt_contract["symbol"],
-        option_token=opt_contract["token"],
+        option_symbol=opt_selection.symbol,
+        option_token=opt_selection.token,
         quantity=qty * lot_size,
         stop_loss_price=stop_price,
         target_price=target_price,
@@ -168,10 +355,14 @@ async def execute_angel_entry_order(
         cash_mgr.force_release(symbol)
         return False
 
+    # Store IDs for OCO management
+    # Note: place_bracket_order in client.py returns dict with keys: entry_order_id, sl_order_id, target_order_id
+    ACTIVE_OCO_ORDERS[symbol] = bracket
+
     logger.info("[%s] ✅ Order placed successfully!", symbol)
     send_telegram(
         f"✅ Entered {symbol} {bias}\n"
-        f"Option: {opt_contract['symbol']}\n"
+        f"Option: {opt_selection.symbol}\n"
         f"Entry: ₹{prem:.2f} | SL: ₹{stop_price:.2f} | TP: ₹{target_price:.2f}"
     )
 
@@ -180,7 +371,7 @@ async def execute_angel_entry_order(
         timestamp=get_ist_now().isoformat(),
         symbol=symbol,
         bias=bias,
-        option=opt_contract["symbol"],
+        option=opt_selection.symbol,
         entry_price=prem,
         stop=stop_price,
         target=target_price,
@@ -193,29 +384,18 @@ async def execute_angel_entry_order(
     return True
 
 
+# -----------------------------
+# 5m Entry Search
+# -----------------------------
 async def search_angel_5m_entry(
     symbol, bias, angel_client, cash_mgr, bar_manager, context="ENTRY"
 ):
     """
     Search for 5m entry confirmation over multiple candles for Angel One.
-
-    Args:
-        symbol: Stock symbol
-        bias: BULL or BEAR from 15m detection
-        angel_client: Angel One API client
-        cash_mgr: Cash manager instance
-        bar_manager: Bar manager for this symbol
-        context: "STARTUP" or "ENTRY" for logging
-
-    Returns:
-        True if entry executed, False otherwise
     """
-    from core.config import INDEX_FUTURES
-
-    global _STOP
     checks = 0
 
-    while checks < MAX_5M_CHECKS and not _STOP:
+    while checks < MAX_5M_CHECKS and not _STOP_EVENT.is_set():
         checks += 1
         now_ist = get_ist_now()
 
@@ -238,7 +418,7 @@ async def search_angel_5m_entry(
             next_5m_close.strftime("%H:%M:%S"),
             sleep_seconds,
         )
-        await asyncio.sleep(sleep_seconds)
+        await sleep_until_next(sleep_seconds)
 
         now_ist = get_ist_now()
         if now_ist.time() >= time(15, 30):
@@ -305,15 +485,12 @@ async def search_angel_5m_entry(
     return False
 
 
+# -----------------------------
+# Startup Signal Check
+# -----------------------------
 async def handle_angel_startup_signal(symbol, angel_client, cash_mgr, bar_manager):
     """
     Check for recent 15m signal on startup and search for entry if found.
-
-    Args:
-        symbol: Stock symbol
-        angel_client: Angel One API client
-        cash_mgr: Cash manager instance
-        bar_manager: Bar manager for this symbol
     """
     try:
         now_ist = get_ist_now()
@@ -332,9 +509,14 @@ async def handle_angel_startup_signal(symbol, angel_client, cash_mgr, bar_manage
 
         # Calculate how old this signal is
         latest_15m_time = df15_startup.index[-1]
-        time_since_signal = (
-            now_ist.replace(tzinfo=None) - latest_15m_time
-        ).total_seconds() / 60
+
+        # Ensure timezone compatibility
+        if latest_15m_time.tzinfo is None:
+            # Assume naive time is UTC (as per bar_manager storage)
+            latest_15m_time = pytz.utc.localize(latest_15m_time)
+
+        now_utc = now_ist.astimezone(pytz.UTC)
+        time_since_signal = (now_utc - latest_15m_time).total_seconds() / 60
 
         # If signal is recent (within last 30 minutes), act on it
         if time_since_signal <= 30:
@@ -363,95 +545,76 @@ async def handle_angel_startup_signal(symbol, angel_client, cash_mgr, bar_manage
         logger.exception("[%s] Error in startup signal detection: %s", symbol, e)
 
 
-async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
+# -----------------------------
+# Signal Monitor Loop
+# -----------------------------
+async def angel_signal_monitor(symbol, angel_client, cash_mgr, bar_manager):
     """
-    Main worker loop for each symbol.
-    Monitors market, detects signals, and executes trades.
+    Dedicated signal monitor for a symbol.
     """
-    global _STOP
+    logger.info("[%s] 👀 Signal monitor started", symbol)
 
-    logger.info("[%s] 🚀 Worker started", symbol)
-
-    # STARTUP: Check for recent 15m signal and search for entry
+    # 1. Check for startup signals
     await handle_angel_startup_signal(symbol, angel_client, cash_mgr, bar_manager)
 
-    # MAIN LOOP: Monitor for new 15m signals
-    while not _STOP:
+    # 2. Main Loop
+    while not _STOP_EVENT.is_set():
         try:
             now_ist = get_ist_now()
 
-            # Strict Market Close Check
+            # Strict Market Close Check (15:30)
             if now_ist.time() >= time(15, 30):
                 logger.info(
-                    "[%s] 🛑 Market closed (15:30 reached), stopping worker", symbol
+                    "[%s] 🛑 Market closed (15:30 reached), stopping monitor", symbol
                 )
                 break
 
             # Market hours guard
-            is_open = is_market_open()
-            await notify_market_state(is_open)
-
-            from core.config import MARKET_HOURS_ONLY
-
-            if MARKET_HOURS_ONLY and not is_open:
-                logger.debug("[%s] 💤 Market closed, sleeping 1 minute...", symbol)
-                await asyncio.sleep(60)
+            if MARKET_HOURS_ONLY and not is_market_open():
+                logger.debug("[%s] 💤 Market closed, monitor sleeping...", symbol)
+                await sleep_until_next(300)
                 continue
 
-            # Check if we already have an open position for this symbol
-            has_position = symbol in cash_mgr.open_positions
-
-            # Also check API directly (to handle restarts or out-of-sync state)
-            if not has_position:
-                try:
-                    positions = await angel_client.get_positions()
-                    for p in positions:
-                        if (
-                            symbol in p.get("tradingsymbol", "")
-                            and int(p.get("netqty", 0)) != 0
-                        ):
-                            has_position = True
-                            logger.warning(
-                                "[%s] ⚠️ Found existing position in API not in cache. Syncing...",
-                                symbol,
-                            )
-                            # Register in cash manager
-                            cash_mgr.open_positions[symbol] = {
-                                "symbol": p.get("tradingsymbol"),
-                                "quantity": int(p.get("netqty", 0)),
-                                "entry_price": float(p.get("avgnetprice", 0)),
-                                "entry_time": datetime.now(),
-                            }
-                            break
-                except Exception as e:
-                    logger.error("[%s] Error checking positions: %s", symbol, e)
-
-            if has_position:
-                # Poll for position closure
-                positions = await angel_client.get_positions()
-                has_pos = False
-
-                for p in positions:
-                    if (
-                        symbol in p.get("tradingsymbol", "")
-                        and int(p.get("netqty", 0)) != 0
-                    ):
-                        has_pos = True
-                        break
-
-                if not has_pos:
-                    logger.info("[%s] ✅ Position closed", symbol)
-                    cash_mgr.force_release(symbol)
-                    send_telegram(f"✅ {symbol} position closed")
-                else:
+                # Check for existing position
+                # We check cash_mgr caching for speed, but also sync with API occasionally
+                if symbol in cash_mgr.open_positions:
                     logger.info(
-                        "[%s] ⚠️ Position still open, skipping signal check...", symbol
+                        "[%s] ⏸️ Position exists, monitoring OCO & closure...", symbol
                     )
 
-                await asyncio.sleep(MONITOR_INTERVAL)
-                continue
+                    # 1. Manage OCO (Cancel SL/TP if other fills)
+                    await manage_oco_orders(symbol, angel_client)
 
-            # Wait until next 15m candle close before checking bias
+                    # 2. Check positions
+                    try:
+                        positions = await angel_client.get_positions()
+                        still_open = False
+                        for p in positions:
+                            if (
+                                symbol in p.get("tradingsymbol", "")
+                                and int(p.get("netqty", 0)) != 0
+                            ):
+                                still_open = True
+                                break
+
+                        if not still_open:
+                            logger.info(
+                                "[%s] ✅ Position closed externally (or via OCO), resuming.",
+                                symbol,
+                            )
+                            cash_mgr.force_release(symbol)
+                            # Also clear OCO if still exists
+                            if symbol in ACTIVE_OCO_ORDERS:
+                                del ACTIVE_OCO_ORDERS[symbol]
+                        else:
+                            await sleep_until_next(MONITOR_INTERVAL)
+                            continue
+                    except Exception as e:
+                        logger.error(f"Error checking positions: {e}")
+                        await sleep_until_next(60)
+                        continue
+
+            # Wait for next 15m candle close
             next_15m_close = get_next_candle_close_time(now_ist, "15min")
             sleep_seconds = get_seconds_until_next_close(now_ist, "15min")
 
@@ -461,16 +624,11 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 next_15m_close.strftime("%H:%M:%S"),
                 sleep_seconds,
             )
-            await asyncio.sleep(sleep_seconds)
+            await sleep_until_next(sleep_seconds)
 
-            # Get latest bars at 15m boundary
+            # Wake up and get data
             now_ist = get_ist_now()
-
-            # Double check market close after waking up
             if now_ist.time() >= time(15, 30):
-                logger.info(
-                    "[%s] 🛑 Market closed (15:30 reached), stopping worker", symbol
-                )
                 break
 
             # Convert IST to UTC for bar_manager
@@ -479,10 +637,10 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
 
             if df15.empty:
                 logger.warning("[%s] ⚠️ No 15m data available, waiting...", symbol)
-                await asyncio.sleep(60)
+                await sleep_until_next(60)
                 continue
 
-            # Detect 15m bias at candle close
+            # Detect 15m bias
             logger.info(
                 "[%s] 🔍 Checking 15m bias at %s IST (bars: 5m=%d, 15m=%d)...",
                 symbol,
@@ -496,14 +654,6 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 continue
 
             logger.info(
-                "[%s] ✅ 15m bias detected: %s at %s IST",
-                symbol,
-                bias,
-                now_ist.strftime("%H:%M:%S"),
-            )
-
-            # Notify 15m bias found
-            logger.info(
                 "[%s] 🎯 NEW 15m signal: %s at %s IST - Starting 5m entry search...",
                 symbol,
                 bias,
@@ -513,134 +663,33 @@ async def worker_loop(symbol, angel_client, cash_mgr, bar_manager):
                 f"📊 [{symbol}] 15m Trend: {bias} at {now_ist.strftime('%H:%M')} IST. Looking for 5m entry..."
             )
 
-            # Search for 5m entry confirmation
             await search_angel_5m_entry(
                 symbol, bias, angel_client, cash_mgr, bar_manager, "ENTRY"
             )
 
         except Exception as e:
-            logger.exception("[%s] ❌ Worker exception: %s", symbol, e)
-            send_telegram(f"⚠️ Error in {symbol} worker: {str(e)[:100]}")
-            await asyncio.sleep(2)
-
-    logger.info("[%s] 🛑 Worker exiting", symbol)
+            logger.exception("[%s] ❌ Signal monitor exception: %s", symbol, e)
+            await sleep_until_next(60)
 
 
-async def pre_market_check(cash_mgr):
-    """
-    Perform pre-market balance check and notification.
-    Called once when bot starts or when market opens.
-    """
-    logger.info("🔍 Performing pre-market balance check...")
-    await cash_mgr.check_and_log_start_balance()
-
-
-async def end_of_day_report(cash_mgr, angel_client):
-    """
-    Generate and send end-of-day trading report.
-    Includes balance, P&L, trade count, and position status.
-    """
-    logger.info("📊 Generating end-of-day report...")
-
-    try:
-        # Get daily statistics
-        stats = await cash_mgr.get_daily_statistics()
-
-        # Get open positions from Angel API
-        positions = await angel_client.get_positions()
-        open_positions = [p for p in positions if p.get("netqty", "0") != "0"]
-
-        # Calculate P&L percentage
-        start_bal = stats["start_balance"]
-        pnl = stats["daily_pnl"]
-        pnl_pct = (pnl / start_bal * 100) if start_bal > 0 else 0.0
-
-        # Build report message
-        msg = (
-            f"📊 **End of Day Report**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 Start Balance: ₹{start_bal:,.2f}\n"
-            f"💰 End Balance: ₹{stats['current_balance']:,.2f}\n"
-            f"📈 Daily P&L: ₹{pnl:,.2f} ({pnl_pct:+.2f}%)\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Total Trades: {stats['total_trades']}\n"
-            f"📂 Open Positions: {len(open_positions)}\n"
-        )
-
-        # Add open position details if any
-        if open_positions:
-            msg += "\n🔓 Open Positions:\n"
-            for pos in open_positions:
-                symbol = pos.get("tradingsymbol", "Unknown")
-                qty = pos.get("netqty", "0")
-                pnl_pos = float(pos.get("pnl", 0))
-                msg += f"  • {symbol}: Qty {qty} | P&L ₹{pnl_pos:,.2f}\n"
-        else:
-            msg += "\n✅ All positions closed\n"
-
-        msg += "━━━━━━━━━━━━━━━━━━━━"
-
-        logger.info(msg.replace("**", "").replace("━", "-"))
-        send_telegram(msg)
-
-    except Exception as e:
-        logger.exception("Error generating end-of-day report: %s", e)
-        send_telegram(f"⚠️ Error generating end-of-day report: {str(e)[:100]}")
-
-
-async def schedule_end_of_day_report(cash_mgr, angel_client):
-    """
-    Background task that schedules end-of-day report at market close.
-    Runs continuously and triggers report at 3:30 PM IST each trading day.
-    """
-    from core.angelone.utils import get_seconds_until_market_close
-
-    logger.info("📅 End-of-day report scheduler started")
-
-    while not _STOP:
-        try:
-            # Calculate wait time until market close
-            wait_seconds = get_seconds_until_market_close()
-
-            logger.info(
-                f"⏰ End-of-day report scheduled in {wait_seconds/3600:.1f} hours"
-            )
-
-            # Wait until market close
-            await asyncio.sleep(wait_seconds)
-
-            # Generate report
-            if not _STOP:
-                await end_of_day_report(cash_mgr, angel_client)
-
-            # Wait a bit before scheduling next report (avoid duplicate reports)
-            await asyncio.sleep(300)  # 5 minutes
-
-        except Exception as e:
-            logger.exception("Error in end-of-day scheduler: %s", e)
-            await asyncio.sleep(60)
-
-    logger.info("📅 End-of-day report scheduler exiting")
-
-
+# -----------------------------
+# Main Worker Function
+# -----------------------------
 async def run_angel_workers():
     """Initialize and run all Angel One worker tasks in a daily loop"""
-    global _STOP
 
     logger.info("🤖 Bot process started")
     init_audit_file()
 
     # Start heartbeat task immediately and continuously
-    # This ensures we have logs even when the bot is sleeping overnight
     heartbeat = asyncio.create_task(heartbeat_task())
 
-    while not _STOP:
+    while not _STOP_EVENT.is_set():
         try:
             now_ist = get_ist_now()
             current_time = now_ist.time()
 
             # Define active window: 09:00 to 15:30
-            # We start at 09:00 to allow 15 mins for pre-market checks and data loading
             start_time = time(9, 0)
             end_time = time(15, 30)
 
@@ -651,16 +700,16 @@ async def run_angel_workers():
             if not is_active_window:
                 # Calculate wait time until next start (09:00 AM)
                 if current_time >= end_time or not is_weekday:
-                    # Wait until tomorrow 09:00 (start point)
+                    # Wait until tomorrow 09:00
                     next_start = datetime.combine(
                         now_ist.date() + timedelta(days=1), start_time
                     )
                 else:
-                    # Wait until today 09:00 (if started before market open)
+                    # Wait until today 09:00
                     next_start = datetime.combine(now_ist.date(), start_time)
 
                 # Skip weekends
-                while next_start.weekday() > 4:  # If Sat(5) or Sun(6)
+                while next_start.weekday() > 4:
                     next_start += timedelta(days=1)
 
                 # Make next_start timezone aware
@@ -676,13 +725,13 @@ async def run_angel_workers():
                     f"{next_start.strftime('%Y-%m-%d %H:%M')} IST (09:00 market open)"
                 )
 
-                # Sleep in chunks to allow for graceful shutdown
-                while wait_seconds > 0 and not _STOP:
+                # Sleep in chunks
+                while wait_seconds > 0 and not _STOP_EVENT.is_set():
                     sleep_chunk = min(wait_seconds, 60)
                     await asyncio.sleep(sleep_chunk)
                     wait_seconds -= sleep_chunk
 
-                if _STOP:
+                if _STOP_EVENT.is_set():
                     break
 
             # 🌅 Start Daily Cycle
@@ -692,14 +741,13 @@ async def run_angel_workers():
             # Initialize Angel Broker client
             angel_client = AngelClient()
 
-            # Connect to Angel Broker
+            # Connect
             await angel_client.connect_async()
-
             if not angel_client.connected:
                 logger.error(
                     "❌ Failed to connect to Angel Broker. Retrying in 1 minute..."
                 )
-                await asyncio.sleep(60)
+                await sleep_until_next(60)
                 continue
 
             # Create cash manager
@@ -710,34 +758,27 @@ async def run_angel_workers():
                 max_position_pct=MAX_POSITION_PCT,
             )
 
-            # Initialize BarManagers for each symbol
+            # Initialize BarManagers
             bar_managers = {}
-
             logger.info("Initializing BarManagers and loading historical data...")
 
             for symbol in SYMBOLS:
-                # Create BarManager
-                bar_mgr = BarManager(symbol, max_bars=2880)  # 2 days of 1m bars
+                bar_mgr = BarManager(symbol, max_bars=2880)
                 bar_managers[symbol] = bar_mgr
 
-                # Load initial historical data
+                # Load historical data
                 logger.info("[%s] Loading historical data...", symbol)
                 df_hist = await angel_client.req_historic_1m(symbol, duration_days=2)
-
                 if df_hist is not None and not df_hist.empty:
                     await bar_mgr.initialize_from_historical(df_hist)
                     logger.info("[%s] Loaded %d historical bars", symbol, len(df_hist))
                 else:
                     logger.warning("[%s] Failed to load historical data", symbol)
 
-            # Perform pre-market balance check
-            logger.info("🔍 Checking account balance...")
-            await pre_market_check(cash_mgr)
+            # Pre-market check
+            await cash_mgr.check_and_log_start_balance()
 
-            # Start worker tasks
-            tasks = []
-
-            # Initialize WebSocket
+            # Start WebSocket
             from core.angelone.client import AngelWebSocket
 
             logger.info("🚀 Starting Angel WebSocket...")
@@ -750,31 +791,37 @@ async def run_angel_workers():
                 loop=asyncio.get_running_loop(),
             )
 
-            # Add symbols to WebSocket
+            # Subscribe
             for symbol in SYMBOLS:
                 token = angel_client.get_symbol_token(symbol, "NSE")
                 if token:
                     ws_client.add_symbol(symbol, token, "NSE")
                 else:
-                    logger.error(f"Could not find token for {symbol} to subscribe")
+                    logger.error(f"Could not find token for {symbol}")
 
-            # Start WebSocket in a separate thread (it's blocking)
+            # Start WebSocket Thread
             import threading
 
             ws_thread = threading.Thread(target=ws_client.connect, daemon=True)
             ws_thread.start()
 
-            # Start worker loop for each symbol
-            logger.info("🚀 Starting worker loops...")
+            # Launch Workers
+            tasks = []
+
+            # 1. EOD Scheduler
+            tasks.append(eod_scheduler_task(cash_mgr, angel_client, bar_managers))
+
+            # 2. Signal Monitors
+            logger.info("🚀 Starting signal monitors...")
             for symbol in SYMBOLS:
                 bar_mgr = bar_managers.get(symbol)
-                tasks.append(worker_loop(symbol, angel_client, cash_mgr, bar_mgr))
-                logger.info("[%s] 🔄 Worker thread started", symbol)
+                tasks.append(
+                    angel_signal_monitor(symbol, angel_client, cash_mgr, bar_mgr)
+                )
 
             send_telegram("🚀 Angel Broker Bot Started (LIVE TRADING)")
 
-            # Wait for all tasks to complete
-            # The workers and data fetchers are designed to exit at 15:30
+            # Wait for tasks
             try:
                 await asyncio.gather(*tasks)
             except asyncio.CancelledError:
@@ -782,35 +829,27 @@ async def run_angel_workers():
             except Exception as e:
                 logger.exception("Error in daily task group: %s", e)
 
-            # 🏁 End of Day Cleanup
-            logger.info("🏁 Daily trading session ended (15:30 reached)")
-
-            # Finalize any pending bars (crucial for capturing the 15:29 minute)
-            logger.info("💾 Finalizing last minute bars...")
-            for symbol, bar_mgr in bar_managers.items():
-                await bar_mgr.finalize_bar()
-
-            # Generate End of Day Report
-            await end_of_day_report(cash_mgr, angel_client)
-
-            # Disconnect
+            # Cleanup
+            logger.info("👋 Disconnecting from Angel Broker...")
             angel_client.disconnect()
-            logger.info("👋 Disconnected from Angel Broker. Waiting for next day...")
+
+            # Wait briefly before loop restarts (if not stopped)
+            await sleep_until_next(5)
 
         except Exception as e:
             logger.exception("CRITICAL: Error in main daily loop: %s", e)
-            send_telegram(f"🚨 CRITICAL: Bot daily loop error: {str(e)[:100]}")
-            await asyncio.sleep(60)  # Prevent tight loop on error
+            send_telegram(f"🚨 CRITICAL: Angel Bot daily loop error: {str(e)[:100]}")
+            await sleep_until_next(60)
 
-    # Wait for heartbeat to finish
+    # Wait for heartbeat if stopped
     if not heartbeat.done():
         await heartbeat
 
 
 def stop_angel_workers():
-    """Stop all Angel One worker tasks"""
-    global _STOP
-    _STOP = True
+    """Stop all Angel One workers"""
+    _STOP_EVENT.set()
+    logger.info("🛑 Stop signal sent to all workers")
 
 
 async def notify_market_state(is_open: bool):

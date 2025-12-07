@@ -1,21 +1,35 @@
-# core/ibkr_option_selector.py
+# core/ibkr/option_selector.py
 """
 Option selection logic for IBKR US stock options.
 Selects ITM options based on bias (CALL/PUT) and underlying price.
 """
-from datetime import datetime
-from typing import Dict, Optional, Tuple
 
-from core.config import (
-    OPTION_MIN_DTE,
-    OPTION_MAX_DTE,
-)
+import asyncio
+from datetime import datetime
+from typing import Optional, Tuple, Any, List
+from dataclasses import dataclass
+import pytz
+
+from core.config import OPTION_MIN_DTE, OPTION_MAX_DTE
 from core.logger import logger
+
+
+@dataclass
+class OptionSelection:
+    symbol: str
+    contract: Any
+    strike: float
+    expiry: str
+    right: str
+    dte: int
+    premium: float
+    lot_size: int
+    token: str
 
 
 async def find_ibkr_option_contract(
     ibkr_client, symbol: str, bias: str, underlying_price: float
-) -> Tuple[Optional[Dict], str]:
+) -> Tuple[Optional[OptionSelection], str]:
     """
     Find suitable option contract for US stock based on bias and underlying price.
 
@@ -26,7 +40,7 @@ async def find_ibkr_option_contract(
         underlying_price: Current stock price
 
     Returns:
-        (option_contract_dict, reason_string)
+        (OptionSelection, reason_string)
     """
     try:
         logger.info(
@@ -35,27 +49,31 @@ async def find_ibkr_option_contract(
 
         # Get option chain
         options = await ibkr_client.get_option_chain(symbol, underlying_price)
-
         if not options:
             return None, "No options available"
 
-        # Determine option type based on bias
+        # Determine option type
         option_type = "C" if bias == "BULL" else "P"
-
-        # Filter by option type
         filtered = [opt for opt in options if opt["right"] == option_type]
-
         if not filtered:
             return None, f"No {option_type} options found"
 
-        # Check expiration (DTE filter)
-        today = datetime.now()
+        # Timezone-aware today (ET)
+        et = pytz.timezone("America/New_York")
+        today = datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # Filter by DTE
         valid_options = []
-
         for opt in filtered:
-            expiry_date = datetime.strptime(opt["expiry"], "%Y%m%d")
-            dte = (expiry_date - today).days
+            try:
+                expiry_date = datetime.strptime(opt["expiry"], "%Y%m%d").replace(
+                    tzinfo=et
+                )
+            except ValueError:
+                # Handle possible different date formats if necessary, or skip
+                continue
 
+            dte = (expiry_date - today).days
             if OPTION_MIN_DTE <= dte <= OPTION_MAX_DTE:
                 opt["dte"] = dte
                 valid_options.append(opt)
@@ -63,110 +81,109 @@ async def find_ibkr_option_contract(
         if not valid_options:
             return None, f"No options with {OPTION_MIN_DTE}-{OPTION_MAX_DTE} DTE"
 
-        # Select ITM option (strike below price for CALL, above for PUT)
-        if bias == "BULL":
-            # For CALL: ITM means strike < underlying
-            # Choose strike closest to underlying but below it
-            itm_options = [
-                opt for opt in valid_options if opt["strike"] < underlying_price
-            ]
-            if itm_options:
-                selected = max(
-                    itm_options, key=lambda x: x["strike"]
-                )  # Highest strike below price
-            else:
-                # No ITM available, use ATM
-                selected = min(
-                    valid_options, key=lambda x: abs(x["strike"] - underlying_price)
-                )
-        else:
-            # For PUT: ITM means strike > underlying
-            # Choose strike closest to underlying but above it
-            itm_options = [
-                opt for opt in valid_options if opt["strike"] > underlying_price
-            ]
-            if itm_options:
-                selected = min(
-                    itm_options, key=lambda x: x["strike"]
-                )  # Lowest strike above price
-            else:
-                # No ITM available, use ATM
-                selected = min(
-                    valid_options, key=lambda x: abs(x["strike"] - underlying_price)
-                )
+        # Select strike
+        selected = _select_strike(valid_options, underlying_price, bias)
 
-        # Get option premium (price)
-        premium = await get_option_price(ibkr_client, selected["contract"])
-
+        # Get option premium asynchronously
+        premium = await _get_option_price(ibkr_client, selected["contract"])
         if premium is None or premium <= 0:
             return None, "Could not get valid option price"
 
-        # Format result
-        result = {
-            "symbol": selected["symbol"],
-            "contract": selected["contract"],
-            "strike": selected["strike"],
-            "expiry": selected["expiry"],
-            "right": selected["right"],
-            "dte": selected["dte"],
-            "premium": premium,
-            "lot_size": int(
-                selected["contract"].multiplier or 100
-            ),  # Get multiplier from contract
-            "token": selected["symbol"],  # Use symbol as token for consistency
-        }
+        # Prepare final selection
+        # Ensure lot_size is an integer
+        multiplier = getattr(selected["contract"], "multiplier", "100")
+        try:
+            lot_size = int(multiplier) if multiplier else 100
+        except (ValueError, TypeError):
+            lot_size = 100
+
+        result = OptionSelection(
+            symbol=selected["symbol"],
+            contract=selected["contract"],
+            strike=selected["strike"],
+            expiry=selected["expiry"],
+            right=selected["right"],
+            dte=selected["dte"],
+            premium=premium,
+            lot_size=lot_size,
+            token=selected["symbol"],
+        )
 
         logger.info(
-            f"[{symbol}] Selected: {result['symbol']} "
-            f"Strike=${result['strike']:.2f} DTE={result['dte']} Premium=${premium:.2f}"
+            f"[{symbol}] Selected: {result.symbol} Strike=${result.strike:.2f} "
+            f"DTE={result.dte} Premium=${result.premium:.2f}"
         )
 
         return result, "Success"
 
     except Exception as e:
-        logger.exception(f"Error selecting option for {symbol}: {e}")
+        logger.exception(f"[{symbol}] Error selecting option: {e}")
         return None, str(e)
 
 
-async def get_option_price(ibkr_client, contract) -> Optional[float]:
+def _select_strike(options: List[dict], underlying: float, bias: str) -> dict:
     """
-    Get current price for an option contract.
+    Select ITM option based on bias. Falls back to ATM if no ITM exists.
+    """
+    if bias == "BULL":
+        itm = [o for o in options if o["strike"] < underlying]
+        return (
+            max(itm, key=lambda x: x["strike"])
+            if itm
+            else min(options, key=lambda x: abs(x["strike"] - underlying))
+        )
+    else:  # BEAR
+        itm = [o for o in options if o["strike"] > underlying]
+        return (
+            min(itm, key=lambda x: x["strike"])
+            if itm
+            else min(options, key=lambda x: abs(x["strike"] - underlying))
+        )
 
+
+async def _get_option_price(
+    ibkr_client, contract, timeout: float = 5.0
+) -> Optional[float]:
+    """
+    Get current price for an option contract using polling.
     Args:
         ibkr_client: IBKRClient instance
         contract: IB Option contract
+        timeout: maximum seconds to wait for valid price
 
     Returns:
         Option price or None
     """
     try:
-        # Qualify contract
         await ibkr_client.ib.qualifyContractsAsync(contract)
-
-        # Request market data
         ticker = ibkr_client.ib.reqMktData(contract, "", False, False)
 
-        # Wait for data to populate
-        import asyncio
+        start_time = asyncio.get_event_loop().time()
+        price = None
 
-        await asyncio.sleep(2)
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            bid = getattr(ticker, "bid", 0)
+            ask = getattr(ticker, "ask", 0)
+            last = getattr(ticker, "last", 0)
+            close = getattr(ticker, "close", 0)
 
-        # Try to get bid/ask midpoint
-        if ticker.bid > 0 and ticker.ask > 0:
-            price = (ticker.bid + ticker.ask) / 2
-        elif ticker.last > 0:
-            price = ticker.last
-        elif ticker.close > 0:
-            price = ticker.close
-        else:
-            logger.warning(f"No valid price data for {contract.symbol}")
-            ibkr_client.ib.cancelMktData(contract)
-            return None
+            # Handle potential nan or None values safely?
+            # Usually ib_insync initializes them to nan or 0.0.
+            # We assume non-NaN positive values are valid.
 
-        # Cancel market data
+            if bid > 0 and ask > 0:
+                price = (bid + ask) / 2
+                break
+            elif last > 0:
+                price = last
+                break
+            elif close > 0:
+                price = close
+                break
+            await asyncio.sleep(0.1)
+
         ibkr_client.ib.cancelMktData(contract)
-
-        return float(price)
+        return float(price) if price else None
 
     except Exception as e:
         logger.exception(f"Error getting option price: {e}")
