@@ -23,7 +23,7 @@ from core.config import (
     RISK_PCT_OF_PREMIUM,
     RISK_PER_CONTRACT,
     RR_RATIO,
-    SYMBOLS,
+    ANGEL_SYMBOLS,
     MARKET_HOURS_ONLY,
     INDEX_FUTURES,
 )
@@ -75,6 +75,70 @@ def compute_stop_target(entry_price):
     stop = max(0.05, float(entry_price) - risk)
     target = float(entry_price) + RR_RATIO * risk
     return stop, target, risk
+
+
+async def ensure_market_active(
+    sleep_when_closed=True, sleep_seconds=300, set_stop_on_close=True
+):
+    """
+    Centralized market-hours logic.
+
+    Returns:
+      True  - market is open and caller can proceed
+      False - market is closed or it's past hard-close; caller should stop or skip work
+
+    Behavior:
+    - Uses MARKET_HOURS_ONLY flag to decide whether to enforce hours.
+    - If time >= 15:30 IST and set_stop_on_close True => set _STOP_EVENT and return False.
+    - If market isn't open according to is_market_open():
+        - If sleep_when_closed True => sleep for `sleep_seconds` using cancellation-aware sleep
+        - Return False to indicate work should not proceed now
+    - Also notifies (via notify_market_state) on open/close state changes.
+    """
+    global _STOP_EVENT
+
+    if not MARKET_HOURS_ONLY:
+        # No market hours enforcement required
+        return True
+
+    now_ist = get_ist_now()
+
+    # Hard cutoff (15:30 IST)
+    if now_ist.time() >= time(15, 30):
+        # Market effectively closed for the day — set stop event if requested
+        if set_stop_on_close:
+            _STOP_EVENT.set()
+        try:
+            await notify_market_state(False)
+        except Exception:
+            # Non-fatal if notification fails
+            logger.debug(
+                "notify_market_state failed during hard close check", exc_info=True
+            )
+        return False
+
+    # Soft open/close detection via provided util
+    try:
+        open_flag = is_market_open()
+    except Exception as e:
+        # If utility fails, assume closed to be safe
+        logger.error("is_market_open() check failed: %s", e)
+        open_flag = False
+
+    # Notify if changed
+    try:
+        await notify_market_state(open_flag)
+    except Exception:
+        logger.debug(
+            "notify_market_state failed during open_flag notification", exc_info=True
+        )
+
+    if not open_flag:
+        if sleep_when_closed:
+            await sleep_until_next(sleep_seconds)
+        return False
+
+    return True
 
 
 # -----------------------------
@@ -157,11 +221,6 @@ async def eod_scheduler_task(cash_mgr, angel_client, bar_managers):
             # Calculate wait time until market close (15:30 IST)
             wait_seconds = get_seconds_until_market_close()
 
-            # If market is already closed, wait_seconds might be large (until next day),
-            # or negative if we are just past close.
-            # get_seconds_until_market_close usually returns seconds from NOW until today's 15:30.
-            # If it's past 15:30, it might return 0 or negative.
-
             now_ist = get_ist_now()
             if now_ist.time() >= time(15, 30):
                 # Market already closed today
@@ -173,7 +232,6 @@ async def eod_scheduler_task(cash_mgr, angel_client, bar_managers):
             )
 
             # Wait until market close
-            # Use sleep_until_next to handle cancellation
             await sleep_until_next(wait_seconds)
 
             if _STOP_EVENT.is_set():
@@ -397,14 +455,17 @@ async def search_angel_5m_entry(
 
     while checks < MAX_5M_CHECKS and not _STOP_EVENT.is_set():
         checks += 1
-        now_ist = get_ist_now()
 
-        # Market close check
-        if now_ist.time() >= time(15, 30):
+        # Centralized market-hour check (do not set stop here; we just want to skip attempts if closed)
+        if not await ensure_market_active(
+            sleep_when_closed=False, set_stop_on_close=False
+        ):
             logger.info(
-                "[%s] 🛑 Market closed, stopping %s entry search", symbol, context
+                "[%s] 💤 Market not active, aborting %s entry search", symbol, context
             )
             return False
+
+        now_ist = get_ist_now()
 
         # Wait for next 5m candle close
         next_5m_close = get_next_candle_close_time(now_ist, "5min")
@@ -420,12 +481,19 @@ async def search_angel_5m_entry(
         )
         await sleep_until_next(sleep_seconds)
 
-        now_ist = get_ist_now()
-        if now_ist.time() >= time(15, 30):
+        # After sleep, re-check active window
+        if not await ensure_market_active(
+            sleep_when_closed=False, set_stop_on_close=False
+        ):
+            logger.info(
+                "[%s] 💤 Market closed after wait, aborting %s entry search",
+                symbol,
+                context,
+            )
             return False
 
         # Get fresh data
-        now_utc = now_ist.astimezone(pytz.UTC).replace(tzinfo=None)
+        now_utc = get_ist_now().astimezone(pytz.UTC).replace(tzinfo=None)
         df5_new, df15_new = await bar_manager.get_resampled(current_time=now_utc)
         if df5_new.empty or df15_new.empty:
             logger.debug("[%s] ⚠️ Empty dataframe at 5m check #%d", symbol, checks)
@@ -493,8 +561,13 @@ async def handle_angel_startup_signal(symbol, angel_client, cash_mgr, bar_manage
     Check for recent 15m signal on startup and search for entry if found.
     """
     try:
-        now_ist = get_ist_now()
-        if not is_market_open():
+        # Use centralized check: we don't want to start up trading if market is definitively closed
+        if not await ensure_market_active(
+            sleep_when_closed=False, set_stop_on_close=False
+        ):
+            logger.debug(
+                "[%s] Startup: market not active, skipping startup signal check", symbol
+            )
             return
 
         # Get current data
@@ -515,7 +588,7 @@ async def handle_angel_startup_signal(symbol, angel_client, cash_mgr, bar_manage
             # Assume naive time is UTC (as per bar_manager storage)
             latest_15m_time = pytz.utc.localize(latest_15m_time)
 
-        now_utc = now_ist.astimezone(pytz.UTC)
+        now_utc = get_ist_now().astimezone(pytz.UTC)
         time_since_signal = (now_utc - latest_15m_time).total_seconds() / 60
 
         # If signal is recent (within last 30 minutes), act on it
@@ -560,59 +633,16 @@ async def angel_signal_monitor(symbol, angel_client, cash_mgr, bar_manager):
     # 2. Main Loop
     while not _STOP_EVENT.is_set():
         try:
-            now_ist = get_ist_now()
-
-            # Strict Market Close Check (15:30)
-            if now_ist.time() >= time(15, 30):
-                logger.info(
-                    "[%s] 🛑 Market closed (15:30 reached), stopping monitor", symbol
-                )
-                break
-
-            # Market hours guard
-            if MARKET_HOURS_ONLY and not is_market_open():
-                logger.debug("[%s] 💤 Market closed, monitor sleeping...", symbol)
-                await sleep_until_next(300)
+            # Centralized market-state guard:
+            active = await ensure_market_active()
+            if not active:
+                # If we've been asked to stop, break; otherwise loop will continue after sleep inside ensure_market_active
+                if _STOP_EVENT.is_set():
+                    break
+                # Market is closed but not stop-forced; continue to next iteration
                 continue
 
-                # Check for existing position
-                # We check cash_mgr caching for speed, but also sync with API occasionally
-                if symbol in cash_mgr.open_positions:
-                    logger.info(
-                        "[%s] ⏸️ Position exists, monitoring OCO & closure...", symbol
-                    )
-
-                    # 1. Manage OCO (Cancel SL/TP if other fills)
-                    await manage_oco_orders(symbol, angel_client)
-
-                    # 2. Check positions
-                    try:
-                        positions = await angel_client.get_positions()
-                        still_open = False
-                        for p in positions:
-                            if (
-                                symbol in p.get("tradingsymbol", "")
-                                and int(p.get("netqty", 0)) != 0
-                            ):
-                                still_open = True
-                                break
-
-                        if not still_open:
-                            logger.info(
-                                "[%s] ✅ Position closed externally (or via OCO), resuming.",
-                                symbol,
-                            )
-                            cash_mgr.force_release(symbol)
-                            # Also clear OCO if still exists
-                            if symbol in ACTIVE_OCO_ORDERS:
-                                del ACTIVE_OCO_ORDERS[symbol]
-                        else:
-                            await sleep_until_next(MONITOR_INTERVAL)
-                            continue
-                    except Exception as e:
-                        logger.error(f"Error checking positions: {e}")
-                        await sleep_until_next(60)
-                        continue
+            now_ist = get_ist_now()
 
             # Wait for next 15m candle close
             next_15m_close = get_next_candle_close_time(now_ist, "15min")
@@ -626,13 +656,14 @@ async def angel_signal_monitor(symbol, angel_client, cash_mgr, bar_manager):
             )
             await sleep_until_next(sleep_seconds)
 
-            # Wake up and get data
-            now_ist = get_ist_now()
-            if now_ist.time() >= time(15, 30):
-                break
+            # Re-check after sleeping
+            if not await ensure_market_active(
+                sleep_when_closed=False, set_stop_on_close=False
+            ):
+                continue
 
             # Convert IST to UTC for bar_manager
-            now_utc = now_ist.astimezone(pytz.UTC).replace(tzinfo=None)
+            now_utc = get_ist_now().astimezone(pytz.UTC).replace(tzinfo=None)
             df5, df15 = await bar_manager.get_resampled(current_time=now_utc)
 
             if df15.empty:
@@ -644,7 +675,7 @@ async def angel_signal_monitor(symbol, angel_client, cash_mgr, bar_manager):
             logger.info(
                 "[%s] 🔍 Checking 15m bias at %s IST (bars: 5m=%d, 15m=%d)...",
                 symbol,
-                now_ist.strftime("%H:%M:%S"),
+                get_ist_now().strftime("%H:%M:%S"),
                 len(df5),
                 len(df15),
             )
@@ -657,19 +688,81 @@ async def angel_signal_monitor(symbol, angel_client, cash_mgr, bar_manager):
                 "[%s] 🎯 NEW 15m signal: %s at %s IST - Starting 5m entry search...",
                 symbol,
                 bias,
-                now_ist.strftime("%H:%M:%S"),
+                get_ist_now().strftime("%H:%M:%S"),
             )
             send_telegram(
-                f"📊 [{symbol}] 15m Trend: {bias} at {now_ist.strftime('%H:%M')} IST. Looking for 5m entry..."
+                f"📊 [{symbol}] 15m Trend: {bias} at {get_ist_now().strftime('%H:%M')} IST. Looking for 5m entry..."
             )
 
             await search_angel_5m_entry(
                 symbol, bias, angel_client, cash_mgr, bar_manager, "ENTRY"
             )
 
+            # If we currently hold a position we should still manage OCOs and monitor closure
+            if symbol in cash_mgr.open_positions:
+                # 1. Manage OCO (Cancel SL/TP if other fills)
+                await manage_oco_orders(symbol, angel_client)
+
+                # 2. Check positions via API occasionally
+                try:
+                    positions = await angel_client.get_positions()
+                    still_open = False
+                    for p in positions:
+                        if (
+                            symbol in p.get("tradingsymbol", "")
+                            and int(p.get("netqty", 0)) != 0
+                        ):
+                            still_open = True
+                            break
+
+                    if not still_open:
+                        logger.info(
+                            "[%s] ✅ Position closed externally (or via OCO), resuming.",
+                            symbol,
+                        )
+                        cash_mgr.force_release(symbol)
+                        # Also clear OCO if still exists
+                        if symbol in ACTIVE_OCO_ORDERS:
+                            del ACTIVE_OCO_ORDERS[symbol]
+                    else:
+                        # Continue monitoring OCO & positions
+                        await sleep_until_next(MONITOR_INTERVAL)
+                except Exception as e:
+                    logger.error(f"Error checking positions: {e}")
+                    await sleep_until_next(60)
+
         except Exception as e:
             logger.exception("[%s] ❌ Signal monitor exception: %s", symbol, e)
             await sleep_until_next(60)
+
+
+async def calculate_wait_time(current_time, start_time, end_time, is_weekday, now_ist):
+    """Calculate wait time until next market open"""
+    if current_time >= end_time or not is_weekday:
+        # Wait until tomorrow 09:00
+        next_start = datetime.combine(now_ist.date() + timedelta(days=1), start_time)
+    else:
+        # Wait until today 09:00
+        next_start = datetime.combine(now_ist.date(), start_time)
+
+    # Skip weekends
+    while next_start.weekday() > 4:
+        next_start += timedelta(days=1)
+
+    # Make next_start timezone aware
+    tz = pytz.timezone("Asia/Kolkata")
+    if next_start.tzinfo is None:
+        next_start = tz.localize(next_start)
+
+    wait_seconds = (next_start - now_ist).total_seconds()
+    wait_hours = wait_seconds / 3600
+
+    logger.info(
+        f"💤 Market closed. Sleeping {wait_hours:.1f} hours until "
+        f"{next_start.strftime('%Y-%m-%d %H:%M')} IST (09:00 market open)"
+    )
+
+    return wait_seconds
 
 
 # -----------------------------
@@ -699,30 +792,8 @@ async def run_angel_workers():
 
             if not is_active_window:
                 # Calculate wait time until next start (09:00 AM)
-                if current_time >= end_time or not is_weekday:
-                    # Wait until tomorrow 09:00
-                    next_start = datetime.combine(
-                        now_ist.date() + timedelta(days=1), start_time
-                    )
-                else:
-                    # Wait until today 09:00
-                    next_start = datetime.combine(now_ist.date(), start_time)
-
-                # Skip weekends
-                while next_start.weekday() > 4:
-                    next_start += timedelta(days=1)
-
-                # Make next_start timezone aware
-                tz = pytz.timezone("Asia/Kolkata")
-                if next_start.tzinfo is None:
-                    next_start = tz.localize(next_start)
-
-                wait_seconds = (next_start - now_ist).total_seconds()
-                wait_hours = wait_seconds / 3600
-
-                logger.info(
-                    f"[ANGEL] 💤 Market closed. Sleeping {wait_hours:.1f} hours until "
-                    f"{next_start.strftime('%Y-%m-%d %H:%M')} IST (09:00 market open)"
+                wait_seconds = await calculate_wait_time(
+                    current_time, start_time, end_time, is_weekday, now_ist
                 )
 
                 # Sleep in chunks
@@ -734,9 +805,17 @@ async def run_angel_workers():
                 if _STOP_EVENT.is_set():
                     break
 
+            # Before proceeding, ensure market is active (this also updates notifications)
+            if not await ensure_market_active():
+                # If ensure_market_active sets stop event due to hard close, break outer loop
+                if _STOP_EVENT.is_set():
+                    break
+                # else continue waiting for active window
+                continue
+
             # 🌅 Start Daily Cycle
             logger.info("🌅 Starting daily trading cycle...")
-            send_telegram("🌅 Bot waking up for trading day...")
+            send_telegram("🌅 [Angel] Bot waking up for trading day...")
 
             # Initialize Angel Broker client
             angel_client = AngelClient()
@@ -758,11 +837,18 @@ async def run_angel_workers():
                 max_position_pct=MAX_POSITION_PCT,
             )
 
+            logger.info("✅ Connected to Angel")
+            send_telegram("✅ Connected to Angel")
+
+            # Wait for portfolio sync
+            logger.info("⏳ Waiting 5s for portfolio sync...")
+            await asyncio.sleep(5)
+
             # Initialize BarManagers
             bar_managers = {}
             logger.info("Initializing BarManagers and loading historical data...")
 
-            for symbol in SYMBOLS:
+            for symbol in ANGEL_SYMBOLS:
                 bar_mgr = BarManager(symbol, max_bars=2880)
                 bar_managers[symbol] = bar_mgr
 
@@ -792,7 +878,7 @@ async def run_angel_workers():
             )
 
             # Subscribe
-            for symbol in SYMBOLS:
+            for symbol in ANGEL_SYMBOLS:
                 token = angel_client.get_symbol_token(symbol, "NSE")
                 if token:
                     ws_client.add_symbol(symbol, token, "NSE")
@@ -813,7 +899,7 @@ async def run_angel_workers():
 
             # 2. Signal Monitors
             logger.info("🚀 Starting signal monitors...")
-            for symbol in SYMBOLS:
+            for symbol in ANGEL_SYMBOLS:
                 bar_mgr = bar_managers.get(symbol)
                 tasks.append(
                     angel_signal_monitor(symbol, angel_client, cash_mgr, bar_mgr)

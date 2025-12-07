@@ -399,6 +399,36 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
             await asyncio.sleep(60)
 
 
+async def calculate_wait_time(current_time, start_time, end_time, is_weekday, now_et):
+    from datetime import timedelta
+    import pytz
+
+    if current_time >= end_time or not is_weekday:
+        # Wait until tomorrow 09:00 (start point)
+        next_start = datetime.combine(now_et.date() + timedelta(days=1), start_time)
+    else:
+        # Wait until today 09:00 (if started before market open)
+        next_start = datetime.combine(now_et.date(), start_time)
+
+    # Skip weekends
+    while next_start.weekday() > 4:  # If Sat(5) or Sun(6)
+        next_start += timedelta(days=1)
+
+    # Make next_start timezone aware
+    tz = pytz.timezone("America/New_York")
+    if next_start.tzinfo is None:
+        next_start = tz.localize(next_start)
+
+    wait_seconds = (next_start - now_et).total_seconds()
+    wait_hours = wait_seconds / 3600
+
+    logger.info(
+        f"💤 Market closed. Sleeping {wait_hours:.1f} hours until "
+        f"{next_start.strftime('%Y-%m-%d %H:%M')} ET (09:00 market open)"
+    )
+    return wait_seconds
+
+
 async def run_ibkr_workers():
     """
     Run IBKR worker for US market with full trading logic.
@@ -409,8 +439,6 @@ async def run_ibkr_workers():
     """
     from core.ibkr.client import IBKRClient
     from core.bar_manager import BarManager
-    from datetime import timedelta
-    import pytz
 
     logger.info("🤖 IBKR Bot process started")
 
@@ -435,30 +463,8 @@ async def run_ibkr_workers():
 
             if not is_active_window:
                 # Calculate wait time until next start (09:00 ET)
-                if current_time >= end_time or not is_weekday:
-                    # Wait until tomorrow 09:00 (start point)
-                    next_start = datetime.combine(
-                        now_et.date() + timedelta(days=1), start_time
-                    )
-                else:
-                    # Wait until today 09:00 (if started before market open)
-                    next_start = datetime.combine(now_et.date(), start_time)
-
-                # Skip weekends
-                while next_start.weekday() > 4:  # If Sat(5) or Sun(6)
-                    next_start += timedelta(days=1)
-
-                # Make next_start timezone aware
-                tz = pytz.timezone("America/New_York")
-                if next_start.tzinfo is None:
-                    next_start = tz.localize(next_start)
-
-                wait_seconds = (next_start - now_et).total_seconds()
-                wait_hours = wait_seconds / 3600
-
-                logger.info(
-                    f"💤 Market closed. Sleeping {wait_hours:.1f} hours until "
-                    f"{next_start.strftime('%Y-%m-%d %H:%M')} ET (09:00 market open)"
+                wait_seconds = await calculate_wait_time(
+                    current_time, start_time, end_time, is_weekday, now_et
                 )
 
                 # Sleep in chunks to allow for graceful shutdown
@@ -468,7 +474,6 @@ async def run_ibkr_workers():
                     wait_seconds -= sleep_chunk
 
                 if _STOP_EVENT.is_set():
-
                     break
 
             # --- 2. Start Daily Trading Session ---
@@ -495,7 +500,6 @@ async def run_ibkr_workers():
 
             # Initialize BarManagers for each symbol
             bar_managers = {}
-
             logger.info("Initializing BarManagers and loading historical data...")
 
             for symbol in IBKR_SYMBOLS:

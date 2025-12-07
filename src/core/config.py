@@ -60,7 +60,6 @@ IBKR_QUANTITY = int(os.getenv("IBKR_QUANTITY", "1"))  # Number of contracts per 
 # ============================================================================
 INDEX_FUTURES = ANGEL_INDEX_FUTURES
 STOCK_SYMBOLS = ANGEL_STOCK_SYMBOLS
-SYMBOLS = ANGEL_SYMBOLS
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
