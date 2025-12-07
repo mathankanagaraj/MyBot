@@ -29,9 +29,11 @@ from core.signal_engine import (
 )
 from core.utils import (
     init_audit_file,
-    is_market_open,
     send_telegram,
     write_audit_row,
+)
+from core.angelone.utils import (
+    is_market_open,
     get_ist_now,
 )
 
@@ -591,7 +593,7 @@ async def schedule_end_of_day_report(cash_mgr, angel_client):
     Background task that schedules end-of-day report at market close.
     Runs continuously and triggers report at 3:30 PM IST each trading day.
     """
-    from core.utils import get_seconds_until_market_close
+    from core.angelone.utils import get_seconds_until_market_close
 
     logger.info("📅 End-of-day report scheduler started")
 

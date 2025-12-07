@@ -1,4 +1,4 @@
-from core.utils import is_market_open
+from core.angelone.utils import is_market_open
 from datetime import datetime
 import pytz
 
