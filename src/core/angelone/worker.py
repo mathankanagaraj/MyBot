@@ -65,6 +65,9 @@ MARKET_STATE_EVENT = asyncio.Event()
 # OCO Order Tracking: symbol -> {'sl_order_id': str, 'target_order_id': str}
 ACTIVE_OCO_ORDERS = {}
 
+# Global trade entry lock to prevent simultaneous order placement across symbols
+_TRADE_ENTRY_LOCK = asyncio.Lock()
+
 
 # -----------------------------
 # Helper Functions
@@ -72,7 +75,7 @@ ACTIVE_OCO_ORDERS = {}
 async def sleep_until_next(seconds):
     """Sleep for a period but allow cancellation."""
     try:
-        await asyncio.wait_for(asyncio.sleep(seconds), timeout=seconds)
+        await asyncio.sleep(seconds)
     except asyncio.CancelledError:
         return
 
@@ -138,7 +141,7 @@ async def market_state_watcher(poll_interval=5):
     """
     global MARKET_OPEN_STATE, MARKET_STATE_EVENT, _STOP_EVENT, _LAST_MARKET_OPEN_STATE
 
-    logger.info("🕒 Market state watcher started")
+    logger.info("🕒 Market state watcher started (AngelOne - NSE)")
 
     # Initialize last state using is_market_open() if possible
     try:
@@ -150,6 +153,17 @@ async def market_state_watcher(poll_interval=5):
     _LAST_MARKET_OPEN_STATE = initial_state
     # Ensure first notification about start (the notify function handles a first-run message)
     await _notify_market_state_local(MARKET_OPEN_STATE)
+    
+    # If market is already open at initialization, set the event so waiters can proceed
+    if MARKET_OPEN_STATE:
+        try:
+            MARKET_STATE_EVENT.set()
+        except Exception:
+            logger.debug("Failed to set initial MARKET_STATE_EVENT", exc_info=True)
+    
+    logger.info(
+        f"🕒 Initial market state: {'OPEN ✅' if MARKET_OPEN_STATE else 'CLOSED 🚫'}"
+    )
 
     try:
         while not _STOP_EVENT.is_set():
@@ -180,7 +194,8 @@ async def market_state_watcher(poll_interval=5):
                     )
 
                 _STOP_EVENT.set()
-                logger.info("🛑 _STOP_EVENT set by market watcher (hard close)")
+                logger.info("🛑 _STOP_EVENT set by market watcher (hard close at 15:30 IST)")
+                send_telegram("🛑 [AngelOne] Trading stopped - Market closed at 15:30 IST")
                 break
 
             # Soft open/close using util, only if MARKET_HOURS_ONLY is True
@@ -212,7 +227,7 @@ async def market_state_watcher(poll_interval=5):
                     logger.debug("notify_market_state failed", exc_info=True)
 
                 logger.info(
-                    f"🔔 Market state changed: {'OPEN' if MARKET_OPEN_STATE else 'CLOSED'}"
+                    f"🔔 Market state changed: {'OPEN ✅' if MARKET_OPEN_STATE else 'CLOSED 🚫'}"
                 )
 
             await asyncio.sleep(poll_interval)
@@ -236,10 +251,24 @@ async def market_state_watcher(poll_interval=5):
 async def heartbeat_task(interval=60):
     """Continuous heartbeat to show bot is alive."""
     logger.info("💓 Heartbeat task started")
+    heartbeat_count = 0
+    
     while not _STOP_EVENT.is_set():
-        now_utc = datetime.utcnow()
-        logger.info(f"💓 Heartbeat: {now_utc.strftime('%H:%M:%S')} UTC")
-        await sleep_until_next(interval)
+        try:
+            heartbeat_count += 1
+            now_utc = datetime.utcnow()
+            logger.info(f"💓 Heartbeat #{heartbeat_count}: {now_utc.strftime('%H:%M:%S')} UTC")
+            
+            # Sleep for interval, but check for cancellation
+            await sleep_until_next(interval)
+            
+        except asyncio.CancelledError:
+            logger.info("💓 Heartbeat task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"💓 Heartbeat task error: {e}")
+            await sleep_until_next(10)  # Retry sooner on error
+    
     logger.info("💓 Heartbeat task stopped")
 
 
@@ -418,137 +447,167 @@ async def manage_oco_orders(symbol, angel_client):
         logger.error(f"[{symbol}] OCO Check Error: {e}")
 
 
-async def execute_angel_entry_order(
+async def execute_entry_order(
     symbol, bias, angel_client, cash_mgr, underlying_price
 ):
     """
     Execute entry order with option selection and bracket order placement for Angel One.
+    Uses global lock to prevent simultaneous order placement.
     """
-    # Select option contract
-    logger.info("[%s] 🔍 Selecting option contract...", symbol)
-    opt_selection, reason = await find_option_contract_async(
-        angel_client, symbol, bias, underlying_price
-    )
-    if not opt_selection:
-        logger.error("[%s] ❌ Option selection failed: %s", symbol, reason)
-        send_telegram(f"❌ {symbol} option selection failed: {reason}")
-        return False
-
-    logger.info("[%s] ✅ Selected option: %s", symbol, opt_selection.symbol)
-
-    # Get option premium
-    logger.info("[%s] 💰 Fetching option premium...", symbol)
-    prem = await angel_client.get_last_price(opt_selection.symbol, exchange="NFO")
-    if prem is None or prem < MIN_PREMIUM:
-        logger.error(
-            "[%s] ❌ Premium too low: ₹%s (min: ₹%.2f)", symbol, prem, MIN_PREMIUM
+    # Acquire global lock to prevent simultaneous trades
+    async with _TRADE_ENTRY_LOCK:
+        logger.info("[%s] 🔒 Acquired trade entry lock", symbol)
+        
+        # Get current cash status before trade
+        balance_info = await cash_mgr.get_account_balance()
+        available_funds = balance_info["available_funds"]
+        
+        logger.info(
+            "[%s] 💰 Pre-trade check: Available funds: ₹%.2f",
+            symbol,
+            available_funds
         )
-        send_telegram(f"❌ {symbol} premium too low: ₹{prem}")
-        return False
+        
+        # Select option contract
+        logger.info("[%s] 🔍 Selecting option contract...", symbol)
+        opt_selection, reason = await find_option_contract_async(
+            angel_client, symbol, bias, underlying_price
+        )
+        if not opt_selection:
+            logger.error("[%s] ❌ Option selection failed: %s", symbol, reason)
+            send_telegram(f"❌ {symbol} option selection failed: {reason}")
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
+            return False
 
-    logger.info("[%s] 💰 Option premium: ₹%.2f", symbol, prem)
+        logger.info("[%s] ✅ Selected option: %s", symbol, opt_selection.symbol)
 
-    # Calculate position size
-    lot_size = opt_selection.lot_size
-    per_lot_cost = float(prem) * float(lot_size)
-    qty = MAX_CONTRACTS_PER_TRADE
-    est_cost = per_lot_cost * qty
+        # Get option premium
+        logger.info("[%s] 💰 Fetching option premium...", symbol)
+        prem = await angel_client.get_last_price(opt_selection.symbol, exchange="NFO")
+        if prem is None or prem < MIN_PREMIUM:
+            logger.error(
+                "[%s] ❌ Premium too low: ₹%s (min: ₹%.2f)", symbol, prem, MIN_PREMIUM
+            )
+            send_telegram(f"❌ {symbol} premium too low: ₹{prem}")
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
+            return False
 
-    logger.info(
-        "[%s] 📊 Position sizing: %d lots × %d qty × ₹%.2f = ₹%.2f",
-        symbol,
-        qty,
-        lot_size,
-        prem,
-        est_cost,
-    )
+        logger.info("[%s] 💰 Option premium: ₹%.2f", symbol, prem)
 
-    # Check if we can open position
-    can_open = await cash_mgr.can_open_position(symbol, est_cost)
-    if not can_open:
-        logger.error("[%s] ❌ Insufficient funds or risk limit reached", symbol)
-        send_telegram(f"❌ {symbol} insufficient funds or risk limit reached")
-        return False
+        # Calculate position size
+        lot_size = opt_selection.lot_size
+        per_lot_cost = float(prem) * float(lot_size)
+        qty = MAX_CONTRACTS_PER_TRADE
+        est_cost = per_lot_cost * qty
 
-    # Register position
-    cash_mgr.register_open(symbol, est_cost)
+        logger.info(
+            "[%s] 📊 Position sizing: %d lots × %d qty × ₹%.2f = ₹%.2f",
+            symbol,
+            qty,
+            lot_size,
+            prem,
+            est_cost,
+        )
 
-    # Calculate stop loss and target
-    risk_amt = prem * RISK_PCT_OF_PREMIUM
-    stop_price = prem - risk_amt
-    target_price = prem + (risk_amt * RR_RATIO)
+        # Check if we can open position (re-check with lock held)
+        can_open = await cash_mgr.can_open_position(symbol, est_cost)
+        if not can_open:
+            logger.error("[%s] ❌ Insufficient funds or risk limit reached", symbol)
+            available_exposure = await cash_mgr.available_exposure()
+            send_telegram(
+                f"❌ [{symbol}] Trade blocked\n"
+                f"Required: ₹{est_cost:,.2f}\n"
+                f"Available: ₹{available_exposure:,.2f}\n"
+                f"Current balance: ₹{available_funds:,.2f}"
+            )
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
+            return False
 
-    if stop_price < 0.05:
-        stop_price = 0.05
+        # Register position
+        cash_mgr.register_open(symbol, est_cost)
 
-    # Place bracket order
-    logger.info(
-        f"[{symbol}] 📤 Placing bracket order: {bias} "
-        f"Entry=₹{prem:.2f}, SL=₹{stop_price:.2f}, TP=₹{target_price:.2f}"
-    )
+        # Calculate stop loss and target
+        risk_amt = prem * RISK_PCT_OF_PREMIUM
+        stop_price = prem - risk_amt
+        target_price = prem + (risk_amt * RR_RATIO)
 
-    # bracket = await angel_client.place_bracket_order(
-    #     option_symbol=opt_selection.symbol,
-    #     option_token=opt_selection.token,
-    #     quantity=qty * lot_size,
-    #     stop_loss_price=stop_price,
-    #     target_price=target_price,
-    #     exchange="NFO",
-    # )
+        if stop_price < 0.05:
+            stop_price = 0.05
 
-    # Suppose `api` is your SmartAPI client implementing required methods
-    from core.angelone.robo_order_manager import RoboOrderManager
+        # Place bracket order
+        logger.info(
+            f"[{symbol}] 📤 Placing bracket order: {bias} "
+            f"Entry=₹{prem:.2f}, SL=₹{stop_price:.2f}, TP=₹{target_price:.2f}"
+        )
 
-    manager = RoboOrderManager(angel_client)
+        # Suppose `api` is your SmartAPI client implementing required methods
+        from core.angelone.robo_order_manager import RoboOrderManager
 
-    bracket = await manager.place_robo(
-        symbol=opt_selection.symbol,
-        token=opt_selection.token,
-        quantity=qty * lot_size,
-        side="BUY",
-        sl_points=stop_price,
-        target_points=target_price,
-    )
+        manager = RoboOrderManager(angel_client)
 
-    if bracket is None:
-        logger.error("[%s] ❌ Order placement failed", symbol)
-        send_telegram(f"❌ {symbol} order placement failed")
-        cash_mgr.force_release(symbol)
-        return False
+        bracket = await manager.place_robo_order(
+            symbol=opt_selection.symbol,
+            token=opt_selection.token,
+            quantity=qty * lot_size,
+            side="BUY",
+            sl_points=stop_price,
+            target_points=target_price,
+        )
 
-    # Store IDs for OCO management
-    # Note: place_bracket_order in client.py returns dict with keys: entry_order_id, sl_order_id, target_order_id
-    ACTIVE_OCO_ORDERS[symbol] = bracket
+        if bracket is None:
+            logger.error("[%s] ❌ Order placement failed", symbol)
+            send_telegram(f"❌ {symbol} order placement failed")
+            cash_mgr.force_release(symbol)
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
+            return False
 
-    logger.info("[%s] ✅ Order placed successfully!", symbol)
-    send_telegram(
-        f"✅ Entered {symbol} {bias}\n"
-        f"Option: {opt_selection.symbol}\n"
-        f"Entry: ₹{prem:.2f} | SL: ₹{stop_price:.2f} | TP: ₹{target_price:.2f}"
-    )
+        # Store IDs for OCO management
+        # Note: place_bracket_order in client.py returns dict with keys: entry_order_id, sl_order_id, target_order_id
+        ACTIVE_OCO_ORDERS[symbol] = bracket
 
-    # Write audit
-    write_audit_row(
-        timestamp=get_ist_now().isoformat(),
-        symbol=symbol,
-        bias=bias,
-        option=opt_selection.symbol,
-        entry_price=prem,
-        stop=stop_price,
-        target=target_price,
-        exit_price=0,
-        outcome="OPEN",
-        holding_seconds=0,
-        details="Entry confirmed",
-    )
+        logger.info("[%s] ✅ Order placed successfully!", symbol)
+        
+        # Get post-trade balance summary
+        balance_info_post = await cash_mgr.get_account_balance()
+        available_exposure_post = await cash_mgr.available_exposure()
+        open_positions_count = len(cash_mgr.open_positions)
+        
+        send_telegram(
+            f"✅ Entered {symbol} {bias}\n"
+            f"Option: {opt_selection.symbol}\n"
+            f"Entry: ₹{prem:.2f} | SL: ₹{stop_price:.2f} | TP: ₹{target_price:.2f}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Cash Summary:\n"
+            f"Position Cost: ₹{est_cost:,.2f}\n"
+            f"Available Funds: ₹{balance_info_post['available_funds']:,.2f}\n"
+            f"Available Exposure: ₹{available_exposure_post:,.2f}\n"
+            f"Open Positions: {open_positions_count}"
+        )
 
-    return True
+        logger.info("[%s] 🔓 Released trade entry lock", symbol)
+        
+        # Write audit
+        write_audit_row(
+            timestamp=get_ist_now().isoformat(),
+            symbol=symbol,
+            bias=bias,
+            option=opt_selection.symbol,
+            entry_price=prem,
+            stop=stop_price,
+            target=target_price,
+            exit_price=0,
+            outcome="OPEN",
+            holding_seconds=0,
+            details="Entry confirmed",
+        )
+
+        return True
 
 
 # -----------------------------
 # 5m Entry Search
 # -----------------------------
-async def search_angel_5m_entry(
+async def search_5m_entry(
     symbol, bias, angel_client, cash_mgr, bar_manager, context="ENTRY"
 ):
     """
@@ -628,10 +687,12 @@ async def search_angel_5m_entry(
             details,
         )
 
-        # Get underlying price
+        # Get underlying price for option selection
+        # For indices: Use SPOT index price (not futures) for strike selection
+        # Note: Bar data and signals are based on futures price for better volume/liquidity
         if symbol in INDEX_FUTURES:
-            logger.info("[%s] 📊 Fetching futures price for index...", symbol)
-            underlying = await angel_client.get_futures_price(symbol)
+            logger.info("[%s] 📊 Fetching spot index price for option selection...", symbol)
+            underlying = await angel_client.get_index_spot_price(symbol)
         else:
             logger.info("[%s] 📊 Fetching stock price...", symbol)
             underlying = await angel_client.get_last_price(symbol, exchange="NSE")
@@ -644,7 +705,7 @@ async def search_angel_5m_entry(
         logger.info("[%s] 💰 Underlying price: ₹%.2f", symbol, underlying)
 
         # Execute order
-        success = await execute_angel_entry_order(
+        success = await execute_entry_order(
             symbol, bias, angel_client, cash_mgr, underlying
         )
         return success
@@ -656,7 +717,7 @@ async def search_angel_5m_entry(
 # -----------------------------
 # Startup Signal Check
 # -----------------------------
-async def handle_angel_startup_signal(symbol, angel_client, cash_mgr, bar_manager):
+async def handle_startup_signal(symbol, angel_client, cash_mgr, bar_manager):
     """
     Check for recent 15m signal on startup and search for entry if found.
     The function will no-op early if the market is not open.
@@ -704,7 +765,7 @@ async def handle_angel_startup_signal(symbol, angel_client, cash_mgr, bar_manage
             )
 
             # Search for 5m entry
-            await search_angel_5m_entry(
+            await search_5m_entry(
                 symbol, startup_bias, angel_client, cash_mgr, bar_manager, "STARTUP"
             )
         else:
@@ -728,7 +789,7 @@ async def angel_signal_monitor(symbol, angel_client, cash_mgr, bar_manager):
 
     # 1. Check for startup signals (only if market open)
     if MARKET_OPEN_STATE:
-        await handle_angel_startup_signal(symbol, angel_client, cash_mgr, bar_manager)
+        await handle_startup_signal(symbol, angel_client, cash_mgr, bar_manager)
 
     # 2. Main Loop
     while not _STOP_EVENT.is_set():
@@ -789,7 +850,7 @@ async def angel_signal_monitor(symbol, angel_client, cash_mgr, bar_manager):
                 f"📊 [{symbol}] 15m Trend: {bias} at {get_ist_now().strftime('%H:%M')} IST. Looking for 5m entry..."
             )
 
-            await search_angel_5m_entry(
+            await search_5m_entry(
                 symbol, bias, angel_client, cash_mgr, bar_manager, "ENTRY"
             )
 
@@ -967,7 +1028,43 @@ async def run_angel_workers():
                     else:
                         logger.warning("[%s] Failed to load historical data", symbol)
 
-                # Pre-market check
+                # Check for existing open positions on startup (e.g., after restart)
+                logger.info("Checking for existing open positions...")
+                try:
+                    positions = await angel_client.get_positions()
+                    if positions:
+                        for pos in positions:
+                            symbol_name = pos.get("tradingsymbol", "")
+                            # Check if this is an option position for our tracked symbols
+                            for tracked_symbol in ANGEL_SYMBOLS:
+                                if tracked_symbol in symbol_name:
+                                    qty = int(pos.get("netqty", 0))
+                                    if qty != 0:  # Open position
+                                        # Calculate position value (qty * avg_price)
+                                        avg_price = float(pos.get("totalbuyavgprice", 0) or pos.get("totalsellavgprice", 0))
+                                        position_value = abs(qty * avg_price)
+                                        
+                                        # Register the position if not already tracked
+                                        if tracked_symbol not in cash_mgr.open_positions:
+                                            cash_mgr.open_positions[tracked_symbol] = position_value
+                                            logger.info(
+                                                f"Registered existing position: {tracked_symbol} "
+                                                f"({symbol_name}) @ ₹{position_value:,.2f}"
+                                            )
+                                        break
+                        
+                        if cash_mgr.open_positions:
+                            total_locked = sum(cash_mgr.open_positions.values())
+                            logger.info(f"Total capital locked in existing positions: ₹{total_locked:,.2f}")
+                            send_telegram(
+                                f"🔄 **Startup Position Check**\n"
+                                f"Found {len(cash_mgr.open_positions)} open position(s)\n"
+                                f"Capital Locked: ₹{total_locked:,.2f}"
+                            )
+                except Exception as e:
+                    logger.error(f"Error checking existing positions: {e}")
+
+                # Pre-market check (must be done AFTER checking existing positions)
                 await cash_mgr.check_and_log_start_balance()
 
                 # Start WebSocket

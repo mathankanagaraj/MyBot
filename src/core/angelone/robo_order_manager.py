@@ -29,7 +29,7 @@ async def _sleep_backoff(attempt: int):
 class RoboOrderManager:
     """
     RoboOrderManager wraps a SmartAPI-like client (self.client) and provides:
-      - place_robo(...)
+      - place_robo_order(...)
       - fallbacks and robust validation
 
     Required methods on the underlying client (self.client):
@@ -45,7 +45,7 @@ class RoboOrderManager:
         self.max_retries = max_retries
 
     # --------------------- public API ---------------------
-    async def place_robo(
+    async def place_robo_order(
         self,
         symbol: str,
         token: str,

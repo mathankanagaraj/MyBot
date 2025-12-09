@@ -5,7 +5,7 @@ import os
 # Add src to path
 sys.path.append(os.path.join(os.getcwd(), "src"))
 
-from core.angel_client import AngelClient
+from core.angelone.client import AngelClient
 from core.logger import logger
 
 # Mock logger to avoid clutter

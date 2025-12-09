@@ -33,28 +33,35 @@ class LiveCashManager:
 
     async def available_exposure(self):
         """
-        Calculate available exposure based on account funds and risk limits.
+        Calculate available exposure based on daily limit and risk limits.
+        Uses 70% of the daily start balance as max allocation (not current balance).
 
         Returns:
             Available exposure in ₹
         """
         try:
-            summary = await self.angel_client.get_account_summary_async()
-            avail_funds = float(summary.get("AvailableFunds", 0))
+            # Use daily start balance for max allocation limit
+            # This ensures we stick to 70% of pre-market opening balance
+            if self.daily_start_balance == 0.0:
+                # Fallback to current balance if daily start not set
+                summary = await self.angel_client.get_account_summary_async()
+                base_balance = float(summary.get("AvailableFunds", 0))
+            else:
+                base_balance = self.daily_start_balance
 
-            # Maximum we can allocate
-            max_allocation = avail_funds * self.max_alloc_pct
+            # Maximum we can allocate (70% of daily start balance)
+            max_daily_allocation = base_balance * self.max_alloc_pct
 
             # Subtract currently used exposure
             current_exposure = sum(self.open_positions.values())
 
-            # Check daily loss limit (percentage based)
-            max_daily_loss = avail_funds * self.max_daily_loss_pct
+            # Check daily loss limit (percentage based on start balance)
+            max_daily_loss = base_balance * self.max_daily_loss_pct
             if abs(self.daily_pnl) >= max_daily_loss:
                 logger.warning(f"Daily loss limit reached: ₹{self.daily_pnl:.2f} (Limit: ₹{max_daily_loss:.2f})")
                 return 0.0
 
-            available = max(0.0, max_allocation - current_exposure)
+            available = max(0.0, max_daily_allocation - current_exposure)
 
             return available
 
@@ -84,17 +91,22 @@ class LiveCashManager:
             return False
 
         # Get account balance for limit calculations
-        balance_info = await self.get_account_balance()
-        avail_funds = balance_info["available_funds"]
+        # Use daily start balance for consistent limits throughout the day
+        if self.daily_start_balance == 0.0:
+            # Fallback to current balance if daily start not set
+            balance_info = await self.get_account_balance()
+            base_balance = balance_info["available_funds"]
+        else:
+            base_balance = self.daily_start_balance
 
-        # Check position size limit (percentage based)
-        max_position_size = avail_funds * self.max_position_pct
+        # Check position size limit (percentage based on daily start balance)
+        max_position_size = base_balance * self.max_position_pct
         if cost > max_position_size:
-            logger.warning(f"Position size ₹{cost:.2f} exceeds limit ₹{max_position_size:.2f} ({self.max_position_pct*100}%)")
+            logger.warning(f"Position size ₹{cost:.2f} exceeds limit ₹{max_position_size:.2f} ({self.max_position_pct*100}% of daily start)")
             return False
 
-        # Check daily loss limit (percentage based)
-        max_daily_loss = avail_funds * self.max_daily_loss_pct
+        # Check daily loss limit (percentage based on daily start balance)
+        max_daily_loss = base_balance * self.max_daily_loss_pct
         if abs(self.daily_pnl) >= max_daily_loss:
             logger.warning(f"Daily loss limit reached: ₹{self.daily_pnl:.2f} (Limit: ₹{max_daily_loss:.2f})")
             return False
@@ -191,6 +203,7 @@ class LiveCashManager:
     async def check_and_log_start_balance(self):
         """
         Check and log starting balance for the day.
+        Accounts for any existing open positions to calculate true available balance.
         Send Telegram notification with balance and allocation info.
         """
         from datetime import date
@@ -204,22 +217,51 @@ class LiveCashManager:
             return
 
         balance_info = await self.get_account_balance()
-        self.daily_start_balance = balance_info["available_funds"]
+        current_available = balance_info["available_funds"]
+        
+        # Check if there are any existing open positions (from previous session/restart)
+        # If there are, we need to account for them in the daily start balance calculation
+        existing_positions_value = sum(self.open_positions.values())
+        
+        if existing_positions_value > 0:
+            logger.info(
+                f"Found existing open positions worth ₹{existing_positions_value:,.2f} from previous session"
+            )
+            # The true daily start balance should include the locked capital in open positions
+            # This ensures we maintain the 70% limit based on original available balance
+            self.daily_start_balance = current_available + existing_positions_value
+            logger.info(
+                f"Adjusted daily start balance: ₹{self.daily_start_balance:,.2f} "
+                f"(Available: ₹{current_available:,.2f} + Locked: ₹{existing_positions_value:,.2f})"
+            )
+        else:
+            # No existing positions, use current available as daily start
+            self.daily_start_balance = current_available
+        
         self.last_balance_check_date = today
 
-        # Calculate allocation limits
+        # Calculate allocation limits based on the true daily start balance
         max_allocation = self.daily_start_balance * self.max_alloc_pct
+        remaining_allocation = max_allocation - existing_positions_value
 
         # Log and notify
         msg = (
             f"📊 **Daily Balance Check**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💰 Total Funds: ₹{balance_info['total_funds']:,.2f}\n"
-            f"✅ Available: ₹{self.daily_start_balance:,.2f}\n"
+            f"✅ Daily Start Balance: ₹{self.daily_start_balance:,.2f}\n"
             f"📈 Max Allocation (70%): ₹{max_allocation:,.2f}\n"
-            f"🎯 Available for Trading: ₹{max_allocation:,.2f}\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
         )
+        
+        if existing_positions_value > 0:
+            msg += (
+                f"🔒 Existing Positions: ₹{existing_positions_value:,.2f}\n"
+                f"🎯 Available for New Trades: ₹{remaining_allocation:,.2f}\n"
+            )
+        else:
+            msg += f"🎯 Available for Trading: ₹{max_allocation:,.2f}\n"
+        
+        msg += "━━━━━━━━━━━━━━━━━━━━"
 
         logger.info(msg.replace("**", "").replace("━", "-"))
         send_telegram(msg)

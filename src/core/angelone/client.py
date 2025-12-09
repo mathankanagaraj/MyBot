@@ -50,6 +50,12 @@ class AngelClient:
         self.rate_limiter = APIRateLimiter(
             enabled=enable_rate_limiting, safety_margin=0.9
         )
+        
+        # Connection health tracking
+        self._last_successful_call = datetime.now()
+        self._failed_call_count = 0
+        self._circuit_breaker_open = False
+        self._circuit_breaker_reset_time = None
 
     async def connect_async(self, retry_backoff=1.0, max_backoff=60.0):
         """
@@ -201,11 +207,54 @@ class AngelClient:
             logger.info("Disconnected from Angel Broker")
         except Exception:
             logger.exception("Error disconnecting from Angel Broker")
+    
+    def _mark_api_success(self):
+        """Mark successful API call for health tracking"""
+        self._last_successful_call = datetime.now()
+        if self._failed_call_count > 0:
+            self._failed_call_count = 0
+            logger.info("API calls recovered, resetting failure count")
+    
+    def _mark_api_failure(self):
+        """Mark failed API call and potentially open circuit breaker"""
+        self._failed_call_count += 1
+        
+        # Open circuit breaker after 5 consecutive failures
+        if self._failed_call_count >= 5 and not self._circuit_breaker_open:
+            self._circuit_breaker_open = True
+            self._circuit_breaker_reset_time = datetime.now() + timedelta(seconds=60)
+            logger.error(
+                f"🚨 Circuit breaker OPENED after {self._failed_call_count} failures. "
+                f"Will reset at {self._circuit_breaker_reset_time.strftime('%H:%M:%S')}"
+            )
+            try:
+                from core.utils import send_telegram
+                send_telegram(
+                    f"⚠️ AngelOne API circuit breaker opened after {self._failed_call_count} failures. "
+                    "Will attempt reconnection in 60 seconds."
+                )
+            except Exception:
+                pass
+    
+    def _check_circuit_breaker(self) -> bool:
+        """Check if circuit breaker allows requests. Returns True if request can proceed."""
+        if not self._circuit_breaker_open:
+            return True
+        
+        # Check if reset time has passed
+        if datetime.now() >= self._circuit_breaker_reset_time:
+            logger.info("🔄 Circuit breaker reset time reached, closing breaker")
+            self._circuit_breaker_open = False
+            self._failed_call_count = 0
+            return True
+        
+        return False
 
     async def load_scrip_master(self):
         """
         Download and cache the OpenAPI Scrip Master file.
         This contains all tradable instruments with their symbol tokens.
+        Falls back to hardcoded essential instruments if download fails.
         """
         try:
             logger.info("Downloading OpenAPI Scrip Master...")
@@ -225,8 +274,44 @@ class AngelClient:
             return True
 
         except Exception as e:
-            logger.exception("Failed to load Scrip Master: %s", e)
-            return False
+            logger.warning("Failed to load Scrip Master from URL: %s", e)
+            logger.info("Loading fallback instrument data...")
+
+            # Fallback: Load essential instruments manually
+            self._load_fallback_instruments()
+            return True
+
+    def _load_fallback_instruments(self):
+        """
+        Load essential instrument data as fallback when Scrip Master is unavailable.
+        """
+        # Essential indices and stocks for NIFTY options trading
+        fallback_instruments = [
+            # Indices
+            {"token": "99926000", "symbol": "NIFTY", "name": "NIFTY", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+            {"token": "99926009", "symbol": "BANKNIFTY", "name": "BANKNIFTY", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+
+            # Common stocks (add more as needed)
+            {"token": "738561", "symbol": "RELIANCE", "name": "RELIANCE", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+            {"token": "3045", "symbol": "SBIN", "name": "SBIN", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+            {"token": "11536", "symbol": "TCS", "name": "TCS", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+            {"token": "2885", "symbol": "INFY", "name": "INFY", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+            {"token": "14977", "symbol": "HDFCBANK", "name": "HDFCBANK", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+            {"token": "1394", "symbol": "ICICIBANK", "name": "ICICIBANK", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+            {"token": "317", "symbol": "AXISBANK", "name": "AXISBANK", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+            {"token": "1660", "symbol": "BAJFINANCE", "name": "BAJFINANCE", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+            {"token": "1922", "symbol": "BHARTIARTL", "name": "BHARTIARTL", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+            {"token": "526", "symbol": "HINDUNILVR", "name": "HINDUNILVR", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+        ]
+
+        self.scrip_master = fallback_instruments
+
+        # Build symbol cache
+        for instrument in self.scrip_master:
+            key = f"{instrument.get('name')}_{instrument.get('exch_seg')}"
+            self.symbol_cache[key] = instrument
+
+        logger.info(f"Loaded {len(self.scrip_master)} fallback instruments")
 
     def get_symbol_token(self, symbol: str, exchange: str = "NSE") -> Optional[str]:
         """
@@ -262,6 +347,30 @@ class AngelClient:
                     token = instrument.get("token")
                     self.symbol_cache[key] = instrument
                     return token
+
+            # Fallback: Try searchScrip API for dynamic lookup
+            if self.smart_api and self.connected:
+                try:
+                    logger.info(f"Searching for symbol {symbol} on {exchange} via API...")
+                    search_result = self.smart_api.searchScrip(exchange, symbol)
+
+                    if search_result and 'data' in search_result:
+                        for item in search_result['data']:
+                            if item.get('symbol') == symbol or item.get('tradingsymbol') == symbol:
+                                token = str(item.get('token'))
+                                # Cache the result
+                                instrument = {
+                                    'token': token,
+                                    'symbol': item.get('symbol', symbol),
+                                    'name': item.get('name', symbol),
+                                    'exch_seg': exchange
+                                }
+                                self.symbol_cache[key] = instrument
+                                logger.info(f"Found symbol {symbol} with token {token}")
+                                return token
+
+                except Exception as api_error:
+                    logger.warning(f"API search failed for {symbol}: {api_error}")
 
             logger.warning(f"Symbol token not found for {symbol} on {exchange}")
             return None
@@ -391,6 +500,58 @@ class AngelClient:
                 logger.exception(f"Error fetching historical data for {symbol}: {e}")
             return None
 
+    async def get_ltp(self, token: str, exchange: str = "NFO") -> Optional[float]:
+        """
+        Get last traded price by token (used by RoboOrderManager).
+
+        Args:
+            token: Symbol token
+            exchange: Exchange segment (default NFO for options)
+
+        Returns:
+            Last traded price or None
+        """
+        try:
+            if not self.connected:
+                logger.error(f"Not connected to Angel Broker when fetching LTP for token {token}")
+                return None
+
+            # Find symbol from token
+            symbol = None
+            if self.scrip_master:
+                for instrument in self.scrip_master:
+                    if instrument.get("token") == token and instrument.get("exch_seg") == exchange:
+                        symbol = instrument.get("symbol")
+                        break
+
+            if not symbol:
+                logger.error(f"Symbol not found for token {token} in {exchange}")
+                return None
+
+            # Rate limiting for ltpData (10/sec, 500/min, 5000/hour)
+            await self.rate_limiter.acquire("ltpData")
+
+            # Use LTP API with timeout
+            ltp_data = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.smart_api.ltpData, exchange, symbol, token
+                ),
+                timeout=5.0,
+            )
+
+            if ltp_data and ltp_data.get("data"):
+                return float(ltp_data["data"]["ltp"])
+
+            logger.warning(f"No LTP data returned for token {token}")
+            return None
+
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout getting LTP for token {token} (5s exceeded)")
+            return None
+        except Exception as e:
+            logger.exception(f"Error getting LTP for token {token}: {e}")
+            return None
+
     async def get_last_price(
         self, symbol: str, exchange: str = "NSE"
     ) -> Optional[float]:
@@ -405,6 +566,10 @@ class AngelClient:
             Last traded price or None
         """
         try:
+            if not self.connected:
+                logger.error(f"Not connected to Angel Broker when fetching price for {symbol}")
+                return None
+                
             symbol_token = self.get_symbol_token(symbol, exchange)
             if not symbol_token:
                 return None
@@ -423,8 +588,12 @@ class AngelClient:
             if ltp_data and ltp_data.get("data"):
                 return float(ltp_data["data"]["ltp"])
 
+            logger.warning(f"No LTP data returned for {symbol}")
             return None
 
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout getting last price for {symbol} (5s exceeded)")
+            return None
         except Exception as e:
             logger.exception(f"Error getting last price for {symbol}: {e}")
             return None
@@ -500,6 +669,55 @@ class AngelClient:
             logger.exception(f"Error getting futures price for {symbol}: {e}")
             return None
 
+    async def get_index_spot_price(self, symbol: str) -> Optional[float]:
+        """
+        Get current spot index price for NIFTY/BANKNIFTY.
+        Used for option strike selection (underlying price).
+
+        Args:
+            symbol: Index symbol (NIFTY or BANKNIFTY)
+
+        Returns:
+            Current spot index price or None
+        """
+        try:
+            if not self.connected:
+                logger.error(f"Not connected when fetching spot price for {symbol}")
+                return None
+
+            # For indices, use NSE exchange to get spot price
+            # The symbol format in scrip master for spot indices is usually just "NIFTY" or "BANKNIFTY"
+            symbol_token = self.get_symbol_token(symbol, "NSE")
+            if not symbol_token:
+                logger.error(f"Could not find spot token for {symbol}")
+                return None
+
+            # Rate limiting for ltpData
+            await self.rate_limiter.acquire("ltpData")
+
+            # Get spot LTP
+            ltp_data = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.smart_api.ltpData, "NSE", symbol, symbol_token
+                ),
+                timeout=5.0,
+            )
+
+            if ltp_data and ltp_data.get("data"):
+                price = float(ltp_data["data"]["ltp"])
+                logger.debug(f"Spot index price for {symbol}: ₹{price}")
+                return price
+
+            logger.warning(f"No spot price data for {symbol}")
+            return None
+
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout getting spot price for {symbol}")
+            return None
+        except Exception as e:
+            logger.exception(f"Error getting spot index price for {symbol}: {e}")
+            return None
+
     async def place_order(
         self,
         symbol: str,
@@ -532,6 +750,16 @@ class AngelClient:
             Dict with order response or None
         """
         try:
+            # Validate connection
+            if not self.connected:
+                logger.error("Cannot place order: Not connected to Angel Broker")
+                return None
+            
+            # Validate inputs
+            if quantity <= 0:
+                logger.error(f"Invalid quantity: {quantity}")
+                return None
+                
             order_params = {
                 "variety": variety,
                 "tradingsymbol": symbol,
@@ -740,13 +968,20 @@ class AngelClient:
             # Rate limiting for getPosition (1/sec)
             await self.rate_limiter.acquire("getPosition")
 
-            response = self.smart_api.position()
+            # Use asyncio.to_thread with timeout for blocking call
+            response = await asyncio.wait_for(
+                asyncio.to_thread(self.smart_api.position),
+                timeout=5.0
+            )
 
             if response and response.get("data"):
                 return response["data"]
 
             return []
 
+        except asyncio.TimeoutError:
+            logger.error("Timeout getting positions (5s exceeded)")
+            return []
         except Exception as e:
             logger.exception(f"Error getting positions: {e}")
             return []
@@ -762,8 +997,11 @@ class AngelClient:
             # Rate limiting for getRMS (2/sec)
             await self.rate_limiter.acquire("getRMS")
 
-            # Get RMS Limits (Risk Management System)
-            rms = self.smart_api.rmsLimit()
+            # Get RMS Limits (Risk Management System) - use asyncio.to_thread for blocking call
+            rms = await asyncio.wait_for(
+                asyncio.to_thread(self.smart_api.rmsLimit),
+                timeout=5.0
+            )
 
             if rms and rms.get("data"):
                 data = rms["data"]
@@ -773,8 +1011,12 @@ class AngelClient:
                     "TotalFunds": float(data.get("net", 0)),
                 }
 
+            logger.warning("No data returned from rmsLimit API")
             return {}
 
+        except asyncio.TimeoutError:
+            logger.error("Timeout getting account summary (5s exceeded)")
+            return {}
         except Exception as e:
             logger.exception(f"Error getting account summary: {e}")
             return {}

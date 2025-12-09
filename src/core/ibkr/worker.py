@@ -13,6 +13,72 @@ from core.utils import send_telegram
 from core.ibkr.utils import is_us_market_open, get_us_et_now
 
 _STOP_EVENT = asyncio.Event()  # Global stop event
+_TRADE_ENTRY_LOCK = asyncio.Lock()  # Global trade entry lock to prevent simultaneous order placement
+
+
+# -----------------------------
+# Market Hours Watcher
+# -----------------------------
+async def market_hours_watcher():
+    """
+    Background task that monitors US market hours and sets _STOP_EVENT at market close.
+    Runs continuously and provides clear logging of market state.
+    IMPORTANT: Only sets _STOP_EVENT when market closes DURING active trading.
+    Does not stop on startup if already after hours.
+    """
+    logger.info("🕒 Market hours watcher started (IBKR - US Markets)")
+    
+    last_market_state = None
+    was_trading_today = False  # Track if we started trading today
+    
+    while not _STOP_EVENT.is_set():
+        try:
+            now_et = get_us_et_now()
+            current_time = now_et.time()
+            
+            # Check if market is open (09:30 - 16:00 ET, Mon-Fri)
+            is_weekday = now_et.weekday() <= 4
+            is_market_hours = is_us_market_open()
+            
+            # Market open detection (09:30 - 16:00 ET)
+            if is_market_hours and is_weekday:
+                if last_market_state != "OPEN":
+                    logger.info("✅ US Market is OPEN (09:30-16:00 ET)")
+                    send_telegram("✅ [IBKR] US Market is OPEN")
+                    last_market_state = "OPEN"
+                    was_trading_today = True  # Mark that we're trading
+            
+            # Market close detection (16:00 ET) - ONLY stop if we were trading
+            elif current_time >= time(16, 0) and is_weekday:
+                if was_trading_today and last_market_state != "CLOSED":
+                    # We were trading and now market closed - stop for the day
+                    logger.info("🛑 US Market closed (16:00 ET) - Stopping all trading")
+                    send_telegram("🛑 [IBKR] Trading stopped - Market closed at 16:00 ET")
+                    last_market_state = "CLOSED"
+                    _STOP_EVENT.set()
+                    break
+                elif not was_trading_today and last_market_state != "AFTER_HOURS":
+                    # Started after hours - just log, don't stop
+                    logger.info("🚫 US Market closed (after hours) - Waiting for next session")
+                    last_market_state = "AFTER_HOURS"
+            
+            # Before market open or weekend
+            else:
+                if last_market_state != "WAITING":
+                    logger.info("🚫 US Market is CLOSED - Waiting for market hours")
+                    last_market_state = "WAITING"
+            
+            # Check every 30 seconds
+            await asyncio.sleep(30)
+            
+        except asyncio.CancelledError:
+            logger.info("Market hours watcher cancelled")
+            break
+        except Exception as e:
+            logger.exception("Market hours watcher error: %s", e)
+            await asyncio.sleep(60)
+    
+    logger.info("🕒 Market hours watcher stopped")
 
 
 # -----------------------------
@@ -27,7 +93,7 @@ def market_closed(now_et=None):
 async def sleep_until_next(seconds):
     """Sleep for a period but allow cancellation."""
     try:
-        await asyncio.wait_for(asyncio.sleep(seconds), timeout=seconds)
+        await asyncio.sleep(seconds)
     except asyncio.CancelledError:
         return
 
@@ -38,10 +104,24 @@ async def sleep_until_next(seconds):
 async def heartbeat_task(interval=60):
     """Continuous heartbeat to show bot is alive."""
     logger.info("� Heartbeat task started")
+    heartbeat_count = 0
+    
     while not _STOP_EVENT.is_set():
-        now_utc = datetime.utcnow()
-        logger.info(f"� Heartbeat: {now_utc.strftime('%H:%M:%S')} UTC")
-        await sleep_until_next(interval)
+        try:
+            heartbeat_count += 1
+            now_utc = datetime.utcnow()
+            logger.info(f"� Heartbeat #{heartbeat_count}: {now_utc.strftime('%H:%M:%S')} UTC")
+            
+            # Sleep for interval, but check for cancellation
+            await sleep_until_next(interval)
+            
+        except asyncio.CancelledError:
+            logger.info("� Heartbeat task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"� Heartbeat task error: {e}")
+            await sleep_until_next(10)  # Retry sooner on error
+    
     logger.info("� Heartbeat task stopped")
 
 
@@ -66,64 +146,122 @@ async def has_position(ibkr_client, symbol):
 # Execute Order
 # -----------------------------
 async def execute_entry_order(symbol, bias, ibkr_client, context="ENTRY"):
-    """Place entry order with bracket SL/Target."""
+    """Place entry order with bracket SL/Target. Uses global lock to prevent simultaneous trades."""
     from core.ibkr.option_selector import find_ibkr_option_contract
 
-    stock_price = await ibkr_client.get_last_price(symbol, "STOCK")
-    if not stock_price:
-        logger.error("[%s] ❌ Failed to get stock price", symbol)
-        return False
+    # Acquire global lock to prevent simultaneous trades
+    async with _TRADE_ENTRY_LOCK:
+        logger.info("[%s] 🔒 Acquired trade entry lock", symbol)
+        
+        # Check account balance before trade
+        try:
+            account_summary = await ibkr_client.get_account_summary()
+            available_funds = float(account_summary.get("AvailableFunds", 0))
+            logger.info(
+                "[%s] 💰 Pre-trade check: Available funds: $%.2f",
+                symbol,
+                available_funds
+            )
+        except Exception as e:
+            logger.error("[%s] ❌ Failed to get account summary: %s", symbol, e)
+            available_funds = 0.0
+        
+        stock_price = await ibkr_client.get_last_price(symbol, "STOCK")
+        if not stock_price:
+            logger.error("[%s] ❌ Failed to get stock price", symbol)
+            return False
 
-    option_info, reason = await find_ibkr_option_contract(
-        ibkr_client, symbol, bias, stock_price
-    )
-    if not option_info:
-        logger.warning("[%s] ⚠️ %s: No option found: %s", symbol, context, reason)
-        return False
-
-    premium = option_info.premium
-    if premium <= 0:
-        logger.error("[%s] ❌ Invalid premium: $%.2f", symbol, premium)
-        return False
-
-    stop_loss = premium * 0.8
-    target = premium * (1 + 0.2 * RR_RATIO)
-
-    logger.info(
-        "[%s] 📈 %s Entry: $%.2f | SL: $%.2f | Target: $%.2f",
-        symbol,
-        context,
-        premium,
-        stop_loss,
-        target,
-    )
-    send_telegram(
-        f"🎯 [IBKR] {symbol} {bias} ({context})\nEntry: ${premium:.2f}\nSL: ${stop_loss:.2f}\nTarget: ${target:.2f}"
-    )
-
-    try:
-        order_ids = await ibkr_client.place_bracket_order(
-            option_info.contract, IBKR_QUANTITY, stop_loss, target
+        option_info, reason = await find_ibkr_option_contract(
+            ibkr_client, symbol, bias, stock_price
         )
-    except Exception as e:
-        logger.exception("[%s] ❌ Order placement failed: %s", symbol, e)
-        send_telegram(f"🚨 [IBKR] [{symbol}] Order exception: {e}")
-        return False
+        if not option_info:
+            logger.warning("[%s] ⚠️ %s: No option found: %s", symbol, context, reason)
+            return False
 
-    if not order_ids or not order_ids.get("entry_order_id"):
-        logger.error("[%s] ❌ Failed to place order", symbol)
-        return False
+        premium = option_info.premium
+        if premium <= 0:
+            logger.error("[%s] ❌ Invalid premium: $%.2f", symbol, premium)
+            return False
+        
+        # Calculate position cost
+        position_cost = premium * IBKR_QUANTITY * 100  # Options are in lots of 100
+        
+        # Check if sufficient funds (require at least 2x position cost for margin)
+        if available_funds < (position_cost * 2):
+            logger.error(
+                "[%s] ❌ Insufficient funds. Required: $%.2f (2x), Available: $%.2f",
+                symbol,
+                position_cost * 2,
+                available_funds
+            )
+            send_telegram(
+                f"❌ [IBKR] [{symbol}] Trade blocked\n"
+                f"Required: ${position_cost * 2:,.2f} (2x margin)\n"
+                f"Available: ${available_funds:,.2f}"
+            )
+            return False
 
-    logger.info(
-        "[%s] ✅ Order placed: Entry=%s | SL=%s | Target=%s | OCA=%s",
-        symbol,
-        order_ids.get("entry_order_id"),
-        order_ids.get("sl_order_id"),
-        order_ids.get("target_order_id"),
-        order_ids.get("oca_group", "N/A"),
-    )
-    send_telegram(f"🚀 [IBKR] {symbol} {context} order placed successfully!")
-    return True
+        stop_loss = premium * 0.8
+        target = premium * (1 + 0.2 * RR_RATIO)
+
+        logger.info(
+            "[%s] 📈 %s Entry: $%.2f | SL: $%.2f | Target: $%.2f",
+            symbol,
+            context,
+            premium,
+            stop_loss,
+            target,
+        )
+        send_telegram(
+            f"🎯 [IBKR] {symbol} {bias} ({context})\nEntry: ${premium:.2f}\nSL: ${stop_loss:.2f}\nTarget: ${target:.2f}"
+        )
+
+        try:
+            order_ids = await ibkr_client.place_bracket_order(
+                option_info.contract, IBKR_QUANTITY, stop_loss, target
+            )
+        except Exception as e:
+            logger.exception("[%s] ❌ Order placement failed: %s", symbol, e)
+            send_telegram(f"🚨 [IBKR] [{symbol}] Order exception: {e}")
+            return False
+
+        if not order_ids or not order_ids.get("entry_order_id"):
+            logger.error("[%s] ❌ Failed to place order", symbol)
+            return False
+
+        logger.info(
+            "[%s] ✅ Order placed: Entry=%s | SL=%s | Target=%s | OCA=%s",
+            symbol,
+            order_ids.get("entry_order_id"),
+            order_ids.get("sl_order_id"),
+            order_ids.get("target_order_id"),
+            order_ids.get("oca_group", "N/A"),
+        )
+        
+        # Get post-trade balance summary
+        try:
+            account_summary_post = await ibkr_client.get_account_summary()
+            available_funds_post = float(account_summary_post.get("AvailableFunds", 0))
+            net_liquidation = float(account_summary_post.get("NetLiquidation", 0))
+            
+            # Get position count
+            positions = await ibkr_client.get_positions()
+            open_positions_count = len([p for p in positions if p["position"] != 0])
+            
+            send_telegram(
+                f"🚀 [IBKR] {symbol} {context} order placed!\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 Cash Summary:\n"
+                f"Position Cost: ${position_cost:,.2f}\n"
+                f"Available Funds: ${available_funds_post:,.2f}\n"
+                f"Net Liquidation: ${net_liquidation:,.2f}\n"
+                f"Open Positions: {open_positions_count}"
+            )
+        except Exception as e:
+            logger.error("[%s] Failed to get post-trade summary: %s", symbol, e)
+            send_telegram(f"🚀 [IBKR] {symbol} {context} order placed successfully!")
+        
+        return True
 
 
 # -----------------------------
@@ -436,6 +574,7 @@ async def run_ibkr_workers():
     - Daily loop (starts fresh each day)
     - Smart sleep (waits for market open)
     - Heartbeat (keeps container alive)
+    - Market hours watcher (monitors market open/close)
     """
     from core.ibkr.client import IBKRClient
     from core.bar_manager import BarManager
@@ -444,6 +583,9 @@ async def run_ibkr_workers():
 
     # Start heartbeat task immediately and continuously
     heartbeat = asyncio.create_task(heartbeat_task())
+    
+    # Start market hours watcher immediately
+    market_watcher = asyncio.create_task(market_hours_watcher())
 
     while not _STOP_EVENT.is_set():
 
@@ -554,9 +696,32 @@ async def run_ibkr_workers():
             send_telegram(f"🚨 CRITICAL: IBKR Bot daily loop error: {str(e)[:100]}")
             await asyncio.sleep(60)  # Prevent tight loop on error
 
+    # Main loop exited - this is normal end of day
+    logger.info("🏁 IBKR main loop completed for the day")
+    
+    # Cleanup: Wait for background tasks to finish
+    logger.info("Shutting down IBKR workers...")
+    
+    # Cancel market watcher if still running
+    if not market_watcher.done():
+        market_watcher.cancel()
+        try:
+            await market_watcher
+        except Exception:
+            pass
+    
     # Wait for heartbeat to finish if stopped
     if not heartbeat.done():
-        await heartbeat
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except Exception:
+            pass
+    
+    logger.info("IBKR workers shutdown complete")
+    
+    # Don't exit main process - let Docker handle restart if needed
+    # This prevents immediate restart loop
 
 
 def stop_ibkr_workers():

@@ -125,12 +125,14 @@ async def find_current_monthly_option(
         # Sort by expiry (nearest first), then by strike
         options.sort(key=lambda x: (x.expiry, abs(x.strike - underlying_price)))
 
-        # Select 1-2 strikes ITM for better delta and directional exposure
+        # Select strikes closer to ATM for better delta (0.6-0.7 range)
+        # Target: 0.5-1% ITM (In-The-Money)
         best_option = None
 
         if bias == "BULL":
-            # For BULL (CE): Select strike below spot (ITM)
-            target_strike = underlying_price * 0.99  # 1% below spot as target
+            # For BULL (CE): Select strike slightly below spot (0.5-1% ITM)
+            # This gives delta around 0.6-0.7
+            target_strike = underlying_price * 0.995  # 0.5% below spot
 
             # Find strikes below spot price (ITM for CE)
             itm_options = [opt for opt in options if opt.strike < underlying_price]
@@ -138,7 +140,7 @@ async def find_current_monthly_option(
             if itm_options:
                 # Sort by strike descending (highest ITM strike first)
                 itm_options.sort(key=lambda x: x.strike, reverse=True)
-                # Pick the strike closest to target
+                # Pick the strike closest to target (prefer slightly ITM)
                 best_option = min(
                     itm_options, key=lambda x: abs(x.strike - target_strike)
                 )
@@ -149,8 +151,9 @@ async def find_current_monthly_option(
                 )
 
         else:  # BEAR
-            # For BEAR (PE): Select strike above spot (ITM)
-            target_strike = underlying_price * 1.01  # 1% above spot as target
+            # For BEAR (PE): Select strike slightly above spot (0.5-1% ITM)
+            # This gives delta around -0.6 to -0.7
+            target_strike = underlying_price * 1.005  # 0.5% above spot
 
             # Find strikes above spot price (ITM for PE)
             itm_options = [opt for opt in options if opt.strike > underlying_price]
@@ -158,7 +161,7 @@ async def find_current_monthly_option(
             if itm_options:
                 # Sort by strike ascending (lowest ITM strike first)
                 itm_options.sort(key=lambda x: x.strike)
-                # Pick the strike closest to target
+                # Pick the strike closest to target (prefer slightly ITM)
                 best_option = min(
                     itm_options, key=lambda x: abs(x.strike - target_strike)
                 )
