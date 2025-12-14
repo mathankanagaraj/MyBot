@@ -108,7 +108,7 @@ class AngelClient:
                         try:
                             from core.utils import send_telegram
 
-                            send_telegram("✅ Angel Broker connected successfully")
+                            send_telegram("✅ Angel Broker connected successfully", broker="ANGEL")
                         except Exception:
                             pass
                         self.alert_sent = False
@@ -126,7 +126,7 @@ class AngelClient:
 
                         send_telegram(
                             f"⚠️ Angel Broker connection failed: {str(e)[:100]}"
-                        )
+                        , broker="ANGEL")
                     except Exception:
                         pass
                     self.alert_sent = True
@@ -232,7 +232,7 @@ class AngelClient:
                 send_telegram(
                     f"⚠️ AngelOne API circuit breaker opened after {self._failed_call_count} failures. "
                     "Will attempt reconnection in 60 seconds."
-                )
+                , broker="ANGEL")
             except Exception:
                 pass
     

@@ -84,6 +84,8 @@ class IBKRClient:
         Args:
             symbol: Stock symbol (e.g., 'SPY', 'AAPL')
             duration_days: Number of days of history to fetch
+                          Use 0.0104 for 15 minutes (15/1440)
+                          Use 1.0 for full trading day
 
         Returns:
             DataFrame with OHLCV data indexed by datetime (UTC)
@@ -92,8 +94,12 @@ class IBKRClient:
             contract = Stock(symbol, "SMART", "USD")
             await self.ib.qualifyContractsAsync(contract)
 
-            # IB does NOT support second-based durations for 1m bars.
-            if duration_days <= 1:
+            # Calculate appropriate duration string based on duration_days
+            # IBKR supports: S (seconds), D (days), W (weeks), M (months), Y (years)
+            if duration_days < 0.1:  # Less than ~2.4 hours, use seconds
+                duration_seconds = int(duration_days * 24 * 3600)
+                duration_str = f"{duration_seconds} S"
+            elif duration_days <= 1:
                 duration_str = "1 D"
             else:
                 duration_str = f"{int(duration_days)} D"
@@ -138,15 +144,72 @@ class IBKRClient:
             logger.exception(f"Error fetching historical data for {symbol}")
             return None
 
+    async def get_historical_bars_direct(
+        self, symbol: str, bar_size: str = "15 mins", duration_str: str = "1 D"
+    ) -> Optional[pd.DataFrame]:
+        """
+        Fetch historical bars directly at specified interval (no resampling).
+        
+        Args:
+            symbol: Stock symbol (e.g., 'SPY', 'AAPL')
+            bar_size: Bar size ("5 mins", "15 mins", "1 hour", etc.)
+            duration_str: Duration ("1 D" for 1 day, "2 D" for 2 days)
+        
+        Returns:
+            DataFrame with OHLCV data indexed by datetime (UTC naive)
+        """
+        try:
+            contract = Stock(symbol, "SMART", "USD")
+            await self.ib.qualifyContractsAsync(contract)
+            
+            logger.debug(f"[{symbol}] Requesting {duration_str} of {bar_size} bars...")
+            
+            bars = await self.ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime="",
+                durationStr=duration_str,
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
+            
+            if not bars:
+                logger.warning(f"[{symbol}] No historical {bar_size} data returned")
+                return None
+            
+            df = util.df(bars)
+            if df is None or df.empty:
+                return None
+            
+            # Convert timestamps to UTC naive
+            df["datetime"] = pd.to_datetime(df["date"])
+            
+            if df["datetime"].iloc[0].tzinfo is None:
+                df["datetime"] = df["datetime"].dt.tz_localize("America/New_York")
+            
+            df["datetime"] = df["datetime"].dt.tz_convert("UTC").dt.tz_localize(None)
+            df = df.set_index("datetime")[["open", "high", "low", "close", "volume"]]
+            
+            logger.info(f"[{symbol}] Fetched {len(df)} {bar_size} bars (latest close: ${df['close'].iloc[-1]:.2f})")
+            return df
+            
+        except Exception:
+            logger.exception(f"Error fetching {bar_size} historical data for {symbol}")
+            return None
+
     async def get_option_chain(
-        self, symbol: str, underlying_price: float
+        self, symbol: str, underlying_price: float, min_dte: int = 2, max_dte: int = 7
     ) -> List[Dict]:
         """
-        Selects safe option expiries:
-        - Weekly preferred
-        - Avoid <= 2 DTE at all costs
-        - If weekly is too close, jump to next weekly
-        - During last week of month, prefer monthly (3rd Friday)
+        Get option chain for symbol filtered by DTE range.
+        Returns options for ALL expiries within the DTE range.
+        
+        Args:
+            symbol: Stock symbol
+            underlying_price: Current stock price
+            min_dte: Minimum days to expiry (default 2)
+            max_dte: Maximum days to expiry (default 7)
         """
         try:
             # --- Underlying Contract ---
@@ -178,19 +241,9 @@ class IBKRClient:
                 logger.warning(f"[{symbol}] No strikes in ±20% range")
                 return []
 
-            # --- Expiry Handling ---
+            # --- Expiry Filtering by DTE Range ---
             today = datetime.now(timezone.utc)
-
-            def is_monthly_expiry(date: datetime) -> bool:
-                """True monthly = 3rd Friday (OCC standard)."""
-                third_friday = max(
-                    week[4]  # Friday index 4
-                    for week in calendar.monthcalendar(date.year, date.month)
-                    if week[4] != 0
-                )
-                return date.weekday() == 4 and date.day == third_friday
-
-            weekly, monthly = [], []
+            valid_expiries = []
 
             for exp_str in chain.expirations:
                 try:
@@ -202,80 +255,52 @@ class IBKRClient:
 
                 dte = (exp - today).total_seconds() / 86400
 
-                if dte < 0 or dte > 30:
-                    continue
+                # Only keep expiries within the DTE range
+                if min_dte <= dte <= max_dte:
+                    valid_expiries.append((exp_str, dte))
 
-                if is_monthly_expiry(exp):
-                    monthly.append((exp_str, dte))
-                else:
-                    weekly.append((exp_str, dte))
+            if not valid_expiries:
+                logger.warning(
+                    f"[{symbol}] No expiries found in {min_dte}-{max_dte} DTE range"
+                )
+                return []
 
-            weekly.sort(key=lambda x: x[1])
-            monthly.sort(key=lambda x: x[1])
+            # Sort by DTE (closest first)
+            valid_expiries.sort(key=lambda x: x[1])
+            
+            logger.info(
+                f"[{symbol}] Found {len(valid_expiries)} valid expiries in {min_dte}-{max_dte} DTE range"
+            )
 
-            # --- Last week of month check ---
-            is_last_week = today.day > 21
-
-            selected_expiry = None
-
-            # --- Prefer monthly only during last week AND > 2 DTE ---
-            if is_last_week:
-                for exp, dte in monthly:
-                    if dte > 2:
-                        selected_expiry = exp
-                        logger.info(
-                            f"[{symbol}] Using monthly expiry {exp} ({dte:.2f} DTE)"
-                        )
-                        break
-
-            # --- Otherwise weekly logic ---
-            if not selected_expiry:
-                for exp, dte in weekly:
-                    if dte > 2:
-                        selected_expiry = exp
-                        logger.info(
-                            f"[{symbol}] Using weekly expiry {exp} ({dte:.2f} DTE)"
-                        )
-                        break
-
-            # --- Fallback: closest to 3 DTE ---
-            if not selected_expiry:
-                all_exp = weekly + monthly
-                if not all_exp:
-                    logger.warning(f"[{symbol}] No valid expiries found")
-                    return []
-                exp, dte = min(all_exp, key=lambda x: abs(x[1] - 3))
-                selected_expiry = exp
-                logger.warning(f"[{symbol}] Fallback expiry: {exp} ({dte:.2f} DTE)")
-
-            # --- Build Option Contracts ---
-            expiry = selected_expiry
+            # --- Build Option Contracts for ALL valid expiries ---
             options = []
 
-            exp_date = datetime.strptime(expiry, "%Y%m%d")
-            expiry_yymmdd = exp_date.strftime("%y%m%d")
+            for expiry, dte in valid_expiries:
+                exp_date = datetime.strptime(expiry, "%Y%m%d")
+                expiry_yymmdd = exp_date.strftime("%y%m%d")
 
-            for strike in strikes:
-                for right in ["C", "P"]:
-                    option = Option(symbol, expiry, strike, right, "SMART")
+                for strike in strikes:
+                    for right in ["C", "P"]:
+                        option = Option(symbol, expiry, strike, right, "SMART")
 
-                    # OCC format: [root 6 chars][yymmdd][C/P][strike*1000 padded to 8 digits]
-                    root = symbol.ljust(6)
-                    strike1000 = f"{int(round(strike * 1000)):08d}"
-                    occ_symbol = f"{root}{expiry_yymmdd}{right}{strike1000}"
+                        # OCC format: [root 6 chars][yymmdd][C/P][strike*1000 padded to 8 digits]
+                        root = symbol.ljust(6)
+                        strike1000 = f"{int(round(strike * 1000)):08d}"
+                        occ_symbol = f"{root}{expiry_yymmdd}{right}{strike1000}"
 
-                    options.append(
-                        {
-                            "symbol": occ_symbol,
-                            "strike": strike,
-                            "expiry": expiry,
-                            "right": right,
-                            "contract": option,
-                        }
-                    )
+                        options.append(
+                            {
+                                "symbol": occ_symbol,
+                                "strike": strike,
+                                "expiry": expiry,
+                                "right": right,
+                                "contract": option,
+                                "dte": dte,
+                            }
+                        )
 
             logger.info(
-                f"[{symbol}] Created {len(options)} option contracts for expiry {expiry}"
+                f"[{symbol}] Created {len(options)} option contracts across {len(valid_expiries)} expiries"
             )
             return options
 

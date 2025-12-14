@@ -47,10 +47,12 @@ async def find_ibkr_option_contract(
             f"[{symbol}] Selecting option: Bias={bias}, Price=${underlying_price:.2f}"
         )
 
-        # Get option chain
-        options = await ibkr_client.get_option_chain(symbol, underlying_price)
+        # Get option chain with DTE filtering
+        options = await ibkr_client.get_option_chain(
+            symbol, underlying_price, OPTION_MIN_DTE, OPTION_MAX_DTE
+        )
         if not options:
-            return None, "No options available"
+            return None, f"No options available in {OPTION_MIN_DTE}-{OPTION_MAX_DTE} DTE range"
 
         # Determine option type
         option_type = "C" if bias == "BULL" else "P"
@@ -58,28 +60,12 @@ async def find_ibkr_option_contract(
         if not filtered:
             return None, f"No {option_type} options found"
 
-        # Timezone-aware today (ET)
-        et = pytz.timezone("America/New_York")
-        today = datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0)
-
-        # Filter by DTE
-        valid_options = []
-        for opt in filtered:
-            try:
-                expiry_date = datetime.strptime(opt["expiry"], "%Y%m%d").replace(
-                    tzinfo=et
-                )
-            except ValueError:
-                # Handle possible different date formats if necessary, or skip
-                continue
-
-            dte = (expiry_date - today).days
-            if OPTION_MIN_DTE <= dte <= OPTION_MAX_DTE:
-                opt["dte"] = dte
-                valid_options.append(opt)
-
+        # Options already filtered by DTE in get_option_chain, no need to filter again
+        # Just verify they have DTE field
+        valid_options = [opt for opt in filtered if "dte" in opt]
+        
         if not valid_options:
-            return None, f"No options with {OPTION_MIN_DTE}-{OPTION_MAX_DTE} DTE"
+            return None, f"No options with valid DTE"
 
         # Select strike
         selected = _select_strike(valid_options, underlying_price, bias)

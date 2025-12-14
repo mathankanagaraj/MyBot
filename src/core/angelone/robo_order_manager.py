@@ -243,16 +243,15 @@ class RoboOrderManager:
 
         # Place entry
         entry_params = {
-            "variety": "NORMAL",
-            "tradingsymbol": symbol,
-            "symboltoken": token,
-            "transactiontype": side,
+            "symbol": symbol,
+            "token": token,
+            "transaction_type": side,
             "exchange": exchange,
-            "ordertype": "LIMIT",
-            "producttype": "INTRADAY",  # manual bracket will be intraday product
-            "duration": "DAY",
-            "price": str(entry_price),
-            "quantity": str(quantity),
+            "order_type": "LIMIT",
+            "price": float(entry_price),
+            "product_type": "INTRADAY",
+            "quantity": quantity,
+            "variety": "NORMAL",
         }
 
         entry_resp = await self.client.place_order(**entry_params)
@@ -282,19 +281,16 @@ class RoboOrderManager:
 
         # Stop-loss (STOPLOSS_LIMIT) — ensure trigger value and price set appropriately.
         sl_params = {
-            "variety": "STOPLOSS",
-            "tradingsymbol": symbol,
-            "symboltoken": token,
-            "transactiontype": exit_side,
+            "symbol": symbol,
+            "token": token,
+            "transaction_type": exit_side,
             "exchange": exchange,
-            "ordertype": "STOPLOSS_LIMIT",
-            "producttype": "INTRADAY",
-            "duration": "DAY",
-            "triggerprice": str(sl_price),  # trigger price
-            "price": str(
-                sl_price
-            ),  # limit price (can be same as trigger or slightly worse)
-            "quantity": str(quantity),
+            "order_type": "STOPLOSS_LIMIT",
+            "triggerprice": float(sl_price),
+            "price": float(sl_price),
+            "product_type": "INTRADAY",
+            "quantity": quantity,
+            "variety": "STOPLOSS",
         }
         sl_resp = await self.client.place_order(**sl_params)
         sl_order_id = None
@@ -308,16 +304,15 @@ class RoboOrderManager:
 
         # Target (LIMIT)
         target_params = {
-            "variety": "NORMAL",
-            "tradingsymbol": symbol,
-            "symboltoken": token,
-            "transactiontype": exit_side,
+            "symbol": symbol,
+            "token": token,
+            "transaction_type": exit_side,
             "exchange": exchange,
-            "ordertype": "LIMIT",
-            "producttype": "INTRADAY",
-            "duration": "DAY",
-            "price": str(target_price),
-            "quantity": str(quantity),
+            "order_type": "LIMIT",
+            "price": float(target_price),
+            "product_type": "INTRADAY",
+            "quantity": quantity,
+            "variety": "NORMAL",
         }
         target_resp = await self.client.place_order(**target_params)
         target_order_id = None

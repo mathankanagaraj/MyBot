@@ -21,7 +21,7 @@ _TRADE_ENTRY_LOCK = asyncio.Lock()  # Global trade entry lock to prevent simulta
 # -----------------------------
 async def market_hours_watcher():
     """
-    Background task that monitors US market hours and sets _STOP_EVENT at market close.
+    Monitor US market hours and update global state.
     Runs continuously and provides clear logging of market state.
     IMPORTANT: Only sets _STOP_EVENT when market closes DURING active trading.
     Does not stop on startup if already after hours.
@@ -29,7 +29,14 @@ async def market_hours_watcher():
     logger.info("🕒 Market hours watcher started (IBKR - US Markets)")
     
     last_market_state = None
-    was_trading_today = False  # Track if we started trading today
+    
+    # Initialize was_trading_today based on current market state
+    # If market is currently open, we're trading today
+    try:
+        is_currently_open = is_us_market_open()
+        was_trading_today = is_currently_open
+    except Exception:
+        was_trading_today = False
     
     while not _STOP_EVENT.is_set():
         try:
@@ -44,7 +51,7 @@ async def market_hours_watcher():
             if is_market_hours and is_weekday:
                 if last_market_state != "OPEN":
                     logger.info("✅ US Market is OPEN (09:30-16:00 ET)")
-                    send_telegram("✅ [IBKR] US Market is OPEN")
+                    send_telegram("✅ [IBKR] US Market is OPEN", broker="IBKR")
                     last_market_state = "OPEN"
                     was_trading_today = True  # Mark that we're trading
             
@@ -53,7 +60,7 @@ async def market_hours_watcher():
                 if was_trading_today and last_market_state != "CLOSED":
                     # We were trading and now market closed - stop for the day
                     logger.info("🛑 US Market closed (16:00 ET) - Stopping all trading")
-                    send_telegram("🛑 [IBKR] Trading stopped - Market closed at 16:00 ET")
+                    send_telegram("🛑 [IBKR] Trading stopped - Market closed at 16:00 ET", broker="IBKR")
                     last_market_state = "CLOSED"
                     _STOP_EVENT.set()
                     break
@@ -146,47 +153,135 @@ async def has_position(ibkr_client, symbol):
 # Execute Order
 # -----------------------------
 async def execute_entry_order(symbol, bias, ibkr_client, context="ENTRY"):
-    """Place entry order with bracket SL/Target. Uses global lock to prevent simultaneous trades."""
+    """
+    Place entry order with bracket SL/Target for IBKR.
+    Uses global lock to prevent simultaneous trades.
+    
+    Pre-Trade Validation Flow (using IBKR API as single source of truth):
+    1. Lock Acquisition - Acquire global trade lock
+    2. Live Position Check - Query broker API for existing positions (CRITICAL)
+    3. Balance Verification - Check available funds from broker
+    4. Stock Price Fetch - Get current underlying price
+    5. Option Selection - Find appropriate contract
+    6. Premium Validation - Ensure premium is valid
+    7. Position Sizing - Calculate cost and margin requirement
+    8. Final Funds Check - Verify 2x margin available
+    9. Order Placement - Execute bracket order with retries
+    
+    Note: Does NOT rely on local cache for position verification.
+          Only IBKR API is the source of truth.
+    """
     from core.ibkr.option_selector import find_ibkr_option_contract
 
     # Acquire global lock to prevent simultaneous trades
     async with _TRADE_ENTRY_LOCK:
         logger.info("[%s] 🔒 Acquired trade entry lock", symbol)
         
-        # Check account balance before trade
+        # 1. Check real-time positions from broker API (SINGLE SOURCE OF TRUTH)
+        # Retry up to 3 times for API reliability
+        logger.info("[%s] 🔍 Checking live positions from IBKR API...", symbol)
+        live_positions = None
+        for attempt in range(3):
+            try:
+                live_positions = await ibkr_client.get_positions()
+                break  # Success, exit retry loop
+            except Exception as e:
+                logger.warning("[%s] ⚠️ Position check attempt %d/3 failed: %s", symbol, attempt + 1, e)
+                if attempt < 2:  # Don't sleep on last attempt
+                    await asyncio.sleep(1)  # Wait 1 second before retry
+        
+        # If all retries failed, block trade for safety
+        if live_positions is None:
+            logger.error("[%s] ❌ CRITICAL: Failed to verify positions after 3 attempts", symbol)
+            send_telegram(
+                f"❌ [IBKR] [{symbol}] Trade blocked\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Failed to verify positions from broker\n"
+                f"Retried 3 times - blocking for safety"
+            , broker="IBKR")
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
+            return False
+        
+        # Check for existing positions in the same underlying
+        has_position = False
+        for pos in live_positions:
+            position_qty = pos.get("position", 0)
+            if position_qty != 0:
+                pos_symbol = pos.get("symbol", "")
+                # Check if this position matches our symbol
+                # For options, check if underlying matches (e.g., AAPL in AAPL250117C00150000)
+                if symbol == pos_symbol or symbol in pos_symbol:
+                    has_position = True
+                    logger.error(
+                        "[%s] ❌ Live position exists in broker: %s (Qty: %d)",
+                        symbol,
+                        pos_symbol,
+                        position_qty
+                    )
+                    send_telegram(
+                        f"❌ [IBKR] [{symbol}] Trade blocked\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 Live Position Found:\n"
+                        f"Symbol: {pos_symbol}\n"
+                        f"Quantity: {position_qty}\n"
+                        f"Market Value: ${pos.get('marketValue', 0):,.2f}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"❌ Cannot open duplicate position"
+                    , broker="IBKR")
+                    logger.info("[%s] 🔓 Released trade entry lock", symbol)
+                    return False
+        
+        if not has_position:
+            logger.info("[%s] ✅ No existing positions found in broker", symbol)
+        
+        # 2. Check account balance before trade
         try:
-            account_summary = await ibkr_client.get_account_summary()
+            account_summary = await ibkr_client.get_account_summary_async()
             available_funds = float(account_summary.get("AvailableFunds", 0))
             logger.info(
-                "[%s] 💰 Pre-trade check: Available funds: $%.2f",
+                "[%s] 💰 Balance check: Available funds: $%.2f",
                 symbol,
                 available_funds
             )
         except Exception as e:
             logger.error("[%s] ❌ Failed to get account summary: %s", symbol, e)
-            available_funds = 0.0
+            send_telegram(
+                f"❌ [IBKR] [{symbol}] Trade blocked\n"
+                f"Failed to get account balance"
+            , broker="IBKR")
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
+            return False
         
+        # 3. Get stock price
         stock_price = await ibkr_client.get_last_price(symbol, "STOCK")
         if not stock_price:
             logger.error("[%s] ❌ Failed to get stock price", symbol)
+            send_telegram(f"❌ [IBKR] [{symbol}] Failed to get stock price", broker="IBKR")
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
             return False
 
+        # 4. Select option contract
         option_info, reason = await find_ibkr_option_contract(
             ibkr_client, symbol, bias, stock_price
         )
         if not option_info:
             logger.warning("[%s] ⚠️ %s: No option found: %s", symbol, context, reason)
+            send_telegram(f"❌ [IBKR] [{symbol}] No option found: {reason}", broker="IBKR")
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
             return False
 
+        # 5. Validate premium
         premium = option_info.premium
         if premium <= 0:
             logger.error("[%s] ❌ Invalid premium: $%.2f", symbol, premium)
+            send_telegram(f"❌ [IBKR] [{symbol}] Invalid premium: ${premium:.2f}", broker="IBKR")
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
             return False
         
-        # Calculate position cost
+        # 6. Calculate position cost
         position_cost = premium * IBKR_QUANTITY * 100  # Options are in lots of 100
         
-        # Check if sufficient funds (require at least 2x position cost for margin)
+        # 7. Check if sufficient funds (require at least 2x position cost for margin)
         if available_funds < (position_cost * 2):
             logger.error(
                 "[%s] ❌ Insufficient funds. Required: $%.2f (2x), Available: $%.2f",
@@ -196,11 +291,14 @@ async def execute_entry_order(symbol, bias, ibkr_client, context="ENTRY"):
             )
             send_telegram(
                 f"❌ [IBKR] [{symbol}] Trade blocked\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"Required: ${position_cost * 2:,.2f} (2x margin)\n"
                 f"Available: ${available_funds:,.2f}"
-            )
+            , broker="IBKR")
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
             return False
 
+        # 8. Calculate SL and Target
         stop_loss = premium * 0.8
         target = premium * (1 + 0.2 * RR_RATIO)
 
@@ -213,22 +311,37 @@ async def execute_entry_order(symbol, bias, ibkr_client, context="ENTRY"):
             target,
         )
         send_telegram(
-            f"🎯 [IBKR] {symbol} {bias} ({context})\nEntry: ${premium:.2f}\nSL: ${stop_loss:.2f}\nTarget: ${target:.2f}"
-        )
+            f"🎯 [IBKR] {symbol} {bias} ({context})\n"
+            f"Entry: ${premium:.2f}\n"
+            f"SL: ${stop_loss:.2f}\n"
+            f"Target: ${target:.2f}"
+        , broker="IBKR")
 
-        try:
-            order_ids = await ibkr_client.place_bracket_order(
-                option_info.contract, IBKR_QUANTITY, stop_loss, target
-            )
-        except Exception as e:
-            logger.exception("[%s] ❌ Order placement failed: %s", symbol, e)
-            send_telegram(f"🚨 [IBKR] [{symbol}] Order exception: {e}")
-            return False
-
+        # 9. Place bracket order with retry logic
+        order_ids = None
+        for attempt in range(3):
+            try:
+                order_ids = await ibkr_client.place_bracket_order(
+                    option_info.contract, IBKR_QUANTITY, stop_loss, target
+                )
+                if order_ids and order_ids.get("entry_order_id"):
+                    break  # Success, exit retry loop
+            except Exception as e:
+                logger.warning("[%s] ⚠️ Order placement attempt %d/3 failed: %s", symbol, attempt + 1, e)
+                if attempt < 2:  # Don't sleep on last attempt
+                    await asyncio.sleep(2)  # Wait 2 seconds before retry
+        
+        # Check if order placement succeeded
         if not order_ids or not order_ids.get("entry_order_id"):
-            logger.error("[%s] ❌ Failed to place order", symbol)
+            logger.error("[%s] ❌ Failed to place order after 3 attempts", symbol)
+            send_telegram(
+                f"❌ [IBKR] [{symbol}] Order placement failed\n"
+                f"Retried 3 times - unable to place order"
+            , broker="IBKR")
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
             return False
 
+        # 10. Order placed successfully
         logger.info(
             "[%s] ✅ Order placed: Entry=%s | SL=%s | Target=%s | OCA=%s",
             symbol,
@@ -240,7 +353,7 @@ async def execute_entry_order(symbol, bias, ibkr_client, context="ENTRY"):
         
         # Get post-trade balance summary
         try:
-            account_summary_post = await ibkr_client.get_account_summary()
+            account_summary_post = await ibkr_client.get_account_summary_async()
             available_funds_post = float(account_summary_post.get("AvailableFunds", 0))
             net_liquidation = float(account_summary_post.get("NetLiquidation", 0))
             
@@ -256,10 +369,10 @@ async def execute_entry_order(symbol, bias, ibkr_client, context="ENTRY"):
                 f"Available Funds: ${available_funds_post:,.2f}\n"
                 f"Net Liquidation: ${net_liquidation:,.2f}\n"
                 f"Open Positions: {open_positions_count}"
-            )
+            , broker="IBKR")
         except Exception as e:
             logger.error("[%s] Failed to get post-trade summary: %s", symbol, e)
-            send_telegram(f"🚀 [IBKR] {symbol} {context} order placed successfully!")
+            send_telegram(f"🚀 [IBKR] {symbol} {context} order placed successfully!", broker="IBKR")
         
         return True
 
@@ -290,6 +403,7 @@ async def ibkr_data_fetcher(symbol, ibkr_client, bar_manager, symbol_index=0):
                 await sleep_until_next(sleep_seconds)
                 continue
 
+            # Fetch only 15 minutes of 1m candles (15 bars) for 5min resampling
             df_new = await ibkr_client.req_historic_1m(symbol, duration_days=0.0104)
             if df_new is not None and not df_new.empty:
                 for idx, row in df_new.iterrows():
@@ -303,7 +417,7 @@ async def ibkr_data_fetcher(symbol, ibkr_client, bar_manager, symbol_index=0):
                             "volume": row["volume"],
                         }
                     )
-                logger.info("[%s] 📊 Fetched %d 1m candles", symbol, len(df_new))
+                logger.debug("[%s] 📊 Fetched %d 1m candles", symbol, len(df_new))
                 retry_count = 0
             else:
                 logger.warning("[%s] ⚠️ No data returned from API", symbol)
@@ -325,9 +439,14 @@ async def ibkr_data_fetcher(symbol, ibkr_client, bar_manager, symbol_index=0):
 # 5m Entry Search
 # -----------------------------
 async def search_5m_entry(symbol, bias, ibkr_client, bar_manager, context="ENTRY"):
+    """
+    Search for 5m entry confirmation.
+    Uses DIRECT 5m bar fetching to ensure accurate price detection.
+    """
     from core.signal_engine import (
         detect_15m_bias,
         detect_5m_entry,
+        prepare_bars_with_indicators,
         get_next_candle_close_time,
         get_seconds_until_next_close,
     )
@@ -352,20 +471,53 @@ async def search_5m_entry(symbol, bias, ibkr_client, bar_manager, context="ENTRY
         await sleep_until_next(sleep_seconds)
 
         now_et = get_us_et_now()
-        df5_new, df15_new = await bar_manager.get_resampled()
+        
+        # Fetch DIRECT 15m and 5m bars from IBKR
+        # Use 5 days to properly warm up indicators (EMA50 needs 50+ bars, MACD needs 26+, plus warm-up)
+        logger.debug(f"[{symbol}] 📥 Fetching direct 15m/5m bars for entry check #{checks}...")
+        df15_raw = await ibkr_client.get_historical_bars_direct(symbol, bar_size="15 mins", duration_str="5 D")
+        df5_raw = await ibkr_client.get_historical_bars_direct(symbol, bar_size="5 mins", duration_str="5 D")
+        
+        if df15_raw is None or df15_raw.empty or df5_raw is None or df5_raw.empty:
+            logger.warning(f"[{symbol}] ⚠️ No data available for 5m check #{checks}")
+            continue
+        
+        # Prepare bars with indicators
+        df15_new = prepare_bars_with_indicators(df15_raw, timeframe="15min", current_time=now_et)
+        df5_new = prepare_bars_with_indicators(df5_raw, timeframe="5min", current_time=now_et)
+        
         if df5_new.empty or df15_new.empty:
             continue
 
-        bias_now = detect_15m_bias(df15_new)
+        # Re-check 15m bias (ensure it hasn't changed)
+        bias_now = detect_15m_bias(df15_new, symbol=symbol)
         if bias_now != bias:
             send_telegram(
                 f"⚠️ [IBKR] [{symbol}] {context}: 15m bias changed {bias} → {bias_now}"
-            )
+            , broker="IBKR")
             return False
 
-        entry_ok, _ = detect_5m_entry(df5_new, bias)
-        if entry_ok:
-            return await execute_entry_order(symbol, bias, ibkr_client, context)
+        # Check 5m entry with detailed logging
+        entry_ok, details = detect_5m_entry(df5_new, bias, symbol=symbol)
+        if not entry_ok:
+            reason = details.get("reason", "unknown")
+            logger.debug(
+                "[%s] ⏸️ %s 5m check #%d: Entry rejected - %s",
+                symbol,
+                context,
+                checks,
+                reason,
+            )
+            continue
+            
+        # Entry confirmed!
+        logger.info(
+            "[%s] ✅ %s: 5m entry confirmed for %s",
+            symbol,
+            context,
+            bias
+        )
+        return await execute_entry_order(symbol, bias, ibkr_client, context)
 
     return False
 
@@ -375,17 +527,26 @@ async def search_5m_entry(symbol, bias, ibkr_client, bar_manager, context="ENTRY
 # -----------------------------
 async def handle_startup_signal(symbol, ibkr_client, bar_manager):
     """Check for recent 15m signal on startup and search for 5m entry."""
-    from core.signal_engine import detect_15m_bias
+    from core.signal_engine import detect_15m_bias, prepare_bars_with_indicators
 
     try:
-
-        # Get current data
-        df5_startup, df15_startup = await bar_manager.get_resampled()
-        if df5_startup.empty or df15_startup.empty:
+        now_et = get_us_et_now()
+        
+        # Fetch 15m bars directly from IBKR (last 5 days to properly warm up EMA50, MACD, RSI and all indicators)
+        logger.info(f"[{symbol}] 📥 STARTUP: Fetching direct 15m bars from IBKR...")
+        df15_raw = await ibkr_client.get_historical_bars_direct(symbol, bar_size="15 mins", duration_str="5 D")
+        if df15_raw is None or df15_raw.empty:
+            logger.warning(f"[{symbol}] ⚠️ STARTUP: No 15m data available")
+            return
+        
+        # Add indicators and filter incomplete candles
+        df15_startup = prepare_bars_with_indicators(df15_raw, timeframe="15min", current_time=now_et)
+        if df15_startup.empty:
+            logger.warning(f"[{symbol}] ⚠️ STARTUP: No complete 15m bars after filtering")
             return
 
         # Detect 15m bias
-        startup_bias = detect_15m_bias(df15_startup)
+        startup_bias = detect_15m_bias(df15_startup, symbol=symbol)
         if not startup_bias:
             return
 
@@ -397,7 +558,7 @@ async def handle_startup_signal(symbol, ibkr_client, bar_manager):
         )
         send_telegram(
             f"🔍 [IBKR] [{symbol}] Startup detected 15m {startup_bias} bias. Searching for entry..."
-        )
+        , broker="IBKR")
 
         # Search for 5m entry
         await search_5m_entry(symbol, startup_bias, ibkr_client, bar_manager, "STARTUP")
@@ -409,47 +570,25 @@ async def handle_startup_signal(symbol, ibkr_client, bar_manager):
 async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
     """
     Monitor for trading signals on a symbol.
+    Uses DIRECT 15m bar fetching instead of resampling to ensure accurate price detection.
 
     Args:
         symbol: Symbol to monitor
         ibkr_client: IBKR API client
-        bar_manager: Bar manager for this symbol
+        bar_manager: Bar manager for this symbol (kept for 5m entry searches)
     """
     from core.signal_engine import (
         detect_15m_bias,
+        prepare_bars_with_indicators,
         get_next_candle_close_time,
         get_seconds_until_next_close,
     )
 
-    logger.info("[%s] 👀 Signal monitor started", symbol)
-
-    # Helper function to check if we already have a position for this symbol
-    async def has_position(sym):
-        try:
-            positions = await ibkr_client.get_positions()
-            found = False
-            for p in positions:
-                if p["symbol"] == sym and p["position"] != 0:
-                    found = True
-                    break
-                if sym in p["symbol"] and p["position"] != 0:
-                    found = True
-                    break
-
-            if found:
-                logger.info(f"[{sym}] Position check: FOUND ✅")
-                return True
-            else:
-                logger.info(
-                    f"[{sym}] Position check: NOT FOUND ❌ (Checked {len(positions)} positions)"
-                )
-                return False
-        except Exception as ex:
-            logger.error(f"[{sym}] Error checking positions: {ex}")
-            return False
+    logger.info("[%s] 👀 Signal monitor started (DIRECT 15m fetch mode)", symbol)
 
     # STARTUP: Check for recent 15m signal and search for entry
-    await handle_startup_signal(symbol, ibkr_client, bar_manager, has_position)
+    # Note: Position check is done inside execute_entry_order, not here
+    await handle_startup_signal(symbol, ibkr_client, bar_manager)
 
     # MAIN LOOP: Monitor for new 15m signals
     while not _STOP_EVENT.is_set():
@@ -471,13 +610,8 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
                 await asyncio.sleep(300)
                 continue
 
-            # Check if we already have a position for this symbol
-            if await has_position(symbol):
-                logger.info("[%s] ⏸️ Position exists, pausing signal monitoring", symbol)
-                await asyncio.sleep(60)
-                continue
-
             # Wait for next 15m candle close
+            # Note: Position check happens inside execute_entry_order, not here
             next_15m_close = get_next_candle_close_time(now_et, "15min")
             sleep_seconds = get_seconds_until_next_close(now_et, "15min")
 
@@ -497,20 +631,29 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
                 logger.info("[%s] 🛑 Market closed after sleep", symbol)
                 break
 
-            df5m, df15m = await bar_manager.get_resampled()
-            if df5m.empty or df15m.empty:
-                logger.debug("[%s] ⚠️ Empty dataframe, skipping this 15m check", symbol)
+            # Fetch DIRECT 15m bars from IBKR (ensures we get exact candle close prices)
+            logger.info(f"[{symbol}] 📥 Fetching direct 15m bars from IBKR...")
+            # Fetch 5 days to properly warm up EMA50, MACD(26), RSI(14) and other indicators
+            df15_raw = await ibkr_client.get_historical_bars_direct(symbol, bar_size="15 mins", duration_str="5 D")
+            if df15_raw is None or df15_raw.empty:
+                logger.warning(f"[{symbol}] ⚠️ No 15m data available, skipping")
+                continue
+            
+            # Add indicators and filter incomplete candles
+            df15m = prepare_bars_with_indicators(df15_raw, timeframe="15min", current_time=now_et)
+            if df15m.empty:
+                logger.debug("[%s] ⚠️ Empty dataframe after filtering, skipping this 15m check", symbol)
                 continue
 
             # Detect 15m bias
             logger.info(
-                "[%s] 🕒 Checking 15m bias at %s ET (bars: 5m=%d, 15m=%d)...",
+                "[%s] 🕒 Checking 15m bias at %s ET (bars: %d, latest close: $%.2f)...",
                 symbol,
                 now_et.strftime("%H:%M:%S"),
-                len(df5m),
                 len(df15m),
+                df15m['close'].iloc[-1]
             )
-            bias = detect_15m_bias(df15m)
+            bias = detect_15m_bias(df15m, symbol=symbol)
             if not bias:
                 logger.debug("[%s] No clear 15m bias", symbol)
                 continue
@@ -524,7 +667,7 @@ async def ibkr_signal_monitor(symbol, ibkr_client, bar_manager):
             )
             send_telegram(
                 f"📊 [IBKR] [{symbol}] 15m Trend: {bias} at {now_et.strftime('%H:%M')} ET. Looking for 5m entry..."
-            )
+            , broker="IBKR")
 
             # Search for 5m entry confirmation
             await search_5m_entry(symbol, bias, ibkr_client, bar_manager, "ENTRY")
@@ -620,7 +763,7 @@ async def run_ibkr_workers():
 
             # --- 2. Start Daily Trading Session ---
             logger.info("🌅 Starting daily trading cycle...")
-            send_telegram("🌅 [IBKR] Bot waking up for trading day...")
+            send_telegram("🌅 [IBKR] Bot waking up for trading day...", broker="IBKR")
 
             # Initialize IBKR client
             ibkr_client = IBKRClient()
@@ -634,7 +777,7 @@ async def run_ibkr_workers():
                 continue
 
             logger.info("✅ Connected to IBKR")
-            send_telegram("✅ Connected to IBKR")
+            send_telegram("✅ Connected to IBKR", broker="IBKR")
 
             # Wait for portfolio sync
             logger.info("⏳ Waiting 5s for portfolio sync...")
@@ -675,7 +818,7 @@ async def run_ibkr_workers():
                 logger.info("Starting signal monitor for %s", symbol)
                 tasks.append(ibkr_signal_monitor(symbol, ibkr_client, bar_mgr))
 
-            send_telegram("🚀 [IBKR] Bot Started (Session Active)")
+            send_telegram("🚀 [IBKR] Bot Started (Session Active)", broker="IBKR")
 
             # Wait for all tasks to complete
             # The workers are designed to exit at 16:00 ET
@@ -693,7 +836,7 @@ async def run_ibkr_workers():
 
         except Exception as e:
             logger.exception("CRITICAL: Error in main daily loop: %s", e)
-            send_telegram(f"🚨 CRITICAL: IBKR Bot daily loop error: {str(e)[:100]}")
+            send_telegram(f"🚨 CRITICAL: IBKR Bot daily loop error: {str(e)[:100]}", broker="IBKR")
             await asyncio.sleep(60)  # Prevent tight loop on error
 
     # Main loop exited - this is normal end of day

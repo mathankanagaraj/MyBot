@@ -71,20 +71,18 @@ class LiveCashManager:
 
     async def can_open_position(self, symbol: str, cost: float) -> bool:
         """
-        Check if we can open a new position.
-
+        Check if we can open a new position based on risk limits.
+        
+        Note: This does NOT check if position exists - that check should be done
+              using Angel One API before calling this method.
+        
         Args:
             symbol: Trading symbol
             cost: Estimated cost of position
 
         Returns:
-            True if position can be opened
+            True if position can be opened based on risk limits
         """
-        # Check if position already exists
-        if symbol in self.open_positions:
-            logger.warning(f"Position already exists for {symbol}")
-            return False
-
         # Check if cost is valid
         if cost <= 0:
             logger.warning(f"Invalid cost: ₹{cost}")
@@ -136,9 +134,14 @@ class LiveCashManager:
             return False
 
         self.open_positions[symbol] = cost
-        self.total_trades_today += 1
-        logger.info(f"Registered open position: {symbol} @ ₹{cost:.2f} (Trade #{self.total_trades_today})")
+        # Don't increment trade count here - only increment when order is successfully placed
+        logger.info(f"Registered open position: {symbol} @ ₹{cost:.2f}")
         return True
+    
+    def increment_trade_count(self):
+        """Increment total trades counter (call only after successful order placement)"""
+        self.total_trades_today += 1
+        logger.info(f"Trade count incremented: {self.total_trades_today} trades today")
 
     def register_close(self, symbol: str, exit_value: float) -> float:
         """

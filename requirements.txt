@@ -8,3 +8,4 @@ pytz
 requests
 websocket-client
 ib_insync==0.9.86
+pandas-ta>=0.3.14b

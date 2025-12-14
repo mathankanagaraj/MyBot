@@ -8,21 +8,39 @@ import requests
 
 from core.config import (
     AUDIT_CSV,
+    IBKR_TELEGRAM_CHAT_ID,
+    IBKR_TELEGRAM_TOKEN,
     TELEGRAM_CHAT_ID,
     TELEGRAM_TOKEN,
 )
 from core.logger import logger
 
 
-def send_telegram(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.info("Telegram not configured: %s", text)
+def send_telegram(text: str, broker: str = "ANGEL"):
+    """
+    Send Telegram notification using broker-specific tokens.
+    
+    Args:
+        text: Message to send
+        broker: "ANGEL" or "IBKR" (determines which Telegram bot to use)
+    """
+    # Select appropriate token and chat_id based on broker
+    if broker.upper() == "IBKR":
+        token = IBKR_TELEGRAM_TOKEN
+        chat_id = IBKR_TELEGRAM_CHAT_ID
+    else:  # Default to Angel One
+        token = TELEGRAM_TOKEN
+        chat_id = TELEGRAM_CHAT_ID
+    
+    if not token or not chat_id:
+        logger.info(f"[{broker}] Telegram not configured: %s", text)
         return
+    
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=5)
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=5)
     except Exception:
-        logger.exception("Failed to send Telegram")
+        logger.exception(f"[{broker}] Failed to send Telegram")
 
 
 def init_audit_file():

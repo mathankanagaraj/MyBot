@@ -136,7 +136,8 @@ async def market_state_watcher(poll_interval=5):
     Responsibilities:
     - Maintain MARKET_OPEN_STATE (single source of truth)
     - Trigger MARKET_STATE_EVENT to wake workers when state changes
-    - Set _STOP_EVENT at hard close (15:30 IST)
+    - Set _STOP_EVENT at hard close (15:30 IST) ONLY during active trading
+    - Sleep until next market open if started after hours
     - Notify via notify_market_state on changes
     """
     global MARKET_OPEN_STATE, MARKET_STATE_EVENT, _STOP_EVENT, _LAST_MARKET_OPEN_STATE
@@ -165,38 +166,47 @@ async def market_state_watcher(poll_interval=5):
         f"🕒 Initial market state: {'OPEN ✅' if MARKET_OPEN_STATE else 'CLOSED 🚫'}"
     )
 
+    # Track if we were open during this session (to distinguish hard close from startup after hours)
+    was_open_today = MARKET_OPEN_STATE
+
     try:
         while not _STOP_EVENT.is_set():
             now_ist = get_ist_now()
 
-            # Hard cutoff: if time >= 15:30 IST, stop the bot for the day
+            # Hard cutoff: if time >= 15:30 IST and we were open today, stop the bot
             if now_ist.time() >= time(15, 30):
-                if MARKET_OPEN_STATE:
-                    logger.info(
-                        "🛑 Market hard close reached (15:30 IST) - transitioning to CLOSED"
-                    )
-                MARKET_OPEN_STATE = False
+                if was_open_today:
+                    # Only set stop event if we were trading today (hard close scenario)
+                    if MARKET_OPEN_STATE:
+                        logger.info(
+                            "🛑 Market hard close reached (15:30 IST) - transitioning to CLOSED"
+                        )
+                    MARKET_OPEN_STATE = False
 
-                # Wake all waiters then set the global stop event
-                old_event = MARKET_STATE_EVENT
-                try:
-                    old_event.set()
-                except Exception:
-                    pass
-                MARKET_STATE_EVENT = asyncio.Event()
+                    # Wake all waiters then set the global stop event
+                    old_event = MARKET_STATE_EVENT
+                    try:
+                        old_event.set()
+                    except Exception:
+                        pass
+                    MARKET_STATE_EVENT = asyncio.Event()
 
-                # Notify and set stop
-                try:
-                    await notify_market_state(False)
-                except Exception:
-                    logger.debug(
-                        "notify_market_state failed at hard close", exc_info=True
-                    )
+                    # Notify and set stop
+                    try:
+                        await notify_market_state(False)
+                    except Exception:
+                        logger.debug(
+                            "notify_market_state failed at hard close", exc_info=True
+                        )
 
-                _STOP_EVENT.set()
-                logger.info("🛑 _STOP_EVENT set by market watcher (hard close at 15:30 IST)")
-                send_telegram("🛑 [AngelOne] Trading stopped - Market closed at 15:30 IST")
-                break
+                    _STOP_EVENT.set()
+                    logger.info("🛑 _STOP_EVENT set by market watcher (hard close at 15:30 IST)")
+                    send_telegram("🛑 [AngelOne] Trading stopped - Market closed at 15:30 IST", broker="ANGEL")
+                    break
+                else:
+                    # Started after 15:30, just keep MARKET_OPEN_STATE = False
+                    # Let run_angel_workers handle the sleep logic
+                    MARKET_OPEN_STATE = False
 
             # Soft open/close using util, only if MARKET_HOURS_ONLY is True
             if MARKET_HOURS_ONLY:
@@ -211,6 +221,10 @@ async def market_state_watcher(poll_interval=5):
             # If state changed, wake waiters and notify
             if is_open_now != MARKET_OPEN_STATE:
                 MARKET_OPEN_STATE = is_open_now
+
+                # Track if market opened during this session
+                if is_open_now:
+                    was_open_today = True
 
                 # Wake all waiting workers using the old event then swap in a fresh event
                 old_event = MARKET_STATE_EVENT
@@ -321,11 +335,11 @@ async def end_of_day_report(cash_mgr, angel_client):
         msg += "━━━━━━━━━━━━━━━━━━━━"
 
         logger.info(msg.replace("**", "").replace("━", "-"))
-        send_telegram(msg)
+        send_telegram(msg, broker="ANGEL")
 
     except Exception as e:
         logger.exception("Error generating end-of-day report: %s", e)
-        send_telegram(f"⚠️ Error generating end-of-day report: {str(e)[:100]}")
+        send_telegram(f"⚠️ Error generating end-of-day report: {str(e)[:100]}", broker="ANGEL")
 
 
 async def eod_scheduler_task(cash_mgr, angel_client, bar_managers):
@@ -453,20 +467,107 @@ async def execute_entry_order(
     """
     Execute entry order with option selection and bracket order placement for Angel One.
     Uses global lock to prevent simultaneous order placement.
+    
+    Pre-Trade Validation Flow (using Angel One API as single source of truth):
+    1. Lock Acquisition - Acquire global trade lock
+    2. Live Position Check - Query broker API for existing positions (CRITICAL)
+    3. Balance Verification - Check available funds from broker
+    4. Exposure Check - Verify 70% daily allocation limit
+    5. Option Selection - Find appropriate contract
+    6. Premium Validation - Ensure premium meets minimum
+    7. Position Sizing - Calculate lots and cost
+    8. Final Risk Check - Verify can_open_position
+    9. Order Placement - Execute bracket order
+    10. Trade Counting - Increment only on success
+    
+    Note: Does NOT rely on local cache for position verification.
+          Only Angel One API is the source of truth.
     """
     # Acquire global lock to prevent simultaneous trades
     async with _TRADE_ENTRY_LOCK:
         logger.info("[%s] 🔒 Acquired trade entry lock", symbol)
         
-        # Get current cash status before trade
+        # 1. Check real-time positions from broker API (SINGLE SOURCE OF TRUTH)
+        # Retry up to 3 times for API reliability
+        logger.info("[%s] 🔍 Checking live positions from Angel One API...", symbol)
+        live_positions = None
+        for attempt in range(3):
+            try:
+                live_positions = await angel_client.get_positions()
+                break  # Success, exit retry loop
+            except Exception as e:
+                logger.warning("[%s] ⚠️ Position check attempt %d/3 failed: %s", symbol, attempt + 1, e)
+                if attempt < 2:  # Don't sleep on last attempt
+                    await asyncio.sleep(1)  # Wait 1 second before retry
+        
+        # If all retries failed, block trade for safety
+        if live_positions is None:
+            logger.error("[%s] ❌ CRITICAL: Failed to verify positions after 3 attempts", symbol)
+            send_telegram(
+                f"❌ [{symbol}] Trade blocked\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Failed to verify positions from broker\n"
+                f"Retried 3 times - blocking for safety"
+            , broker="ANGEL")
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
+            return False
+        
+        # Check for existing positions
+        has_position = False
+        for pos in live_positions:
+            netqty = int(pos.get('netqty', '0'))
+            if netqty != 0:
+                pos_symbol = pos.get('tradingsymbol', '')
+                # Check if this position matches our symbol (underlying)
+                # Example: BANKNIFTY matches BANKNIFTY30DEC2559300PE
+                if symbol in pos_symbol or pos_symbol.startswith(symbol):
+                    has_position = True
+                    logger.error(
+                        "[%s] ❌ Live position exists in broker: %s (Qty: %d)",
+                        symbol,
+                        pos_symbol,
+                        netqty
+                    )
+                    send_telegram(
+                        f"❌ [{symbol}] Trade blocked\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 Live Position Found:\n"
+                        f"Symbol: {pos_symbol}\n"
+                        f"Quantity: {netqty}\n"
+                        f"P&L: ₹{float(pos.get('pnl', 0)):,.2f}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"❌ Cannot open duplicate position"
+                    , broker="ANGEL")
+                    logger.info("[%s] 🔓 Released trade entry lock", symbol)
+                    return False
+        
+        if not has_position:
+            logger.info("[%s] ✅ No existing positions found in broker", symbol)
+        
+        # 2. Get current cash status and calculate limits
         balance_info = await cash_mgr.get_account_balance()
         available_funds = balance_info["available_funds"]
         
+        # 3. Calculate available exposure based on 70% of daily start balance
+        available_exposure = await cash_mgr.available_exposure()
+        
         logger.info(
-            "[%s] 💰 Pre-trade check: Available funds: ₹%.2f",
+            "[%s] 💰 Balance check: Available funds: ₹%.2f | Available exposure (70%% limit): ₹%.2f",
             symbol,
-            available_funds
+            available_funds,
+            available_exposure
         )
+        
+        # 4. Early exit if no exposure available
+        if available_exposure <= 0:
+            logger.error("[%s] ❌ No exposure available (70%% daily limit reached)", symbol)
+            send_telegram(
+                f"❌ [{symbol}] No exposure available\n"
+                f"Daily allocation limit (70%) reached\n"
+                f"Available funds: ₹{available_funds:,.2f}"
+            , broker="ANGEL")
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
+            return False
         
         # Select option contract
         logger.info("[%s] 🔍 Selecting option contract...", symbol)
@@ -475,7 +576,7 @@ async def execute_entry_order(
         )
         if not opt_selection:
             logger.error("[%s] ❌ Option selection failed: %s", symbol, reason)
-            send_telegram(f"❌ {symbol} option selection failed: {reason}")
+            send_telegram(f"❌ {symbol} option selection failed: {reason}", broker="ANGEL")
             logger.info("[%s] 🔓 Released trade entry lock", symbol)
             return False
 
@@ -488,7 +589,7 @@ async def execute_entry_order(
             logger.error(
                 "[%s] ❌ Premium too low: ₹%s (min: ₹%.2f)", symbol, prem, MIN_PREMIUM
             )
-            send_telegram(f"❌ {symbol} premium too low: ₹{prem}")
+            send_telegram(f"❌ {symbol} premium too low: ₹{prem}", broker="ANGEL")
             logger.info("[%s] 🔓 Released trade entry lock", symbol)
             return False
 
@@ -519,7 +620,7 @@ async def execute_entry_order(
                 f"Required: ₹{est_cost:,.2f}\n"
                 f"Available: ₹{available_exposure:,.2f}\n"
                 f"Current balance: ₹{available_funds:,.2f}"
-            )
+            , broker="ANGEL")
             logger.info("[%s] 🔓 Released trade entry lock", symbol)
             return False
 
@@ -556,7 +657,7 @@ async def execute_entry_order(
 
         if bracket is None:
             logger.error("[%s] ❌ Order placement failed", symbol)
-            send_telegram(f"❌ {symbol} order placement failed")
+            send_telegram(f"❌ {symbol} order placement failed", broker="ANGEL")
             cash_mgr.force_release(symbol)
             logger.info("[%s] 🔓 Released trade entry lock", symbol)
             return False
@@ -564,8 +665,11 @@ async def execute_entry_order(
         # Store IDs for OCO management
         # Note: place_bracket_order in client.py returns dict with keys: entry_order_id, sl_order_id, target_order_id
         ACTIVE_OCO_ORDERS[symbol] = bracket
+        
+        # Increment trade count only after successful order placement
+        cash_mgr.increment_trade_count()
 
-        logger.info("[%s] ✅ Order placed successfully!", symbol)
+        logger.info("[%s] ✅ Order placed successfully! (Trade #%d)", symbol, cash_mgr.total_trades_today)
         
         # Get post-trade balance summary
         balance_info_post = await cash_mgr.get_account_balance()
@@ -582,7 +686,7 @@ async def execute_entry_order(
             f"Available Funds: ₹{balance_info_post['available_funds']:,.2f}\n"
             f"Available Exposure: ₹{available_exposure_post:,.2f}\n"
             f"Open Positions: {open_positions_count}"
-        )
+        , broker="ANGEL")
 
         logger.info("[%s] 🔓 Released trade entry lock", symbol)
         
@@ -659,7 +763,7 @@ async def search_5m_entry(
             continue
 
         # Revalidate 15m bias
-        bias_now = detect_15m_bias(df15_new)
+        bias_now = detect_15m_bias(df15_new, symbol=symbol)
         if bias_now != bias:
             logger.warning(
                 "[%s] ⚠️ 15m bias changed %s → %s, aborting %s entry search",
@@ -670,11 +774,11 @@ async def search_5m_entry(
             )
             send_telegram(
                 f"⚠️ [{symbol}] {context}: 15m bias changed {bias} → {bias_now}, aborting"
-            )
+            , broker="ANGEL")
             return False
 
         # Check 5m entry
-        entry_ok, details = detect_5m_entry(df5_new, bias)
+        entry_ok, details = detect_5m_entry(df5_new, bias, symbol=symbol)
         if not entry_ok:
             continue
 
@@ -699,7 +803,7 @@ async def search_5m_entry(
 
         if not underlying:
             logger.error("[%s] ❌ Failed to get underlying price", symbol)
-            send_telegram(f"❌ {symbol} failed to get underlying price")
+            send_telegram(f"❌ {symbol} failed to get underlying price", broker="ANGEL")
             return False
 
         logger.info("[%s] 💰 Underlying price: ₹%.2f", symbol, underlying)
@@ -731,12 +835,13 @@ async def handle_startup_signal(symbol, angel_client, cash_mgr, bar_manager):
             return
 
         # Get current data
-        df5_startup, df15_startup = await bar_manager.get_resampled()
+        now_utc = datetime.utcnow()
+        df5_startup, df15_startup = await bar_manager.get_resampled(current_time=now_utc)
         if df5_startup.empty or df15_startup.empty:
             return
 
         # Detect 15m bias
-        startup_bias = detect_15m_bias(df15_startup)
+        startup_bias = detect_15m_bias(df15_startup, symbol=symbol)
         if not startup_bias:
             return
 
@@ -762,7 +867,7 @@ async def handle_startup_signal(symbol, angel_client, cash_mgr, bar_manager):
             send_telegram(
                 f"🔍 [{symbol}] Startup detected recent 15m {startup_bias} signal "
                 f"({int(time_since_signal)}m ago). Searching for entry..."
-            )
+            , broker="ANGEL")
 
             # Search for 5m entry
             await search_5m_entry(
@@ -829,13 +934,13 @@ async def angel_signal_monitor(symbol, angel_client, cash_mgr, bar_manager):
 
             # Detect 15m bias
             logger.info(
-                "[%s] 🔍 Checking 15m bias at %s IST (bars: 5m=%d, 15m=%d)...",
+                "[%s] 🔍 Checking 15m bias at %s IST (total bars accumulated: 5m=%d, 15m=%d)...",
                 symbol,
                 get_ist_now().strftime("%H:%M:%S"),
                 len(df5),
                 len(df15),
             )
-            bias = detect_15m_bias(df15)
+            bias = detect_15m_bias(df15, symbol=symbol)
 
             if not bias:
                 continue
@@ -848,7 +953,7 @@ async def angel_signal_monitor(symbol, angel_client, cash_mgr, bar_manager):
             )
             send_telegram(
                 f"📊 [{symbol}] 15m Trend: {bias} at {get_ist_now().strftime('%H:%M')} IST. Looking for 5m entry..."
-            )
+            , broker="ANGEL")
 
             await search_5m_entry(
                 symbol, bias, angel_client, cash_mgr, bar_manager, "ENTRY"
@@ -978,7 +1083,7 @@ async def run_angel_workers():
 
                 # 🌅 Start Daily Cycle
                 logger.info("🌅 Starting daily trading cycle...")
-                send_telegram("🌅 [Angel] Bot waking up for trading day...")
+                send_telegram("🌅 [Angel] Bot waking up for trading day...", broker="ANGEL")
 
                 # Initialize Angel Broker client
                 angel_client = AngelClient()
@@ -1001,7 +1106,7 @@ async def run_angel_workers():
                 )
 
                 logger.info("✅ Connected to Angel")
-                send_telegram("✅ Connected to Angel")
+                send_telegram("✅ Connected to Angel", broker="ANGEL")
 
                 # Wait for portfolio sync
                 logger.info("⏳ Waiting 5s for portfolio sync...")
@@ -1060,7 +1165,7 @@ async def run_angel_workers():
                                 f"🔄 **Startup Position Check**\n"
                                 f"Found {len(cash_mgr.open_positions)} open position(s)\n"
                                 f"Capital Locked: ₹{total_locked:,.2f}"
-                            )
+                            , broker="ANGEL")
                 except Exception as e:
                     logger.error(f"Error checking existing positions: {e}")
 
@@ -1116,7 +1221,7 @@ async def run_angel_workers():
                         )
                     )
 
-                send_telegram("🚀 Angel Broker Bot Started (LIVE TRADING)")
+                send_telegram("🚀 Angel Broker Bot Started (LIVE TRADING)", broker="ANGEL")
 
                 # Wait for all tasks to complete or for _STOP_EVENT
                 # We await gather here; tasks should honor _STOP_EVENT and exit cleanly.
@@ -1138,7 +1243,7 @@ async def run_angel_workers():
                 logger.exception("CRITICAL: Error in main daily loop: %s", e)
                 send_telegram(
                     f"🚨 CRITICAL: Angel Bot daily loop error: {str(e)[:100]}"
-                )
+                , broker="ANGEL")
                 await sleep_until_next(60)
 
         # Main while loop end
@@ -1182,15 +1287,15 @@ async def notify_market_state(is_open: bool):
     if first_run:
         if not is_open:
             logger.warning("🔔 BOT started outside NSE market hours")
-            send_telegram("🔔 BOT started outside NSE market hours")
+            send_telegram("🔔 BOT started outside NSE market hours", broker="ANGEL")
         else:
             logger.info("🔔 BOT started during NSE market hours")
-            send_telegram("🔔 BOT started during NSE market hours")
+            send_telegram("🔔 BOT started during NSE market hours", broker="ANGEL")
         return
 
     if is_open != _LAST_MARKET_OPEN_STATE:
         if is_open:
-            send_telegram("🔔 NSE Market is OPEN")
+            send_telegram("🔔 NSE Market is OPEN", broker="ANGEL")
         else:
-            send_telegram("🛑 NSE Market is CLOSED")
+            send_telegram("🛑 NSE Market is CLOSED", broker="ANGEL")
         _LAST_MARKET_OPEN_STATE = is_open

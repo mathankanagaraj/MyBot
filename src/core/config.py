@@ -66,8 +66,13 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # ============================================================================
 # TELEGRAM NOTIFICATIONS
 # ============================================================================
+# Angel One Bot Telegram (for NSE/Indian market notifications)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# IBKR Bot Telegram (for US market notifications)
+IBKR_TELEGRAM_TOKEN = os.getenv("IBKR_TELEGRAM_TOKEN", "")
+IBKR_TELEGRAM_CHAT_ID = os.getenv("IBKR_TELEGRAM_CHAT_ID", "")
 
 # ============================================================================
 # TRADING MODE
@@ -123,6 +128,8 @@ MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "120"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 SUPERTREND_PERIOD = int(os.getenv("SUPERTREND_PERIOD", "10"))
 SUPERTREND_MULTIPLIER = float(os.getenv("SUPERTREND_MULTIPLIER", "3.0"))
+# EMA crossover confirmation window (number of 5m candles to look back)
+EMA_CROSSOVER_WINDOW = int(os.getenv("EMA_CROSSOVER_WINDOW", "3"))
 
 # ============================================================================
 # LOGGING & AUDIT
