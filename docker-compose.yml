@@ -16,9 +16,7 @@ services:
 
   ibkr_bot:
     image: options_bot:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # Build handled by angel_bot service to avoid race condition
     depends_on:
       - angel_bot
     container_name: ibkr_bot

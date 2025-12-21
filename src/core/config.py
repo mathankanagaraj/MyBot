@@ -132,6 +132,58 @@ SUPERTREND_MULTIPLIER = float(os.getenv("SUPERTREND_MULTIPLIER", "3.0"))
 EMA_CROSSOVER_WINDOW = int(os.getenv("EMA_CROSSOVER_WINDOW", "3"))
 
 # ============================================================================
+# OPTIMIZED STRATEGY PARAMETERS (SuperTrend/VWAP/RSI Strategy)
+# ============================================================================
+
+# 5-Minute Entry Parameters
+EMA_PERIOD = int(os.getenv("EMA_PERIOD", "20"))  # EMA for price structure
+RSI_5M_PERIOD = int(os.getenv("RSI_5M_PERIOD", "5"))  # Fast RSI for pullback detection
+
+# Volume Confirmation
+VOLUME_MA_PERIOD = int(
+    os.getenv("VOLUME_MA_PERIOD", "20")
+)  # Volume moving average period
+
+# Volume Confirmation
+VOLUME_MA_PERIOD = int(
+    os.getenv("VOLUME_MA_PERIOD", "20")
+)  # Volume moving average period
+
+# ============================================================================
+# ENHANCED FILTERS
+# ============================================================================
+
+# ATM Strike Distance Filter
+ATM_STRIKE_MAX_DISTANCE_PCT = float(
+    os.getenv("ATM_STRIKE_MAX_DISTANCE_PCT", "0.05")
+)  # 5% max distance from underlying
+
+# Time Gap Between Entries
+MIN_TIME_BETWEEN_ENTRIES_MINUTES = int(
+    os.getenv("MIN_TIME_BETWEEN_ENTRIES_MINUTES", "15")
+)  # Minimum 15 minutes between trades
+
+# EMA Flatness Detection (Ranging Market Filter)
+EMA_FLATNESS_THRESHOLD_PCT = float(
+    os.getenv("EMA_FLATNESS_THRESHOLD_PCT", "0.001")
+)  # 0.1% minimum slope
+
+# Force Exit Before Expiry
+FORCE_EXIT_BEFORE_EXPIRY_MINUTES = int(
+    os.getenv("FORCE_EXIT_BEFORE_EXPIRY_MINUTES", "30")
+)  # Force exit 30min before expiry
+
+# ============================================================================
+# NO-TRADE ZONES
+# ============================================================================
+
+# No entries during first N minutes after market open
+NO_TRADE_FIRST_MINUTES = int(os.getenv("NO_TRADE_FIRST_MINUTES", "5"))
+
+# No entries during last N minutes before expiry (on expiry day)
+NO_TRADE_LAST_MINUTES_EXPIRY = int(os.getenv("NO_TRADE_LAST_MINUTES_EXPIRY", "15"))
+
+# ============================================================================
 # LOGGING & AUDIT
 # ============================================================================
 LOG_DIR = BASE_DIR.joinpath("logs")

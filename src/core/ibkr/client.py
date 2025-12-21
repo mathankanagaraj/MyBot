@@ -1,15 +1,14 @@
-# core/ibkr_client.py
 """
 Interactive Brokers client for US stock options trading.
-Uses ib_insync library to connect to TWS/Gateway.
+Uses ib_async library to connect to TWS/Gateway.
 """
+
 import asyncio
-import calendar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import pandas as pd
-from ib_insync import IB, Stock, Option, util
+from ib_async import IB, Stock, Option, util
 
 from core.config import (
     IB_HOST,
@@ -149,21 +148,21 @@ class IBKRClient:
     ) -> Optional[pd.DataFrame]:
         """
         Fetch historical bars directly at specified interval (no resampling).
-        
+
         Args:
             symbol: Stock symbol (e.g., 'SPY', 'AAPL')
             bar_size: Bar size ("5 mins", "15 mins", "1 hour", etc.)
             duration_str: Duration ("1 D" for 1 day, "2 D" for 2 days)
-        
+
         Returns:
             DataFrame with OHLCV data indexed by datetime (UTC naive)
         """
         try:
             contract = Stock(symbol, "SMART", "USD")
             await self.ib.qualifyContractsAsync(contract)
-            
+
             logger.debug(f"[{symbol}] Requesting {duration_str} of {bar_size} bars...")
-            
+
             bars = await self.ib.reqHistoricalDataAsync(
                 contract,
                 endDateTime="",
@@ -173,27 +172,29 @@ class IBKRClient:
                 useRTH=True,
                 formatDate=1,
             )
-            
+
             if not bars:
                 logger.warning(f"[{symbol}] No historical {bar_size} data returned")
                 return None
-            
+
             df = util.df(bars)
             if df is None or df.empty:
                 return None
-            
+
             # Convert timestamps to UTC naive
             df["datetime"] = pd.to_datetime(df["date"])
-            
+
             if df["datetime"].iloc[0].tzinfo is None:
                 df["datetime"] = df["datetime"].dt.tz_localize("America/New_York")
-            
+
             df["datetime"] = df["datetime"].dt.tz_convert("UTC").dt.tz_localize(None)
             df = df.set_index("datetime")[["open", "high", "low", "close", "volume"]]
-            
-            logger.info(f"[{symbol}] Fetched {len(df)} {bar_size} bars (latest close: ${df['close'].iloc[-1]:.2f})")
+
+            logger.info(
+                f"[{symbol}] Fetched {len(df)} {bar_size} bars (latest close: ${df['close'].iloc[-1]:.2f})"
+            )
             return df
-            
+
         except Exception:
             logger.exception(f"Error fetching {bar_size} historical data for {symbol}")
             return None
@@ -204,7 +205,7 @@ class IBKRClient:
         """
         Get option chain for symbol filtered by DTE range.
         Returns options for ALL expiries within the DTE range.
-        
+
         Args:
             symbol: Stock symbol
             underlying_price: Current stock price
@@ -267,7 +268,7 @@ class IBKRClient:
 
             # Sort by DTE (closest first)
             valid_expiries.sort(key=lambda x: x[1])
-            
+
             logger.info(
                 f"[{symbol}] Found {len(valid_expiries)} valid expiries in {min_dte}-{max_dte} DTE range"
             )

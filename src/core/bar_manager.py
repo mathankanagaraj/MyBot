@@ -29,6 +29,29 @@ class BarManager:
         self.current_bar = None
         self.current_bar_start = None
 
+        # ========================================================================
+        # INTELLIGENT INDICATOR CACHING (Optimized Strategy)
+        # ========================================================================
+        # Cache for 15m indicators (bias detection)
+        self.cache_15m = {
+            "supertrend": None,  # SuperTrend direction (bool)
+            "vwap": None,  # VWAP price
+            "rsi14": None,  # RSI(14)
+            "price": None,  # Close price
+            "last_candle_time": None,  # Timestamp for cache invalidation
+        }
+
+        # Cache for 5m indicators (entry detection)
+        self.cache_5m = {
+            "ema20": None,  # EMA(20) for structure
+            "ema20_series": None,  # Last 6 EMA values for flatness check
+            "rsi5": None,  # RSI(5) current value
+            "rsi5_recent": None,  # Last 3 RSI(5) values for pullback confirm
+            "volume_ma": None,  # Volume MA(20)
+            "current_volume": None,  # Current candle volume
+            "last_candle_time": None,  # Timestamp for cache invalidation
+        }
+
     async def process_tick(self, price: float, timestamp: datetime, volume: int = 0):
         """
         Process a real-time tick and update the current bar.
@@ -207,3 +230,131 @@ class BarManager:
     def get_bar_count(self):
         """Get current number of bars in buffer."""
         return len(self.bars)
+
+    # ========================================================================
+    # INTELLIGENT CACHING METHODS (Optimized Strategy)
+    # ========================================================================
+
+    async def get_cached_15m_indicators(self, df15):
+        """
+        Get cached 15m indicators, recomputing only if stale.
+
+        Args:
+            df15: DataFrame with 15m bars and indicators already computed
+
+        Returns:
+            dict: Cached indicator values
+        """
+        async with self.lock:
+            if df15.empty:
+                return None
+
+            last_candle_time = df15.index[-1]
+
+            # Check if cache is stale
+            if self.cache_15m["last_candle_time"] != last_candle_time:
+                # Recompute indicators
+                logger.debug(
+                    f"[{self.symbol}] 🔄 Updating 15m cache (new candle: {last_candle_time})"
+                )
+
+                last_row = df15.iloc[-1]
+
+                self.cache_15m["supertrend"] = last_row.get("supertrend", None)
+                self.cache_15m["vwap"] = last_row.get("vwap", None)
+                self.cache_15m["rsi14"] = last_row.get("rsi", None)
+                self.cache_15m["price"] = last_row.get("close", None)
+                self.cache_15m["last_candle_time"] = last_candle_time
+
+                logger.debug(
+                    f"[{self.symbol}] ✅ 15m cache updated - "
+                    f"ST: {self.cache_15m['supertrend']}, "
+                    f"VWAP: {self.cache_15m['vwap']:.2f if self.cache_15m['vwap'] else 'N/A'}, "
+                    f"RSI: {self.cache_15m['rsi14']:.2f if self.cache_15m['rsi14'] else 'N/A'}"
+                )
+            else:
+                logger.debug(f"[{self.symbol}] ♻️ Using cached 15m indicators")
+
+            return self.cache_15m.copy()
+
+    async def get_cached_5m_indicators(self, df5):
+        """
+        Get cached 5m indicators, recomputing only if stale.
+
+        Args:
+            df5: DataFrame with 5m bars and indicators already computed
+
+        Returns:
+            dict: Cached indicator values
+        """
+        async with self.lock:
+            if df5.empty:
+                return None
+
+            last_candle_time = df5.index[-1]
+
+            # Check if cache is stale
+            if self.cache_5m["last_candle_time"] != last_candle_time:
+                # Recompute indicators
+                logger.debug(
+                    f"[{self.symbol}] 🔄 Updating 5m cache (new candle: {last_candle_time})"
+                )
+
+                last_row = df5.iloc[-1]
+
+                # Get EMA(20) current value
+                self.cache_5m["ema20"] = last_row.get(
+                    "sma20", None
+                )  # Using sma20 column from indicators.py
+
+                # Get last 6 EMA values for flatness check
+                if "sma20" in df5.columns and len(df5) >= 6:
+                    self.cache_5m["ema20_series"] = df5["sma20"].tail(6).tolist()
+                else:
+                    self.cache_5m["ema20_series"] = None
+
+                # Get RSI(5) - need to calculate from close prices
+                if len(df5) >= 6:  # Need at least 6 candles for RSI(5)
+                    from core.indicators import calculate_rsi
+
+                    self.cache_5m["rsi5"] = calculate_rsi(df5["close"], period=5)
+                    # Get last 3 RSI(5) values for pullback confirmation
+                    rsi5_series = []
+                    for i in range(min(3, len(df5))):
+                        if len(df5) >= 6 + i:
+                            rsi_val = calculate_rsi(
+                                df5["close"].iloc[: -(i) if i > 0 else len(df5)],
+                                period=5,
+                            )
+                            if rsi_val is not None:
+                                rsi5_series.insert(0, rsi_val)
+                    self.cache_5m["rsi5_recent"] = rsi5_series if rsi5_series else None
+                else:
+                    self.cache_5m["rsi5"] = None
+                    self.cache_5m["rsi5_recent"] = None
+
+                # Volume indicators
+                self.cache_5m["current_volume"] = last_row.get("volume", None)
+                if "volume" in df5.columns and len(df5) >= 20:
+                    self.cache_5m["volume_ma"] = df5["volume"].tail(20).mean()
+                else:
+                    self.cache_5m["volume_ma"] = None
+
+                self.cache_5m["last_candle_time"] = last_candle_time
+
+                logger.debug(
+                    f"[{self.symbol}] ✅ 5m cache updated - "
+                    f"EMA20: {self.cache_5m['ema20']:.2f if self.cache_5m['ema20'] else 'N/A'}, "
+                    f"RSI5: {self.cache_5m['rsi5']:.2f if self.cache_5m['rsi5'] else 'N/A'}, "
+                    f"Vol: {self.cache_5m['current_volume']}, VolMA: {self.cache_5m['volume_ma']:.0f if self.cache_5m['volume_ma'] else 'N/A'}"
+                )
+            else:
+                logger.debug(f"[{self.symbol}] ♻️ Using cached 5m indicators")
+
+            return self.cache_5m.copy()
+
+    def clear_cache(self):
+        """Clear all cached indicators (useful for testing or reset)."""
+        logger.info(f"[{self.symbol}] 🗑️ Clearing indicator caches")
+        self.cache_15m = {k: None for k in self.cache_15m.keys()}
+        self.cache_5m = {k: None for k in self.cache_5m.keys()}

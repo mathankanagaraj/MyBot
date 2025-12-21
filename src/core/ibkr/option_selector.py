@@ -5,10 +5,8 @@ Selects ITM options based on bias (CALL/PUT) and underlying price.
 """
 
 import asyncio
-from datetime import datetime
 from typing import Optional, Tuple, Any, List
 from dataclasses import dataclass
-import pytz
 
 from core.config import OPTION_MIN_DTE, OPTION_MAX_DTE
 from core.logger import logger
@@ -52,7 +50,10 @@ async def find_ibkr_option_contract(
             symbol, underlying_price, OPTION_MIN_DTE, OPTION_MAX_DTE
         )
         if not options:
-            return None, f"No options available in {OPTION_MIN_DTE}-{OPTION_MAX_DTE} DTE range"
+            return (
+                None,
+                f"No options available in {OPTION_MIN_DTE}-{OPTION_MAX_DTE} DTE range",
+            )
 
         # Determine option type
         option_type = "C" if bias == "BULL" else "P"
@@ -63,9 +64,9 @@ async def find_ibkr_option_contract(
         # Options already filtered by DTE in get_option_chain, no need to filter again
         # Just verify they have DTE field
         valid_options = [opt for opt in filtered if "dte" in opt]
-        
+
         if not valid_options:
-            return None, f"No options with valid DTE"
+            return None, "No options with valid DTE"
 
         # Select strike
         selected = _select_strike(valid_options, underlying_price, bias)
@@ -154,7 +155,7 @@ async def _get_option_price(
             close = getattr(ticker, "close", 0)
 
             # Handle potential nan or None values safely?
-            # Usually ib_insync initializes them to nan or 0.0.
+            # Usually ib_async initializes them to nan or 0.0.
             # We assume non-NaN positive values are valid.
 
             if bid > 0 and ask > 0:
