@@ -184,6 +184,32 @@ NO_TRADE_FIRST_MINUTES = int(os.getenv("NO_TRADE_FIRST_MINUTES", "5"))
 NO_TRADE_LAST_MINUTES_EXPIRY = int(os.getenv("NO_TRADE_LAST_MINUTES_EXPIRY", "15"))
 
 # ============================================================================
+# ORB (Opening Range Breakout) STRATEGY CONFIG
+# ============================================================================
+# Strategy selection: ORB or MACD_EMA (default existing strategy)
+STRATEGY = os.getenv("STRATEGY", "MACD_EMA").upper()
+
+# ORB Symbols per broker
+ORB_ANGEL_SYMBOLS = ["NIFTY", "BANKNIFTY"]
+ORB_IBKR_SYMBOLS = ["SPX", "NDX"]  # S&P 500 and Nasdaq 100 index options (0 DTE)
+
+# ORB Parameters
+ORB_DURATION_MINUTES = int(
+    os.getenv("ORB_DURATION_MINUTES", "30")
+)  # ORB building period
+ORB_ATR_LENGTH = int(os.getenv("ORB_ATR_LENGTH", "14"))
+ORB_ATR_MULTIPLIER = float(os.getenv("ORB_ATR_MULTIPLIER", "1.2"))
+ORB_RISK_REWARD = float(os.getenv("ORB_RISK_REWARD", "1.5"))  # 1:1.5 risk-reward
+
+# Breakout confirmation timeframe (30 = 30-min candles for higher conviction)
+ORB_BREAKOUT_TIMEFRAME = int(os.getenv("ORB_BREAKOUT_TIMEFRAME", "30"))
+
+# ORB Entry Limits (stop taking entries after this hour)
+ORB_MAX_ENTRY_HOUR = int(
+    os.getenv("ORB_MAX_ENTRY_HOUR", "14")
+)  # 2 PM (both IST and ET)
+
+# ============================================================================
 # LOGGING & AUDIT
 # ============================================================================
 LOG_DIR = BASE_DIR.joinpath("logs")

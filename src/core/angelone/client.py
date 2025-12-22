@@ -50,7 +50,7 @@ class AngelClient:
         self.rate_limiter = APIRateLimiter(
             enabled=enable_rate_limiting, safety_margin=0.9
         )
-        
+
         # Connection health tracking
         self._last_successful_call = datetime.now()
         self._failed_call_count = 0
@@ -108,7 +108,9 @@ class AngelClient:
                         try:
                             from core.utils import send_telegram
 
-                            send_telegram("✅ Angel Broker connected successfully", broker="ANGEL")
+                            send_telegram(
+                                "✅ Angel Broker connected successfully", broker="ANGEL"
+                            )
                         except Exception:
                             pass
                         self.alert_sent = False
@@ -125,8 +127,9 @@ class AngelClient:
                         from core.utils import send_telegram
 
                         send_telegram(
-                            f"⚠️ Angel Broker connection failed: {str(e)[:100]}"
-                        , broker="ANGEL")
+                            f"⚠️ Angel Broker connection failed: {str(e)[:100]}",
+                            broker="ANGEL",
+                        )
                     except Exception:
                         pass
                     self.alert_sent = True
@@ -207,18 +210,18 @@ class AngelClient:
             logger.info("Disconnected from Angel Broker")
         except Exception:
             logger.exception("Error disconnecting from Angel Broker")
-    
+
     def _mark_api_success(self):
         """Mark successful API call for health tracking"""
         self._last_successful_call = datetime.now()
         if self._failed_call_count > 0:
             self._failed_call_count = 0
             logger.info("API calls recovered, resetting failure count")
-    
+
     def _mark_api_failure(self):
         """Mark failed API call and potentially open circuit breaker"""
         self._failed_call_count += 1
-        
+
         # Open circuit breaker after 5 consecutive failures
         if self._failed_call_count >= 5 and not self._circuit_breaker_open:
             self._circuit_breaker_open = True
@@ -229,25 +232,27 @@ class AngelClient:
             )
             try:
                 from core.utils import send_telegram
+
                 send_telegram(
                     f"⚠️ AngelOne API circuit breaker opened after {self._failed_call_count} failures. "
-                    "Will attempt reconnection in 60 seconds."
-                , broker="ANGEL")
+                    "Will attempt reconnection in 60 seconds.",
+                    broker="ANGEL",
+                )
             except Exception:
                 pass
-    
+
     def _check_circuit_breaker(self) -> bool:
         """Check if circuit breaker allows requests. Returns True if request can proceed."""
         if not self._circuit_breaker_open:
             return True
-        
+
         # Check if reset time has passed
         if datetime.now() >= self._circuit_breaker_reset_time:
             logger.info("🔄 Circuit breaker reset time reached, closing breaker")
             self._circuit_breaker_open = False
             self._failed_call_count = 0
             return True
-        
+
         return False
 
     async def load_scrip_master(self):
@@ -288,20 +293,91 @@ class AngelClient:
         # Essential indices and stocks for NIFTY options trading
         fallback_instruments = [
             # Indices
-            {"token": "99926000", "symbol": "NIFTY", "name": "NIFTY", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
-            {"token": "99926009", "symbol": "BANKNIFTY", "name": "BANKNIFTY", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
-
+            {
+                "token": "99926000",
+                "symbol": "NIFTY",
+                "name": "NIFTY",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
+            {
+                "token": "99926009",
+                "symbol": "BANKNIFTY",
+                "name": "BANKNIFTY",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
             # Common stocks (add more as needed)
-            {"token": "738561", "symbol": "RELIANCE", "name": "RELIANCE", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
-            {"token": "3045", "symbol": "SBIN", "name": "SBIN", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
-            {"token": "11536", "symbol": "TCS", "name": "TCS", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
-            {"token": "2885", "symbol": "INFY", "name": "INFY", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
-            {"token": "14977", "symbol": "HDFCBANK", "name": "HDFCBANK", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
-            {"token": "1394", "symbol": "ICICIBANK", "name": "ICICIBANK", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
-            {"token": "317", "symbol": "AXISBANK", "name": "AXISBANK", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
-            {"token": "1660", "symbol": "BAJFINANCE", "name": "BAJFINANCE", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
-            {"token": "1922", "symbol": "BHARTIARTL", "name": "BHARTIARTL", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
-            {"token": "526", "symbol": "HINDUNILVR", "name": "HINDUNILVR", "exch_seg": "NSE", "instrumenttype": "AMXIDX"},
+            {
+                "token": "738561",
+                "symbol": "RELIANCE",
+                "name": "RELIANCE",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
+            {
+                "token": "3045",
+                "symbol": "SBIN",
+                "name": "SBIN",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
+            {
+                "token": "11536",
+                "symbol": "TCS",
+                "name": "TCS",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
+            {
+                "token": "2885",
+                "symbol": "INFY",
+                "name": "INFY",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
+            {
+                "token": "14977",
+                "symbol": "HDFCBANK",
+                "name": "HDFCBANK",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
+            {
+                "token": "1394",
+                "symbol": "ICICIBANK",
+                "name": "ICICIBANK",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
+            {
+                "token": "317",
+                "symbol": "AXISBANK",
+                "name": "AXISBANK",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
+            {
+                "token": "1660",
+                "symbol": "BAJFINANCE",
+                "name": "BAJFINANCE",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
+            {
+                "token": "1922",
+                "symbol": "BHARTIARTL",
+                "name": "BHARTIARTL",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
+            {
+                "token": "526",
+                "symbol": "HINDUNILVR",
+                "name": "HINDUNILVR",
+                "exch_seg": "NSE",
+                "instrumenttype": "AMXIDX",
+            },
         ]
 
         self.scrip_master = fallback_instruments
@@ -351,19 +427,24 @@ class AngelClient:
             # Fallback: Try searchScrip API for dynamic lookup
             if self.smart_api and self.connected:
                 try:
-                    logger.info(f"Searching for symbol {symbol} on {exchange} via API...")
+                    logger.info(
+                        f"Searching for symbol {symbol} on {exchange} via API..."
+                    )
                     search_result = self.smart_api.searchScrip(exchange, symbol)
 
-                    if search_result and 'data' in search_result:
-                        for item in search_result['data']:
-                            if item.get('symbol') == symbol or item.get('tradingsymbol') == symbol:
-                                token = str(item.get('token'))
+                    if search_result and "data" in search_result:
+                        for item in search_result["data"]:
+                            if (
+                                item.get("symbol") == symbol
+                                or item.get("tradingsymbol") == symbol
+                            ):
+                                token = str(item.get("token"))
                                 # Cache the result
                                 instrument = {
-                                    'token': token,
-                                    'symbol': item.get('symbol', symbol),
-                                    'name': item.get('name', symbol),
-                                    'exch_seg': exchange
+                                    "token": token,
+                                    "symbol": item.get("symbol", symbol),
+                                    "name": item.get("name", symbol),
+                                    "exch_seg": exchange,
                                 }
                                 self.symbol_cache[key] = instrument
                                 logger.info(f"Found symbol {symbol} with token {token}")
@@ -460,19 +541,15 @@ class AngelClient:
             # Convert datetime to pandas datetime
             df["datetime"] = pd.to_datetime(df["datetime"])
 
-            # Convert to UTC (Angel returns IST)
-            # Check if datetime is already timezone aware
+            # Keep as IST (Angel returns IST)
+            # Remove timezone info to match datetime.fromtimestamp() behavior in WebSocket
             if df["datetime"].dt.tz is None:
-                df["datetime"] = (
-                    df["datetime"]
-                    .dt.tz_localize("Asia/Kolkata")
-                    .dt.tz_convert("UTC")
-                    .dt.tz_localize(None)
-                )
+                # Assuming input is already in correct local time (IST) from API string
+                # just ensure it's naive
+                pass
             else:
-                df["datetime"] = (
-                    df["datetime"].dt.tz_convert("UTC").dt.tz_localize(None)
-                )
+                # If it has timezone, convert to naive (wall time)
+                df["datetime"] = df["datetime"].dt.tz_localize(None)
 
             # Set index and select OHLCV columns
             df = df.set_index("datetime")[["open", "high", "low", "close", "volume"]]
@@ -513,14 +590,19 @@ class AngelClient:
         """
         try:
             if not self.connected:
-                logger.error(f"Not connected to Angel Broker when fetching LTP for token {token}")
+                logger.error(
+                    f"Not connected to Angel Broker when fetching LTP for token {token}"
+                )
                 return None
 
             # Find symbol from token
             symbol = None
             if self.scrip_master:
                 for instrument in self.scrip_master:
-                    if instrument.get("token") == token and instrument.get("exch_seg") == exchange:
+                    if (
+                        instrument.get("token") == token
+                        and instrument.get("exch_seg") == exchange
+                    ):
                         symbol = instrument.get("symbol")
                         break
 
@@ -533,9 +615,7 @@ class AngelClient:
 
             # Use LTP API with timeout
             ltp_data = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.smart_api.ltpData, exchange, symbol, token
-                ),
+                asyncio.to_thread(self.smart_api.ltpData, exchange, symbol, token),
                 timeout=5.0,
             )
 
@@ -567,9 +647,11 @@ class AngelClient:
         """
         try:
             if not self.connected:
-                logger.error(f"Not connected to Angel Broker when fetching price for {symbol}")
+                logger.error(
+                    f"Not connected to Angel Broker when fetching price for {symbol}"
+                )
                 return None
-                
+
             symbol_token = self.get_symbol_token(symbol, exchange)
             if not symbol_token:
                 return None
@@ -697,9 +779,7 @@ class AngelClient:
 
             # Get spot LTP
             ltp_data = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.smart_api.ltpData, "NSE", symbol, symbol_token
-                ),
+                asyncio.to_thread(self.smart_api.ltpData, "NSE", symbol, symbol_token),
                 timeout=5.0,
             )
 
@@ -754,12 +834,12 @@ class AngelClient:
             if not self.connected:
                 logger.error("Cannot place order: Not connected to Angel Broker")
                 return None
-            
+
             # Validate inputs
             if quantity <= 0:
                 logger.error(f"Invalid quantity: {quantity}")
                 return None
-                
+
             order_params = {
                 "variety": variety,
                 "tradingsymbol": symbol,
@@ -970,8 +1050,7 @@ class AngelClient:
 
             # Use asyncio.to_thread with timeout for blocking call
             response = await asyncio.wait_for(
-                asyncio.to_thread(self.smart_api.position),
-                timeout=5.0
+                asyncio.to_thread(self.smart_api.position), timeout=5.0
             )
 
             if response and response.get("data"):
@@ -999,8 +1078,7 @@ class AngelClient:
 
             # Get RMS Limits (Risk Management System) - use asyncio.to_thread for blocking call
             rms = await asyncio.wait_for(
-                asyncio.to_thread(self.smart_api.rmsLimit),
-                timeout=5.0
+                asyncio.to_thread(self.smart_api.rmsLimit), timeout=5.0
             )
 
             if rms and rms.get("data"):

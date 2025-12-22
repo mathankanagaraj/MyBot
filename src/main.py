@@ -1,7 +1,7 @@
 import asyncio
 import signal
 
-from core.config import BROKER, ANGEL_MODE, IBKR_MODE
+from core.config import BROKER, STRATEGY, ANGEL_MODE, IBKR_MODE
 from core.logger import setup_logging
 from core.utils import send_telegram
 
@@ -11,15 +11,27 @@ logger = setup_logging()
 def _signal_handler(sig, frame):
     msg = f"⚠️ Signal {sig} received: Bot shutting down/restarting..."
     logger.info(msg)
-    
+
     if BROKER == "ANGEL":
         send_telegram(msg, broker="ANGEL")
-        from core.angelone.worker import stop_angel_workers
-        stop_angel_workers()
+        if STRATEGY == "ORB":
+            from core.angelone.orb_worker_angel import stop_orb_angel_workers
+
+            stop_orb_angel_workers()
+        else:
+            from core.angelone.worker import stop_angel_workers
+
+            stop_angel_workers()
     elif BROKER == "IBKR":
         send_telegram(msg, broker="IBKR")
-        from core.ibkr.worker import stop_ibkr_workers
-        stop_ibkr_workers()
+        if STRATEGY == "ORB":
+            from core.ibkr.orb_worker_ibkr import stop_orb_ibkr_workers
+
+            stop_orb_ibkr_workers()
+        else:
+            from core.ibkr.worker import stop_ibkr_workers
+
+            stop_ibkr_workers()
     else:
         send_telegram(msg, broker="ANGEL")  # Default fallback
 
@@ -30,20 +42,35 @@ signal.signal(signal.SIGTERM, _signal_handler)
 
 async def run_multi_broker():
     """
-    Run the broker worker based on BROKER configuration.
-    With separate containers, each container runs ONE broker:
-    - angel_bot container: Runs Angel One worker
-    - ibkr_bot container: Runs IBKR worker
+    Run the broker worker based on BROKER and STRATEGY configuration.
+
+    Strategy Options:
+    - MACD_EMA (default): Existing SuperTrend/VWAP/RSI strategy
+    - ORB: Opening Range Breakout strategy
+
+    Broker Options:
+    - ANGEL: Angel One (India - NSE options)
+    - IBKR: Interactive Brokers (US - SPX/NDX index options)
     """
+    strategy_label = f"Strategy: {STRATEGY}"
 
-    # With separate containers, run only the configured broker
     if BROKER == "ANGEL":
-        logger.info(f"🇮🇳 Starting Angel One Bot (Mode: {ANGEL_MODE}) [AsyncIO]")
-        send_telegram(f"🚀 Angel One Bot Starting (Mode: {ANGEL_MODE})", broker="ANGEL")
+        logger.info(
+            f"🇮🇳 Starting Angel One Bot (Mode: {ANGEL_MODE}, {strategy_label}) [AsyncIO]"
+        )
+        send_telegram(
+            f"🚀 Angel One Bot Starting\nMode: {ANGEL_MODE}\n{strategy_label}",
+            broker="ANGEL",
+        )
         try:
-            from core.angelone.worker import run_angel_workers
+            if STRATEGY == "ORB":
+                from core.angelone.orb_worker_angel import run_orb_angel_workers
 
-            await run_angel_workers()
+                await run_orb_angel_workers()
+            else:
+                from core.angelone.worker import run_angel_workers
+
+                await run_angel_workers()
         except Exception as e:
             logger.exception(f"Error in Angel worker: {e}")
             send_telegram(f"🚨 Angel worker error: {str(e)[:100]}", broker="ANGEL")
@@ -51,12 +78,21 @@ async def run_multi_broker():
             logger.info("👋 Angel worker shutdown complete")
 
     elif BROKER == "IBKR":
-        logger.info(f"🇺🇸 Starting IBKR Bot (Mode: {IBKR_MODE}) [AsyncIO]")
-        send_telegram(f"🚀 IBKR Bot Starting (Mode: {IBKR_MODE})", broker="IBKR")
+        logger.info(
+            f"🇺🇸 Starting IBKR Bot (Mode: {IBKR_MODE}, {strategy_label}) [AsyncIO]"
+        )
+        send_telegram(
+            f"🚀 IBKR Bot Starting\nMode: {IBKR_MODE}\n{strategy_label}", broker="IBKR"
+        )
         try:
-            from core.ibkr.worker import run_ibkr_workers
+            if STRATEGY == "ORB":
+                from core.ibkr.orb_worker_ibkr import run_orb_ibkr_workers
 
-            await run_ibkr_workers()
+                await run_orb_ibkr_workers()
+            else:
+                from core.ibkr.worker import run_ibkr_workers
+
+                await run_ibkr_workers()
         except Exception as e:
             logger.exception(f"Error in IBKR worker: {e}")
             send_telegram(f"🚨 IBKR worker error: {str(e)[:100]}", broker="IBKR")
