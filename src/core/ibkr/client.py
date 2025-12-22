@@ -7,8 +7,9 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+import logging
 import pandas as pd
-from ib_async import IB, Stock, Option, util
+from ib_async import IB, Stock, Option, Index, Future, util
 
 from core.config import (
     IB_HOST,
@@ -16,8 +17,18 @@ from core.config import (
     IB_CLIENT_ID,
     IBKR_MODE,
     IBKR_PAPER_BALANCE,
+    IBKR_FUTURES_EXCHANGES,
 )
 from core.logger import logger
+
+# Map of Indices to their primary exchange
+# SPX -> CBOE, NDX -> NASDAQ
+IBKR_INDICES = {
+    "SPX": "CBOE",
+    "NDX": "NASDAQ",
+    "RUT": "CBOE",
+    "VIX": "CBOE",
+}
 
 
 class IBKRClient:
@@ -32,6 +43,77 @@ class IBKRClient:
         self.mode = IBKR_MODE
         self.paper_balance = IBKR_PAPER_BALANCE
         self.option_chains_cache = {}  # Cache option chains by symbol
+
+        # Silence ib_async/ib_insync ambiguous contract logs
+        logging.getLogger("ib_async").setLevel(logging.WARNING)
+        logging.getLogger("ib_insync").setLevel(logging.WARNING)
+
+    def _get_contract(self, symbol: str):
+        """Helper to get Stock or Index or Future contract based on symbol."""
+        if symbol in IBKR_INDICES:
+            return Index(symbol, IBKR_INDICES[symbol], "USD")
+        if symbol in IBKR_FUTURES_EXCHANGES:
+            return Future(
+                symbol=symbol, exchange=IBKR_FUTURES_EXCHANGES[symbol], currency="USD"
+            )
+        return Stock(symbol, "SMART", "USD")
+
+    async def get_front_month_contract(self, symbol: str) -> Optional[Future]:
+        """
+        Get the front-month (most active) Future contract for a symbol.
+        """
+        try:
+            if symbol not in IBKR_FUTURES_EXCHANGES:
+                logger.error(f"Symbol {symbol} not found in IBKR_FUTURES_EXCHANGES")
+                return None
+
+            exchange = IBKR_FUTURES_EXCHANGES[symbol]
+            # Create a generic future contract to request details
+            contract = Future(symbol=symbol, exchange=exchange, currency="USD")
+            details = await self.ib.reqContractDetailsAsync(contract)
+
+            if not details:
+                logger.warning(f"No contract details found for {symbol}")
+                return None
+
+            # Log candidates for debugging
+            logger.debug(f"[{symbol}] Found {len(details)} potential contract matches.")
+            for d in details:
+                logger.debug(
+                    f"  - Candidate: {d.contract.localSymbol} (conId: {d.contract.conId}, Expiry: {d.contract.lastTradeDateOrContractMonth})"
+                )
+
+            # Filter out expired contracts and sort by expiration
+            # IBKR usually returns many expiries; we want the nearest future front month
+            today_str = datetime.now().strftime("%Y%m%d")
+            valid_details = [
+                d
+                for d in details
+                if d.contract.lastTradeDateOrContractMonth >= today_str
+            ]
+
+            if not valid_details:
+                logger.warning(f"No non-expired contract details found for {symbol}")
+                valid_details = details
+
+            sorted_details = sorted(
+                valid_details, key=lambda x: x.contract.lastTradeDateOrContractMonth
+            )
+            front_month = sorted_details[0].contract
+
+            # Qualify to get conId etc.
+            qualified = await self.ib.qualifyContractsAsync(front_month)
+            if qualified:
+                logger.info(
+                    f"[{symbol}] Front month: {qualified[0].localSymbol} (Expiry: {qualified[0].lastTradeDateOrContractMonth})"
+                )
+                return qualified[0]
+
+            return None
+
+        except Exception as e:
+            logger.exception(f"Error getting front month for {symbol}: {e}")
+            return None
 
     async def connect_async(self, retry_backoff=1.0, max_backoff=60.0):
         """
@@ -76,22 +158,20 @@ class IBKRClient:
         self,
         symbol: str,
         duration_days: float = 1,
+        contract: Optional[any] = None,
     ) -> Optional[pd.DataFrame]:
         """
-        Fetch historical 1-minute candle data for a US stock.
+        Fetch historical 1-minute candle data for a US stock/index/future.
 
         Args:
-            symbol: Stock symbol (e.g., 'SPY', 'AAPL')
+            symbol: Symbol (e.g., 'SPY', 'SPX', 'ES')
             duration_days: Number of days of history to fetch
-                          Use 0.0104 for 15 minutes (15/1440)
-                          Use 1.0 for full trading day
-
-        Returns:
-            DataFrame with OHLCV data indexed by datetime (UTC)
+            contract: Optional qualified contract to avoid ambiguity
         """
         try:
-            contract = Stock(symbol, "SMART", "USD")
-            await self.ib.qualifyContractsAsync(contract)
+            if not contract:
+                contract = self._get_contract(symbol)
+                await self.ib.qualifyContractsAsync(contract)
 
             # Calculate appropriate duration string based on duration_days
             # IBKR supports: S (seconds), D (days), W (weeks), M (months), Y (years)
@@ -144,22 +224,25 @@ class IBKRClient:
             return None
 
     async def get_historical_bars_direct(
-        self, symbol: str, bar_size: str = "15 mins", duration_str: str = "1 D"
+        self,
+        symbol: str,
+        bar_size: str = "15 mins",
+        duration_str: str = "1 D",
+        contract: Optional[any] = None,
     ) -> Optional[pd.DataFrame]:
         """
         Fetch historical bars directly at specified interval (no resampling).
 
         Args:
-            symbol: Stock symbol (e.g., 'SPY', 'AAPL')
+            symbol: Symbol
             bar_size: Bar size ("5 mins", "15 mins", "1 hour", etc.)
             duration_str: Duration ("1 D" for 1 day, "2 D" for 2 days)
-
-        Returns:
-            DataFrame with OHLCV data indexed by datetime (UTC naive)
+            contract: Optional qualified contract to avoid ambiguity
         """
         try:
-            contract = Stock(symbol, "SMART", "USD")
-            await self.ib.qualifyContractsAsync(contract)
+            if not contract:
+                contract = self._get_contract(symbol)
+                await self.ib.qualifyContractsAsync(contract)
 
             logger.debug(f"[{symbol}] Requesting {duration_str} of {bar_size} bars...")
 
@@ -205,20 +288,14 @@ class IBKRClient:
         """
         Get option chain for symbol filtered by DTE range.
         Returns options for ALL expiries within the DTE range.
-
-        Args:
-            symbol: Stock symbol
-            underlying_price: Current stock price
-            min_dte: Minimum days to expiry (default 2)
-            max_dte: Maximum days to expiry (default 7)
         """
         try:
             # --- Underlying Contract ---
-            stock = Stock(symbol, "SMART", "USD")
-            await self.ib.qualifyContractsAsync(stock)
+            contract = self._get_contract(symbol)
+            await self.ib.qualifyContractsAsync(contract)
 
             chains = await self.ib.reqSecDefOptParamsAsync(
-                stock.symbol, "", stock.secType, stock.conId
+                contract.symbol, "", contract.secType, contract.conId
             )
 
             if not chains:
@@ -324,7 +401,7 @@ class IBKRClient:
         """
         try:
             if contract_type == "STOCK":
-                contract = Stock(symbol, "SMART", "USD")
+                contract = self._get_contract(symbol)
             else:
                 # For options, symbol should be the full option symbol
                 # This is simplified - would need proper parsing

@@ -49,14 +49,13 @@ async def find_current_monthly_option(
         # Determine option type
         right = "CE" if bias == "BULL" else "PE"
 
-        # Get current date
-        today = datetime.now().date()
-        current_month = today.month
-        current_year = today.year
-
         # Determine instrument type
         is_index = symbol in INDEX_FUTURES
         instrument_type = "OPTIDX" if is_index else "OPTSTK"
+
+        today = datetime.now().date()
+        current_month = today.month
+        current_year = today.year
 
         # Filter options for this underlying
         options = []
@@ -80,12 +79,21 @@ async def find_current_monthly_option(
                     except ValueError:
                         continue
 
-                # Only consider current month expiry
-                if not (
-                    expiry_date.month == current_month
-                    and expiry_date.year == current_year
-                ):
+                # Filter by expiry:
+                # 1. Skip past dates
+                if expiry_date < today:
                     continue
+
+                # 2. For stocks, only consider current month (for liquidity/stability)
+                if not is_index:
+                    if not (
+                        expiry_date.month == current_month
+                        and expiry_date.year == current_year
+                    ):
+                        continue
+
+                # 3. For indices, we allow weekly (near-term) expiries.
+                # We'll pick the nearest one later.
 
                 # Check option type (CE/PE)
                 symbol_name = instrument.get("symbol", "")
@@ -120,7 +128,8 @@ async def find_current_monthly_option(
                 )
 
         if not options:
-            return None, f"no_current_month_options_found_for_{symbol}"
+            period_type = "weekly/nearest" if is_index else "monthly"
+            return None, f"no_{period_type}_options_found_for_{symbol}"
 
         # Sort by expiry (nearest first), then by strike
         options.sort(key=lambda x: (x.expiry, abs(x.strike - underlying_price)))

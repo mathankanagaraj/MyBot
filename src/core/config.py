@@ -191,7 +191,13 @@ STRATEGY = os.getenv("STRATEGY", "MACD_EMA").upper()
 
 # ORB Symbols per broker
 ORB_ANGEL_SYMBOLS = ["NIFTY", "BANKNIFTY"]
-ORB_IBKR_SYMBOLS = ["SPX", "NDX"]  # S&P 500 and Nasdaq 100 index options (0 DTE)
+ORB_IBKR_SYMBOLS = ["ES", "NQ"]  # E-mini S&P 500 and Nasdaq 100 futures
+
+# IBKR Future Exchanges mapping
+IBKR_FUTURES_EXCHANGES = {
+    "ES": "CME",
+    "NQ": "CME",
+}
 
 # ORB Parameters
 ORB_DURATION_MINUTES = int(

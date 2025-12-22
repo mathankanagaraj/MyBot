@@ -680,6 +680,68 @@ class AngelClient:
             logger.exception(f"Error getting last price for {symbol}: {e}")
             return None
 
+    async def get_current_futures_contract(self, symbol: str) -> Optional[Dict]:
+        """
+        Get the current monthly futures contract details (symbol and token) for an index.
+
+        Args:
+            symbol: Index symbol (NIFTY or BANKNIFTY)
+
+        Returns:
+            Dict with "symbol" and "token" or None
+        """
+        try:
+            today = datetime.now().date()
+            # In India, futures expire on the last Thursday of the month.
+            # We look for the nearest expiry that is >= today.
+
+            futures = []
+            for instrument in self.scrip_master or []:
+                if (
+                    instrument.get("exch_seg") == "NFO"
+                    and instrument.get("instrumenttype") == "FUTIDX"
+                    and instrument.get("name") == symbol
+                ):
+                    expiry_str = instrument.get("expiry")
+                    if not expiry_str:
+                        continue
+
+                    try:
+                        expiry_date = datetime.strptime(expiry_str, "%d%b%Y").date()
+                    except ValueError:
+                        try:
+                            expiry_date = datetime.strptime(
+                                expiry_str, "%Y-%m-%d"
+                            ).date()
+                        except ValueError:
+                            continue
+
+                    if expiry_date >= today:
+                        futures.append(
+                            {
+                                "symbol": instrument.get("symbol"),
+                                "token": instrument.get("token"),
+                                "expiry": expiry_date,
+                            }
+                        )
+
+            if not futures:
+                logger.warning(f"No active futures found for {symbol}")
+                return None
+
+            # Sort by expiry and pick the nearest one
+            futures.sort(key=lambda x: x["expiry"])
+            nearest = futures[0]
+
+            logger.info(
+                f"[{symbol}] Near-month future selected: {nearest['symbol']} (Token: {nearest['token']}, Expiry: {nearest['expiry']})"
+            )
+            return nearest
+
+        except Exception as e:
+            logger.exception(f"Error getting futures contract for {symbol}: {e}")
+            return None
+
     async def get_futures_price(self, symbol: str) -> Optional[float]:
         """
         Get current monthly futures price for an index (NIFTY/BANKNIFTY).

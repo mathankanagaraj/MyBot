@@ -11,9 +11,8 @@ Trades Nifty 50 and Bank Nifty options using ORB strategy:
 """
 
 import asyncio
-import multiprocessing
 from datetime import datetime, time, timedelta
-from typing import Dict, Optional
+from typing import Dict
 import pytz
 
 from core.logger import logger
@@ -30,7 +29,6 @@ from core.config import (
     NSE_MARKET_CLOSE_HOUR,
     NSE_MARKET_CLOSE_MINUTE,
     ANGEL_TIMEZONE,
-    RR_RATIO,
 )
 from core.orb_signal_engine import (
     calculate_atr,
@@ -41,13 +39,14 @@ from core.orb_signal_engine import (
     check_orb_trade_allowed,
     should_force_exit,
     resample_to_timeframe,
-    get_seconds_until_next_30m_close,
+    get_seconds_until_next_candle,
 )
 from core.utils import send_telegram, write_audit_row
 from core.bar_manager import BarManager
 from core.angelone.client import AngelClient
 from core.angelone.option_selector import find_option_contract_async
 from core.angelone.utils import is_market_open, get_ist_now
+from core.scheduler import run_strategy_loop
 
 
 # -----------------------------
@@ -358,7 +357,7 @@ async def orb_signal_monitor(
             # Calculate ORB range (only once after ORB period)
             if not orb_complete:
                 orb_data = calculate_orb_range(
-                    df=df,
+                    df=df_1m,  # Use 1m bars for precision
                     market_open_time=MARKET_OPEN_TIME,
                     orb_duration_minutes=ORB_DURATION_MINUTES,
                     symbol=symbol,
@@ -378,14 +377,19 @@ async def orb_signal_monitor(
                     send_telegram(msg, broker="ANGEL")
                 else:
                     # If failed to establish ORB range and it's getting late (e.g. > 10:15 AM), abort
-                    # This prevents infinite spam if data for 09:15-09:45 is missing
                     if now.time() > time(10, 15):
                         logger.error(
                             f"[{symbol}] ❌ Failed to establish ORB range by 10:15 IST. Missing early data? Aborting for today."
                         )
                         break
 
-                    await asyncio.sleep(30)
+                    sleep_sec = get_seconds_until_next_candle(
+                        now, ORB_BREAKOUT_TIMEFRAME
+                    )
+                    logger.debug(
+                        f"[{symbol}] Waiting {sleep_sec}s for ORB completion..."
+                    )
+                    await asyncio.sleep(sleep_sec)
                     continue
 
             # Check if trade already taken
@@ -411,9 +415,28 @@ async def orb_signal_monitor(
                 await asyncio.sleep(60)
                 continue
 
-            # Detect breakout
+            # --- BREAKOUT DETECTION ON LAST CLOSED BAR ---
+            # Angel Resample uses label='right' (End Time).
+            # So a completed bar ending at 10:00 is labeled 10:00.
+            # Convert now to naive if needed, but assuming comparison works (both IST aware or naive).
+            # Robust cutoff:
+            # cutoff = now
+            # completed_bars = df[df.index <= cutoff]
+
+            # Note: df comes from resample_to_timeframe which might effectively return IST timestamps if BarManager uses IST.
+            # Assuming safe comparison.
+
+            cutoff = now
+            completed_bars = df[df.index <= cutoff]
+
+            if completed_bars.empty:
+                logger.debug(f"[{symbol}] No completed bars found yet")
+                await asyncio.sleep(30)
+                continue
+
+            # Detect breakout on the latest completed bar
             breakout_data = detect_orb_breakout(
-                df=df,
+                df=completed_bars,
                 orb_high=orb_high,
                 orb_low=orb_low,
                 symbol=symbol,
@@ -423,24 +446,15 @@ async def orb_signal_monitor(
 
             if breakout:
                 entry_price = breakout_data.get("price")
-
-                # Calculate ATR for risk
-                atr = calculate_atr(df, period=ORB_ATR_LENGTH)
-                if atr is None:
-                    logger.warning(
-                        f"[{symbol}] ATR calculation failed, using ORB-based risk"
-                    )
-                    atr = (orb_high - orb_low) / 2
-
-                # Calculate risk points
+                atr = calculate_atr(df, period=ORB_ATR_LENGTH) or (
+                    (orb_high - orb_low) / 2
+                )
                 risk_pts = calculate_orb_risk(
                     atr=atr,
                     orb_range=orb_high - orb_low,
                     atr_multiplier=ORB_ATR_MULTIPLIER,
                     symbol=symbol,
                 )
-
-                # Calculate SL/TP
                 stop_loss, take_profit = get_orb_sl_tp(
                     entry_price=entry_price,
                     direction=breakout,
@@ -461,19 +475,19 @@ async def orb_signal_monitor(
                 )
 
                 if success:
+                    ORB_TRADE_TAKEN_TODAY[symbol] = True
                     send_telegram(
-                        f"✅ ORB Breakout: {symbol} {breakout}\n"
-                        f"Entry: ₹{entry_price:.2f}\n"
-                        f"Risk: ₹{risk_pts:.2f} (ATR: ₹{atr:.2f})",
+                        f"✅ ORB Breakout (ANGEL): {symbol} {breakout}\nEntry: ₹{entry_price:.2f}",
                         broker="ANGEL",
                     )
+                    break
 
-            # Wait for next 30m candle close
-            wait_seconds = get_seconds_until_next_30m_close(now)
-            logger.debug(
-                f"[{symbol}] Waiting {wait_seconds}s for next 30m candle close"
+            # Wait for next candle close
+            sleep_sec = get_seconds_until_next_candle(now, ORB_BREAKOUT_TIMEFRAME)
+            logger.info(
+                f"[{symbol}] Analysis complete. Sleeping {sleep_sec}s until next candle close..."
             )
-            await asyncio.sleep(wait_seconds)
+            await asyncio.sleep(sleep_sec)
 
         except asyncio.CancelledError:
             logger.info(f"[{symbol}] ORB Signal Monitor cancelled")
@@ -531,14 +545,38 @@ async def _async_daily_session():
         cash_mgr = LiveCashManager(angel_client)
         await cash_mgr.check_and_log_start_balance()
 
-        # Create bar managers for each symbol
+        # Resolve current futures contracts
+        fut_contracts = {}
+        for symbol in ORB_ANGEL_SYMBOLS:
+            contract = await angel_client.get_current_futures_contract(symbol)
+            if contract:
+                fut_contracts[symbol] = contract
+            else:
+                logger.error(
+                    f"[{symbol}] Could not resolve futures contract. Using spot (NSE) as fallback."
+                )
+
+        # Create bar managers for each symbol (still keyed by NIFTY/BANKNIFTY)
         bar_managers = {symbol: BarManager(symbol) for symbol in ORB_ANGEL_SYMBOLS}
 
         # Load historical data
         for symbol, bar_mgr in bar_managers.items():
             logger.info(f"[{symbol}] Loading historical data...")
             try:
-                df_hist = await angel_client.req_historic_1m(symbol, duration_days=5)
+                # Use futures contract if available
+                if symbol in fut_contracts:
+                    fut_symbol = fut_contracts[symbol]["symbol"]
+                    logger.info(
+                        f"[{symbol}] Fetching historical data for future: {fut_symbol}"
+                    )
+                    df_hist = await angel_client.req_historic_1m(
+                        fut_symbol, duration_days=5, exchange="NFO"
+                    )
+                else:
+                    df_hist = await angel_client.req_historic_1m(
+                        symbol, duration_days=5, exchange="NSE"
+                    )
+
                 if df_hist is not None and not df_hist.empty:
                     await bar_mgr.initialize_from_historical(df_hist)
                     logger.info(f"[{symbol}] Loaded {len(df_hist)} historical bars")
@@ -560,10 +598,20 @@ async def _async_daily_session():
             )
 
             for symbol in ORB_ANGEL_SYMBOLS:
-                token = angel_client.get_symbol_token(symbol, "NSE")
+                if symbol in fut_contracts:
+                    token = fut_contracts[symbol]["token"]
+                    exchange = "NFO"
+                    disp_symbol = fut_contracts[symbol]["symbol"]
+                else:
+                    token = angel_client.get_symbol_token(symbol, "NSE")
+                    exchange = "NSE"
+                    disp_symbol = symbol
+
                 if token:
-                    ws_client.add_symbol(symbol, token, "NSE")
-                    logger.info(f"[{symbol}] Subscribed to WebSocket (Token: {token})")
+                    ws_client.add_symbol(symbol, token, exchange)
+                    logger.info(
+                        f"[{symbol}] Subscribed to WebSocket: {disp_symbol} (Token: {token}, Exch: {exchange})"
+                    )
                 else:
                     logger.error(
                         f"[{symbol}] Could not find token for WebSocket subscription"
@@ -629,9 +677,6 @@ def _run_session_in_process():
         print(f"Process error: {e}")
 
 
-from core.scheduler import run_strategy_loop
-
-
 async def run_orb_angel_workers():
     """
     Main entry point for Angel One ORB strategy workers.
@@ -640,8 +685,6 @@ async def run_orb_angel_workers():
     from core.config import (
         NSE_MARKET_OPEN_HOUR,
         NSE_MARKET_OPEN_MINUTE,
-        NSE_MARKET_CLOSE_HOUR,
-        NSE_MARKET_CLOSE_MINUTE,
     )
 
     # We use 15:30 as close if not defined (NSE standard)

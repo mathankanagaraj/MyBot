@@ -12,13 +12,11 @@ Used by both AngelOne and IBKR ORB workers.
 """
 
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta, time
 from typing import Dict, Optional, Tuple
 from core.logger import logger
 from core.config import (
     ORB_DURATION_MINUTES,
-    ORB_ATR_LENGTH,
     ORB_ATR_MULTIPLIER,
     ORB_RISK_REWARD,
 )
@@ -58,29 +56,50 @@ def resample_to_timeframe(
     return df_resampled
 
 
-def get_seconds_until_next_30m_close(now: datetime) -> int:
+def get_seconds_until_next_candle(now: datetime, timeframe_minutes: int = 30) -> int:
     """
-    Calculate seconds until the next 30-minute candle closes.
+    Calculate seconds until the next candle closes for a given timeframe.
 
     Args:
         now: Current datetime
+        timeframe_minutes: Candle timeframe in minutes (e.g., 5, 15, 30, 60)
 
     Returns:
-        Seconds until next :00 or :30 minute mark
+        Seconds until next candle close
     """
     current_minute = now.minute
     current_second = now.second
 
-    if current_minute < 30:
-        next_close_minute = 30
-    else:
-        next_close_minute = 60  # Top of next hour
+    # Calculate next close minute
+    # e.g., if now is 10:12 and timeframe is 15:
+    # 12 // 15 = 0. (0+1)*15 = 15.
+    # if now is 10:15:01. 15 // 15 = 1. (1+1)*15 = 30.
+
+    # Logic for finding next multiple of timeframe
+    next_close_minute = ((current_minute // timeframe_minutes) + 1) * timeframe_minutes
 
     minutes_remaining = next_close_minute - current_minute
+
+    # Calculate seconds
     seconds_remaining = (minutes_remaining * 60) - current_second
 
-    # Add small buffer to ensure candle is complete
+    # If next_close_minute exceeds 60 (e.g., 60, 90), it means next hour(s).
+    # The formula remains valid in terms of total seconds difference.
+    # But clean minute handling:
+    # (next_close_minute - current_minute) handles the minute diff correctly even if > 60
+    # e.g. current 45, interval 30. next = 60. diff = 15.
+    # current 12, interval 30. next = 30. diff = 18.
+
+    # Add buffer
     return max(10, seconds_remaining + 5)
+
+
+def get_seconds_until_next_30m_close(now: datetime) -> int:
+    """
+    Calculate seconds until the next 30-minute candle closes.
+    Wrapper for get_seconds_until_next_candle.
+    """
+    return get_seconds_until_next_candle(now, timeframe_minutes=30)
 
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
@@ -161,7 +180,8 @@ def calculate_orb_range(
 
     if orb_bars.empty:
         logger.debug(
-            f"[{symbol}] ORB Range: No bars in ORB period ({orb_start} to {orb_end})"
+            f"[{symbol}] ORB Range: No bars in ORB period ({orb_start} to {orb_end}). "
+            f"Data range in DF: {df.index[0]} to {df.index[-1]}"
         )
         return {"orb_high": None, "orb_low": None, "orb_complete": False}
 
@@ -275,9 +295,18 @@ def detect_orb_breakout(
     logger.info(
         f"[{symbol}]   LONG Check (Close > ORB_H AND Low > ORB_H): {'✅' if valid_long else '❌'}"
     )
+    if not valid_long and close > orb_high:
+        logger.info(
+            f"[{symbol}]   ⚠️ Partial LONG: Close is above ORB High, but Low ({low:.2f}) is still within range."
+        )
+
     logger.info(
         f"[{symbol}]   SHORT Check (Close < ORB_L AND High < ORB_L): {'✅' if valid_short else '❌'}"
     )
+    if not valid_short and close < orb_low:
+        logger.info(
+            f"[{symbol}]   ⚠️ Partial SHORT: Close is below ORB Low, but High ({high:.2f}) is still within range."
+        )
 
     if valid_long:
         logger.info(f"[{symbol}]   ✅ VALID LONG BREAKOUT DETECTED")
