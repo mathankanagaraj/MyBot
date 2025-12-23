@@ -74,40 +74,123 @@ def get_orb_end_time() -> datetime:
     orb_end = orb_start + timedelta(minutes=ORB_DURATION_MINUTES)
     return IST.localize(orb_end)
 
-
-def reset_daily_state():
-    """Reset daily tracking variables."""
-    global ORB_TRADE_TAKEN_TODAY, ORB_ACTIVE_POSITIONS
-    ORB_TRADE_TAKEN_TODAY = {symbol: False for symbol in ORB_ANGEL_SYMBOLS}
-    ORB_ACTIVE_POSITIONS = {}
     logger.info("🔄 ORB Daily state reset")
+
+
+async def is_symbol_occupied(
+    symbol: str, angel_client: AngelClient, include_local: bool = True
+) -> bool:
+    """
+    Check if a symbol is already 'occupied' by an open position or active order.
+    Ensures we don't duplicate trades on restarts.
+
+    Args:
+        symbol: The symbol to check.
+        angel_client: The Angel One client instance.
+        include_local: Whether to check local tracking (ORB_ACTIVE_POSITIONS).
+                       Set to False when detecting if a position was closed on the broker.
+    """
+    try:
+        # 1. Local state check
+        if include_local and symbol in ORB_ACTIVE_POSITIONS:
+            logger.debug(
+                f"[{symbol}] 🛡️ Symbol Shield: Occupied (Active in Local Memory). The bot is already tracking an active trade for this symbol."
+            )
+            return True
+
+        # 2. Broker Positions check
+        positions = await angel_client.get_positions()
+        for pos in positions:
+            # For Angel, we check the underlying symbol match in positions
+            # Usually positions are for the OPTION symbol, so we check if any netqty > 0
+            if int(pos.get("netqty", 0)) != 0:
+                # If we find any NFO position, we assume it's our trade for simplicity
+                # or we can check the symbol name starts with our underlying
+                if pos.get("symbolname") == symbol or pos.get(
+                    "tradingsymbol", ""
+                ).startswith(symbol):
+                    logger.debug(
+                        f"[{symbol}] 🛡️ Symbol Shield: Occupied (Broker Position Found: {pos.get('tradingsymbol')})"
+                    )
+                    return True
+
+        # 3. Broker Order Book check (pending orders)
+        order_book = await angel_client.get_order_book()
+        for order in order_book:
+            status = order.get("status", "")
+            if status in ["ordered", "trigger pending", "open"]:
+                if order.get("symbolname") == symbol or order.get(
+                    "tradingsymbol", ""
+                ).startswith(symbol):
+                    logger.debug(
+                        f"[{symbol}] 🛡️ Symbol Shield: Occupied (Open Order Found: {order.get('tradingsymbol')})"
+                    )
+                    return True
+
+        return False
+    except Exception as e:
+        logger.error(f"[{symbol}] Error checking occupancy: {e}")
+        return True  # Err on the side of caution
+
+
+async def recover_active_positions(angel_client: AngelClient):
+    """
+    Scan broker for any existing positions and populate local state.
+    """
+    try:
+        logger.info("🔍 Scanning for existing Angel positions to recover state...")
+        positions = await angel_client.get_positions()
+        for pos in positions:
+            if int(pos.get("netqty", 0)) != 0:
+                tradingsymbol = pos.get("tradingsymbol", "")
+                # Find which of our symbols this belongs to
+                for symbol in ORB_ANGEL_SYMBOLS:
+                    if tradingsymbol.startswith(symbol):
+                        logger.info(
+                            f"[{symbol}] Recovered active position: {tradingsymbol}"
+                        )
+                        ORB_ACTIVE_POSITIONS[symbol] = {
+                            "direction": (
+                                "LONG" if int(pos.get("netqty")) > 0 else "SHORT"
+                            ),
+                            "option_symbol": tradingsymbol,
+                            "qty": abs(int(pos.get("netqty"))),
+                            "entry_time": get_ist_now(),
+                        }
+                        ORB_TRADE_TAKEN_TODAY[symbol] = True
+
+                        # Send one-time notification on restart
+                        send_telegram(
+                            f"🔄 ORB Startup Recovery (ANGEL): {symbol}\n"
+                            f"Found existing {ORB_ACTIVE_POSITIONS[symbol]['direction']} position on broker. Tracking active trade.",
+                            broker="ANGEL",
+                        )
+    except Exception as e:
+        logger.error(f"Error during Angel state recovery: {e}")
 
 
 async def wait_for_orb_complete():
     """Wait until ORB period is complete."""
     orb_end = get_orb_end_time()
-    now = get_ist_now()
 
-    if now >= orb_end:
-        logger.info("✅ ORB period already complete")
-        return True
+    while not _STOP_EVENT.is_set():
+        now = get_ist_now()
+        if now >= orb_end:
+            logger.info("✅ ORB period complete")
+            return True
 
-    wait_seconds = (orb_end - now).total_seconds()
-    logger.info(
-        f"⏳ Waiting {wait_seconds:.0f}s for ORB period to complete ({orb_end.strftime('%H:%M')} IST)"
-    )
+        remaining = (orb_end - now).total_seconds()
+        # Wait in small chunks to allow responsiveness
+        wait_chunk = min(60, remaining)
 
-    send_telegram(
-        f"📊 ORB Strategy: Building opening range until {orb_end.strftime('%H:%M')} IST\n"
-        f"Symbols: {', '.join(ORB_ANGEL_SYMBOLS)}",
-        broker="ANGEL",
-    )
-
-    try:
-        await asyncio.wait_for(asyncio.shield(_STOP_EVENT.wait()), timeout=wait_seconds)
-        return False  # Stop event was set
-    except asyncio.TimeoutError:
-        return True  # ORB period complete
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(_STOP_EVENT.wait()), timeout=wait_chunk
+            )
+            return False  # Stop event was set
+        except asyncio.TimeoutError:
+            continue
+    return False
 
 
 # -----------------------------
@@ -140,6 +223,12 @@ async def execute_orb_entry(
     try:
         # Determine option type
         option_type = "CE" if direction == "LONG" else "PE"
+
+        if await is_symbol_occupied(symbol, angel_client):
+            logger.warning(
+                f"[{symbol}] Aborting entry: Symbol is already occupied by a position or open order."
+            )
+            return False
 
         logger.info(f"[{symbol}] 📥 ORB ENTRY: {direction} at {entry_price:.2f}")
         logger.info(f"[{symbol}]   Option Type: {option_type}")
@@ -176,22 +265,55 @@ async def execute_orb_entry(
             logger.error(f"[{symbol}] Failed to get option LTP")
             return False
 
-        # Calculate quantity based on cash allocation
-        available_margin = await cash_mgr.get_available_margin()
+        # Calculate quantity based on cash allocation (70% of initial balance rule)
+        available_exposure = await cash_mgr.available_exposure()
 
+        # We allocate a portion of the available exposure to this specific trade
+        # For example, if we have 7 symbols, we might want to split the 70% allocation.
+        # But the USER said "use only 70% balance from the initial cash" for the order.
+        # So we'll use the available exposure directly for this order's capacity.
         qty = max(
             1,
-            int(available_margin * 0.3 / (option_ltp * option_selection.lot_size)),
+            int(available_exposure / (option_ltp * option_selection.lot_size)),
+        )
+
+        # Calculate SL/TP in option premium points using a Delta approximation (0.7 for ITM)
+        # logic: option_ltp ± (underlying_points_distance * delta)
+        delta = 0.7
+        underlying_risk_pts = abs(entry_price - stop_loss)
+
+        # 1. Technical (Technical points based)
+        tech_option_sl = option_ltp - (underlying_risk_pts * delta)
+
+        # 2. Risk Management (Cap risk at 50% of premium)
+        max_premium_risk_pct = 0.50
+        min_option_sl = option_ltp * (1 - max_premium_risk_pct)
+
+        # Final Option SL: Technical with a Floor
+        option_sl_price = max(
+            tech_option_sl, min_option_sl, 0.1
+        )  # 0.1 is absolute floor for Angel
+
+        # 3. Recalibrate TP based on the REALIZED premium risk and RR ratio (ORB_RISK_REWARD)
+        realized_premium_risk = option_ltp - option_sl_price
+        option_tp_price = option_ltp + (realized_premium_risk * ORB_RISK_REWARD)
+
+        logger.info(f"[{symbol}] 📋 REALISTIC OPTION LEVELS")
+        logger.info(f"[{symbol}]   Premium Entry: ₹{option_ltp:.2f}")
+        logger.info(
+            f"[{symbol}]   Premium Risk: ₹{realized_premium_risk:.2f} (Capped at {max_premium_risk_pct*100}%)"
+        )
+        logger.info(
+            f"[{symbol}]   Option SL Price: ₹{option_sl_price:.2f}, TP: ₹{option_tp_price:.2f} (RR: 1:{ORB_RISK_REWARD})"
         )
 
         # Place bracket order
         order_result = await angel_client.place_bracket_order(
-            symbol=option_selection.symbol,
-            token=option_selection.token,
-            qty=qty * option_selection.lot_size,
-            side="BUY",
-            stop_loss_pct=abs(stop_loss - entry_price) / entry_price,
-            take_profit_pct=abs(take_profit - entry_price) / entry_price,
+            option_symbol=option_selection.symbol,
+            option_token=option_selection.token,
+            quantity=qty * option_selection.lot_size,
+            stop_loss_price=round(option_sl_price, 1),
+            target_price=round(option_tp_price, 1),
         )
 
         if order_result and order_result.get("status") == "success":
@@ -337,8 +459,48 @@ async def orb_signal_monitor(
             if should_force_exit(
                 now, MARKET_CLOSE_TIME, exit_before_minutes=15, symbol=symbol
             ):
+                logger.warning(f"[{symbol}] EOD Force exit time reached")
+                send_telegram(
+                    f"🕒 [{symbol}] ORB Strategy: EOD Force exit time reached (15:15 IST)",
+                    broker="ANGEL",
+                )
                 await force_exit_position(symbol, angel_client, reason="EOD")
                 break
+
+            # --- PROACTIVE SYMBOL SHIELD ---
+            # We only perform the 'shield' check if we haven't officially marked the trade as taken today.
+            if not ORB_TRADE_TAKEN_TODAY.get(symbol, False):
+                if await is_symbol_occupied(symbol, angel_client):
+                    logger.info(
+                        f"[{symbol}] 🛡️ Symbol Shield: Occupancy found (Position/Order on Broker). Marking trade as taken today."
+                    )
+                    ORB_TRADE_TAKEN_TODAY[symbol] = True
+
+            # If trade taken, just sleep and check for EOD exit
+            if ORB_TRADE_TAKEN_TODAY.get(symbol, False):
+                # Check if position was actively closed on broker (occupied returns false while trade_taken is true)
+                # CRITICAL: We pass include_local=False to check the actual broker state.
+                if not await is_symbol_occupied(
+                    symbol, angel_client, include_local=False
+                ):
+                    if symbol in ORB_ACTIVE_POSITIONS:
+                        logger.info(
+                            f"[{symbol}] 🏁 Trade detected as CLOSED on broker side."
+                        )
+                        send_telegram(
+                            f"🏁 ORB Trade Closed (ANGEL): {symbol}. Position cleared on broker.",
+                            broker="ANGEL",
+                        )
+                        del ORB_ACTIVE_POSITIONS[symbol]
+
+                # Check for EOD exit
+                if should_force_exit(
+                    now, MARKET_CLOSE_TIME, exit_before_minutes=15, symbol=symbol
+                ):
+                    await force_exit_position(symbol, angel_client, reason="EOD")
+                    break
+                await asyncio.sleep(60)
+                continue
 
             # Get historical data and resample to 30m for breakout detection
             df_1m = await bar_manager.get_bars_df(lookback_minutes=180)
@@ -411,6 +573,10 @@ async def orb_signal_monitor(
             if not allowed:
                 if reason == "past_max_entry_hour":
                     logger.info(f"[{symbol}] Past max entry hour, stopping monitor")
+                    send_telegram(
+                        f"🏁 [{symbol}] ORB Strategy: Past max entry hour ({ORB_MAX_ENTRY_HOUR}:00). Stopping monitor for today.",
+                        broker="ANGEL",
+                    )
                     break
                 await asyncio.sleep(60)
                 continue
@@ -539,11 +705,18 @@ async def _async_daily_session():
         from core.angelone.client import AngelWebSocket
         import threading
 
+        # CRITICAL: Re-initialize stop event in the new process's event loop
+        global _STOP_EVENT
+        _STOP_EVENT = asyncio.Event()
+
         angel_client = AngelClient()
         await angel_client.connect_async()
 
         cash_mgr = LiveCashManager(angel_client)
         await cash_mgr.check_and_log_start_balance()
+
+        # Startup Recovery: Scan for existing positions
+        await recover_active_positions(angel_client)
 
         # Resolve current futures contracts
         fut_contracts = {}
@@ -638,8 +811,13 @@ async def _async_daily_session():
 
             if tasks:
                 await asyncio.gather(*tasks)
+
+            send_telegram(
+                "✅ ORB Daily Session: All symbol monitors finished.", broker="ANGEL"
+            )
         else:
             logger.info("ORB wait aborted (Bot stopping)")
+            send_telegram("⚠️ ORB Daily Session: Aborted during wait.", broker="ANGEL")
 
     except Exception as e:
         logger.error(f"Error in daily monitoring session: {e}", exc_info=True)

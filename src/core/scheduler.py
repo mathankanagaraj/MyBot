@@ -174,6 +174,12 @@ async def run_strategy_loop(
                 f"💤 Daily cycle complete. Sleeping {wait_hours:.2f}h until {next_start.strftime('%d-%b %H:%M')}"
             )
 
+            send_telegram(
+                f"💤 Daily cycle complete ({broker_name} {strategy_name}).\n"
+                f"Market is closed. Sleeping until {next_start.strftime('%d-%b %H:%M')}.",
+                broker=broker_name,
+            )
+
             try:
                 await asyncio.wait_for(
                     asyncio.shield(stop_event.wait()), timeout=wait_sec

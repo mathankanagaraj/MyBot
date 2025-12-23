@@ -12,6 +12,7 @@ Trades SPX and NDX index options using ORB strategy:
 """
 
 import asyncio
+import math
 from datetime import datetime, time, timedelta
 from typing import Dict, Optional
 import pytz
@@ -49,6 +50,7 @@ from core.utils import send_telegram
 from core.ibkr.client import IBKRClient
 from core.ibkr.utils import is_us_market_open, get_us_et_now
 from core.scheduler import run_strategy_loop
+from core.cash_manager import LiveCashManager
 
 
 # -----------------------------
@@ -79,37 +81,116 @@ def get_orb_end_time() -> datetime:
 
 def reset_daily_state():
     """Reset daily tracking variables."""
-    global ORB_TRADE_TAKEN_TODAY, ORB_ACTIVE_POSITIONS
-    ORB_TRADE_TAKEN_TODAY = {symbol: False for symbol in ORB_IBKR_SYMBOLS}
-    ORB_ACTIVE_POSITIONS = {}
     logger.info("🔄 ORB Daily state reset (IBKR)")
 
 
-async def wait_for_orb_complete():
-    """Wait until ORB period is complete."""
-    orb_end = get_orb_end_time()
-    now = get_us_et_now()
+async def is_symbol_occupied(
+    symbol: str, ibkr_client: IBKRClient, include_local: bool = True
+) -> bool:
+    """
+    Check if a symbol is already 'occupied' by an open position or active order.
+    Ensures we don't double-dip or place redundant orders after restarts.
 
-    if now >= orb_end:
-        logger.info("✅ ORB period already complete")
-        return True
-
-    wait_seconds = (orb_end - now).total_seconds()
-    logger.info(
-        f"⏳ Waiting {wait_seconds:.0f}s for ORB period to complete ({orb_end.strftime('%H:%M')} ET)"
-    )
-
-    send_telegram(
-        f"📊 ORB Strategy (IBKR): Building opening range until {orb_end.strftime('%H:%M')} ET\n"
-        f"Symbols: {', '.join(ORB_IBKR_SYMBOLS)}",
-        broker="IBKR",
-    )
-
+    Args:
+        symbol: The symbol to check.
+        ibkr_client: The IBKR client instance.
+        include_local: Whether to check local tracking (ORB_ACTIVE_POSITIONS).
+                       Set to False when detecting if a position was closed on the broker.
+    """
     try:
-        await asyncio.wait_for(asyncio.shield(_STOP_EVENT.wait()), timeout=wait_seconds)
-        return False  # Stop event was set
-    except asyncio.TimeoutError:
-        return True  # ORB period complete
+        # 1. Check local state first
+        if include_local and symbol in ORB_ACTIVE_POSITIONS:
+            # Use debug level for repetitive logs to reduce noise
+            logger.debug(
+                f"[{symbol}] 🛡️ Symbol Shield: Occupied (Active in Local Memory). The bot is already tracking an active trade for this symbol."
+            )
+            return True
+
+        # 2. Check Broker Positions
+        positions = await ibkr_client.get_positions()
+        for pos in positions:
+            if pos.get("symbol") == symbol and abs(pos.get("position", 0)) > 0:
+                logger.debug(
+                    f"[{symbol}] 🛡️ Symbol Shield: Occupied (Broker Position Found)"
+                )
+                # Re-link contract if missing
+                if symbol not in ORB_ACTIVE_POSITIONS:
+                    ORB_ACTIVE_POSITIONS[symbol] = {"contract": pos.get("contract")}
+                return True
+
+        # 3. Check Broker Open Orders (Trades)
+        trades = await ibkr_client.get_open_orders()
+        for trade in trades:
+            if trade.contract.symbol == symbol and not trade.isDone():
+                logger.debug(
+                    f"[{symbol}] 🛡️ Symbol Shield: Occupied (Open Order/Trade Found)"
+                )
+                return True
+
+        return False
+    except Exception as e:
+        logger.error(f"[{symbol}] Error checking occupancy: {e}")
+        return True  # Err on the side of caution
+
+
+async def recover_active_positions(ibkr_client: IBKRClient):
+    """
+    Scan broker for any existing ORB-relevant positions and populate local state.
+    Called on startup to prevent duplicates.
+    """
+    try:
+        logger.info("🔍 Scanning for existing positions to recover state...")
+        positions = await ibkr_client.get_positions()
+        for pos in positions:
+            symbol = pos.get("symbol")
+            if symbol in ORB_IBKR_SYMBOLS and abs(pos.get("position", 0)) > 0:
+                logger.info(f"[{symbol}] Recovered active position from broker")
+                ORB_ACTIVE_POSITIONS[symbol] = {
+                    "direction": "LONG" if pos.get("position") > 0 else "SHORT",
+                    "option_contract": pos.get("contract"),
+                    "qty": abs(pos.get("position")),
+                    "entry_time": get_us_et_now(),
+                }
+                ORB_TRADE_TAKEN_TODAY[symbol] = True
+
+                # Send one-time notification on restart
+                send_telegram(
+                    f"🔄 ORB Startup Recovery (IBKR): {symbol}\n"
+                    f"Found existing {ORB_ACTIVE_POSITIONS[symbol]['direction']} position on broker. Tracking active trade.",
+                    broker="IBKR",
+                )
+    except Exception as e:
+        logger.error(f"Error during state recovery: {e}")
+
+
+async def wait_for_orb_complete(ibkr_client: IBKRClient):
+    """Wait until ORB period is complete with connection monitoring."""
+    orb_end = get_orb_end_time()
+
+    while not _STOP_EVENT.is_set():
+        now = get_us_et_now()
+        if now >= orb_end:
+            logger.info("✅ ORB period complete")
+            return True
+
+        # Check connection health
+        if not ibkr_client.ib.isConnected():
+            logger.warning("⚠️ IBKR connection lost during ORB wait. Reconnecting...")
+            await ibkr_client.connect_async()
+
+        remaining = (orb_end - now).total_seconds()
+        # Wait in small chunks to allow connection checking but also respond to stop event
+        wait_chunk = min(60, remaining)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(_STOP_EVENT.wait()), timeout=wait_chunk
+            )
+            return False  # Stop event was set
+        except asyncio.TimeoutError:
+            # Continue loop to check connection and time
+            continue
+    return False
 
 
 async def get_0dte_option_chain(
@@ -124,8 +205,8 @@ async def get_0dte_option_chain(
 
     Args:
         ibkr_client: IBKR client
-        symbol: ES, NQ, SPX, or NDX
-        underlying_contract: Qualified Index or Future contract
+        symbol: ES, NQ, SPX, NDX, or Stock symbol (NVDA, etc.)
+        underlying_contract: Qualified Index, Future, or Stock contract
         underlying_price: Current underlying price
         right: "C" for call, "P" for put
 
@@ -140,17 +221,23 @@ async def get_0dte_option_chain(
         else:
             # Get option chain with 3 retries
             chains = None
-            target_exchange = "CBOE" if underlying_contract.secType == "IND" else "CME"
+            if underlying_contract.secType == "IND":
+                query_exchange = "CBOE"
+            elif underlying_contract.secType == "FUT":
+                query_exchange = "CME"
+            else:
+                query_exchange = ""  # Empty for stocks to get all exchanges
+
             for attempt in range(1, 4):
                 try:
                     logger.debug(
-                        f"[{symbol}] Requesting option chains (Attempt {attempt}/3) for {underlying_contract.secType} (conId: {underlying_contract.conId}) exchange={target_exchange}..."
+                        f"[{symbol}] Requesting option chains (Attempt {attempt}/3) for {underlying_contract.secType} (conId: {underlying_contract.conId}) exchange={query_exchange}..."
                     )
                     # Narrowing by exchange helps performance and avoids timeouts
                     chains = await asyncio.wait_for(
                         ibkr_client.ib.reqSecDefOptParamsAsync(
                             underlying_contract.symbol,
-                            target_exchange,
+                            query_exchange,
                             underlying_contract.secType,
                             underlying_contract.conId,
                         ),
@@ -226,12 +313,22 @@ async def get_0dte_option_chain(
             return None
 
         # Aggregate all available expiries and their trading classes across all matching chains
-        target_exchange = "CBOE" if underlying_contract.secType == "IND" else "CME"
+        if underlying_contract.secType == "IND":
+            target_exchange = "CBOE"
+        elif underlying_contract.secType == "FUT":
+            target_exchange = "CME"
+        else:
+            # For Stocks, the exchange field in the Option Chain results varies (AMEX, PHLX, etc.)
+            # We want to aggregate from all of them, or just use SMART for the contract later.
+            # Here we set a 'preferred' exchange to filter results if many are returned.
+            target_exchange = ""
+
         expiries_map = {}  # expiry -> list of tradingClasses
         strikes_set = set()
 
         for c in chains:
-            if c.exchange == target_exchange:
+            # If target_exchange is empty, we accept all chains (good for stocks)
+            if not target_exchange or c.exchange == target_exchange:
                 for exp in c.expirations:
                     if exp not in expiries_map:
                         expiries_map[exp] = []
@@ -266,19 +363,36 @@ async def get_0dte_option_chain(
                 f"[{symbol}] Using nearest expiry: {today} (Class: {selected_trading_class})"
             )
 
-        # Find ATM strike
+        # Find ITM strike (one level ahead)
         strikes = sorted(list(strikes_set))
         if not strikes:
             return None
-        atm_strike = min(strikes, key=lambda x: abs(x - underlying_price))
+
+        if right == "C":
+            # For Calls: Pick the highest strike below underlying price
+            itm_strikes = [s for s in strikes if s < underlying_price]
+            atm_strike = itm_strikes[-1] if itm_strikes else strikes[0]
+        else:
+            # For Puts: Pick the lowest strike above underlying price
+            itm_strikes = [s for s in strikes if s > underlying_price]
+            atm_strike = itm_strikes[0] if itm_strikes else strikes[-1]
 
         logger.info(
-            f"[{symbol}] Selected Option: Strike={atm_strike}, Expiry={today}, Right={right}, Class={selected_trading_class}, Exchange={target_exchange}"
+            f"[{symbol}] Selected ITM Option: Strike={atm_strike}, Expiry={today}, Right={right}, Class={selected_trading_class}, Exchange={target_exchange}"
         )
 
         # Create option contract
-        if underlying_contract.secType == "IND":
-            option = Option(symbol, today, atm_strike, right, "SMART", multiplier="100")
+        if underlying_contract.secType in ["IND", "STK"]:
+            option = Option(
+                symbol=symbol,
+                lastTradeDateOrContractMonth=today,
+                strike=atm_strike,
+                right=right,
+                exchange="SMART",
+                multiplier="100",  # Standard for US Options
+                currency="USD",
+                tradingClass=selected_trading_class,
+            )
         else:
             # For FuturesOptions, specifying tradingClass is CRITICAL to avoid ambiguity (ES vs EW3)
             option = FuturesOption(
@@ -293,7 +407,39 @@ async def get_0dte_option_chain(
         qualified = await ibkr_client.ib.qualifyContractsAsync(option)
 
         if not qualified:
-            logger.error(f"[{symbol}] Failed to qualify option contract: {option}")
+            logger.warning(
+                f"[{symbol}] ⚠️ Failed to qualify option with full parameters. Trying aggressive fallback (relaxing Exchange/Class)..."
+            )
+            # Aggressive Fallback: Omit tradingClass and exchange, let IBKR search SMART
+            option.tradingClass = ""
+            option.exchange = (
+                "SMART"
+                if underlying_contract.secType in ["IND", "STK"]
+                else option.exchange
+            )
+            qualified = await ibkr_client.ib.qualifyContractsAsync(option)
+
+        if not qualified:
+            logger.warning(
+                f"[{symbol}] ⚠️ Final fallback: Attempting Nuclear Discovery (Broadest Search)..."
+            )
+            # Nuclear Fallback for stocks: Strip everything but the essentials
+            # This allows IBKR to return whatever it finds for that symbol/expiry/strike
+            option.exchange = "SMART"
+            option.tradingClass = ""
+            option.multiplier = ""  # Often fixes qualification issues for stocks
+
+            details = await ibkr_client.ib.reqContractDetailsAsync(option)
+            if details:
+                qualified = [details[0].contract]
+                logger.info(
+                    f"[{symbol}] ✅ Found matching contract via discovery: {qualified[0].localSymbol} (Details: {len(details)} matches)"
+                )
+
+        if not qualified:
+            logger.error(
+                f"[{symbol}] ❌ Failed to qualify option contract after all fallbacks: {option}"
+            )
             return None
 
         return {
@@ -319,25 +465,39 @@ async def execute_orb_entry(
     stop_loss: float,
     take_profit: float,
     ibkr_client: IBKRClient,
+    cash_mgr: LiveCashManager,
     quantity: int = IBKR_QUANTITY,
+    underlying=None,
 ) -> bool:
     """
-    Execute ORB entry order with SL/TP for IBKR.
+    Execute ORB entry order with SL/TP.
 
     Args:
-        symbol: Trading symbol (SPX, NDX)
-        direction: "LONG" or "SHORT"
-        entry_price: Entry price (index level)
-        stop_loss: Stop loss price
-        take_profit: Take profit price
-        ibkr_client: IBKR client
+           symbol: Trading symbol (SPX, NDX)
+           direction: "LONG" or "SHORT"
+           entry_price: Entry price (index level)
+           stop_loss: Stop loss price
+           take_profit: Take profit price
+           ibkr_client: IBKR client
 
-    Returns:
-        True if order placed successfully
+       Returns:
+           True if order placed successfully
     """
     try:
         # Determine option type
         option_right = "C" if direction == "LONG" else "P"
+
+        # The Shield check is now done proactively in the monitor loop.
+        # This check serves as a final safety guard.
+        if await is_symbol_occupied(symbol, ibkr_client):
+            logger.warning(
+                f"[{symbol}] 🛡️ Symbol Shield: BLOCKING Entry. Symbol is already active in a position or open order."
+            )
+            return False
+
+        logger.info(
+            f"[{symbol}] 🛡️ Symbol Shield: CLEAR for Entry. No existing positions or orders found."
+        )
 
         logger.info(f"[{symbol}] 📥 ORB ENTRY: {direction} at {entry_price:.2f}")
         logger.info(
@@ -345,12 +505,16 @@ async def execute_orb_entry(
         )
         logger.info(f"[{symbol}]   SL: {stop_loss:.2f}, TP: {take_profit:.2f}")
 
-        # Get underlying contract (Index or Future)
-        if symbol in ["ES", "NQ"]:
-            underlying = await ibkr_client.get_front_month_contract(symbol)
-        else:
-            underlying = Index(symbol, "CBOE", "USD")
-            await ibkr_client.ib.qualifyContractsAsync(underlying)
+        # Use cached underlying
+        if not underlying:
+            # Last ditch effort if it failed at startup
+            if symbol in ["ES", "NQ"]:
+                underlying = await ibkr_client.get_front_month_contract(symbol)
+            else:
+                from ib_async import Stock
+
+                underlying = Stock(symbol, "SMART", "USD")
+                await ibkr_client.ib.qualifyContractsAsync(underlying)
 
         if not underlying:
             logger.error(f"[{symbol}] Failed to get underlying contract")
@@ -385,29 +549,136 @@ async def execute_orb_entry(
         option_contract = option_data["contract"]
 
         # Get option price for SL/TP calculation
+        option_price = None
         ibkr_client.ib.reqMktData(option_contract, "", False, False)
-        await asyncio.sleep(1)
-        option_ticker = ibkr_client.ib.ticker(option_contract)
-        option_price = option_ticker.last or option_ticker.close or option_ticker.bid
 
-        if not option_price:
-            logger.error(f"[{symbol}] Failed to get option price")
+        # Try up to 5 times to get a valid price (checks Last, Mid, then Model)
+        for attempt in range(1, 6):
+            await asyncio.sleep(0.5 * attempt)
+            option_ticker = ibkr_client.ib.ticker(option_contract)
+
+            # 1. Try Last price
+            if option_ticker.last and not math.isnan(option_ticker.last):
+                option_price = option_ticker.last
+                logger.debug(f"[{symbol}] Identified Last price: {option_price}")
+                break
+
+            # 2. Try Mid price (Bid/Ask)
+            if (
+                option_ticker.bid
+                and option_ticker.ask
+                and not math.isnan(option_ticker.bid)
+                and not math.isnan(option_ticker.ask)
+            ):
+                option_price = (option_ticker.bid + option_ticker.ask) / 2
+                logger.debug(f"[{symbol}] Identified Mid price: {option_price}")
+                break
+
+            # 3. Try Model price
+            if (
+                option_ticker.modelOptComp
+                and option_ticker.modelOptComp.modelPrice
+                and not math.isnan(option_ticker.modelOptComp.modelPrice)
+            ):
+                option_price = option_ticker.modelOptComp.modelPrice
+                logger.debug(f"[{symbol}] Identified Model price: {option_price}")
+                break
+
+            logger.warning(
+                f"[{symbol}] Option price retrieval attempt {attempt}/5 failed (Ticker: {option_ticker})"
+            )
+
+        if option_price is None or math.isnan(option_price) or option_price <= 0:
+            logger.error(
+                f"[{symbol}] ❌ Failed to get valid option price after retries. Aborting trade entry."
+            )
             return False
 
-        logger.info(f"[{symbol}]   Option Price: ${option_price:.2f}")
+        logger.info(f"[{symbol}]   Final Option Price: ${option_price:.2f}")
 
-        # Calculate SL/TP in option price terms
-        # Using the risk/reward ratio on the underlying to set option SL/TP
-        risk_pct = abs(stop_loss - entry_price) / entry_price
-        reward_pct = abs(take_profit - entry_price) / entry_price
+        # Calculate SL/TP in option price terms using a Delta approximation (0.7 for ITM)
+        # logic: option_price ± (underlying_points_distance * delta)
+        delta = 0.7
+        underlying_risk_pts = abs(entry_price - stop_loss)
 
-        option_sl = option_price * (1 - risk_pct)
-        option_tp = option_price * (1 + reward_pct)
+        # 1. Technical (Technical points based)
+        tech_option_sl = option_price - (underlying_risk_pts * delta)
 
-        logger.info(f"[{symbol}]   Option SL: ${option_sl:.2f}, TP: ${option_tp:.2f}")
+        # 2. Risk Management (Cap risk at 50% of premium)
+        max_premium_risk_pct = 0.50
+        min_option_sl = option_price * (1 - max_premium_risk_pct)
+
+        # Final Option SL: Technical with a Floor
+        option_sl = max(tech_option_sl, min_option_sl)
+
+        # 3. Recalibrate TP based on the REALIZED premium risk and RR ratio
+        # This ensures the target is realistic relative to the risk taken on the premium
+        realized_premium_risk = option_price - option_sl
+        option_tp = option_price + (realized_premium_risk * ORB_RISK_REWARD)
+
+        # --- TICK SIZE & SL FLOOR ---
+        # Get minimum tick size for the contract
+        details = await ibkr_client.ib.reqContractDetailsAsync(option_contract)
+        min_tick = details[0].minTick if details else 0.05
+
+        # Round to nearest tick
+        option_sl = round(option_sl / min_tick) * min_tick
+        option_tp = round(option_tp / min_tick) * min_tick
+
+        # Ensure SL is at least min_tick
+        option_sl = max(min_tick, option_sl)
+
+        logger.info(f"[{symbol}] 📋 REALISTIC OPTION LEVELS")
+        logger.info(f"[{symbol}]   Premium Entry: ${option_price:.2f}")
+        logger.info(
+            f"[{symbol}]   Premium Risk: ${realized_premium_risk:.2f} (Capped at {max_premium_risk_pct*100}%)"
+        )
+        logger.info(
+            f"[{symbol}]   Option SL Price: ${option_sl:.2f}, TP: ${option_tp:.2f} (RR: 1:{ORB_RISK_REWARD})"
+        )
+
+        # --- CAPITAL MANAGER (70% Rule) ---
+        available_exposure = await cash_mgr.available_exposure()
+
+        # We use the available exposure to determine the quantity
+        # Cost = option_price * qty * 100
+        qty = quantity
+        trade_cost = option_price * qty * 100
+
+        logger.info(
+            f"[{symbol}] 🛡️ Risk Guard: Checking capital allocation (70% rule)..."
+        )
+        logger.info(
+            f"[{symbol}] 🛡️ Risk Guard: Trade Cost ${trade_cost:.2f} | Available 70% Limit ${available_exposure:.2f} | Trading Qty {qty}"
+        )
+
+        if trade_cost > available_exposure:
+            logger.warning(
+                f"[{symbol}] 🛡️ Risk Guard: Trade cost ${trade_cost:.2f} exceeds 70% allocation limit of ${available_exposure:.2f}"
+            )
+            # Scale down to 1 if possible
+            if qty > 1:
+                qty = 1
+                trade_cost = option_price * qty * 100
+                if trade_cost > available_exposure:
+                    return False
+                logger.info(
+                    f"[{symbol}] 🛡️ Risk Guard: Scaled down qty to {qty} to fit allocation limit."
+                )
+            else:
+                return False
+
+        # Additional balance check
+        balance_info = await cash_mgr.get_account_balance()
+        if trade_cost > balance_info["available_funds"]:
+            logger.error(
+                f"[{symbol}] 🛡️ Risk Guard: Insufficient raw cash for trade: Need ${trade_cost:.2f}, Have ${balance_info['available_funds']:.2f}"
+            )
+            return False
+
+        logger.info(f"[{symbol}] 🛡️ Risk Guard: PASS. Order proceed.")
 
         # Place bracket order
-        qty = quantity
 
         order_result = await ibkr_client.place_bracket_order(
             option_contract=option_contract,
@@ -416,7 +687,7 @@ async def execute_orb_entry(
             target_price=round(option_tp, 2),
         )
 
-        if order_result and order_result.get("parent_trade"):
+        if order_result and order_result.get("status") == "success":
             # Track position
             ORB_ACTIVE_POSITIONS[symbol] = {
                 "direction": direction,
@@ -443,7 +714,13 @@ async def execute_orb_entry(
 
             return True
         else:
-            logger.error(f"[{symbol}] ORB Entry order failed: {order_result}")
+            reason = (
+                order_result.get("error", "Unknown rejection")
+                if order_result
+                else "Submission failed"
+            )
+            logger.error(f"[{symbol}] ORB Entry order failed: {reason}")
+            send_telegram(f"❌ ORB Entry Rejected ({symbol}): {reason}", broker="IBKR")
             return False
 
     except Exception as e:
@@ -508,6 +785,7 @@ async def force_exit_position(
 async def orb_signal_monitor(
     symbol: str,
     ibkr_client: IBKRClient,
+    cash_mgr: LiveCashManager,
 ):
     """
     Monitor for ORB breakout signals for a symbol.
@@ -518,11 +796,16 @@ async def orb_signal_monitor(
     """
     logger.info(f"[{symbol}] 📊 ORB Signal Monitor started")
 
-    # Get underlying contract (Front month for futures)
+    # Get underlying contract (Index, Future, or Stock)
     if symbol in ["ES", "NQ"]:
         underlying = await ibkr_client.get_front_month_contract(symbol)
-    else:
+    elif symbol in ["SPX", "NDX"]:
         underlying = Index(symbol, "CBOE", "USD")
+        await ibkr_client.ib.qualifyContractsAsync(underlying)
+    else:
+        from ib_async import Stock
+
+        underlying = Stock(symbol, "SMART", "USD")
         await ibkr_client.ib.qualifyContractsAsync(underlying)
 
     if not underlying:
@@ -537,7 +820,46 @@ async def orb_signal_monitor(
 
     while not _STOP_EVENT.is_set():
         try:
+            # Ensure connection is active
+            await ibkr_client.ensure_connected()
+
             now = get_us_et_now()
+
+            # --- PROACTIVE SYMBOL SHIELD ---
+            # We only perform the 'shield' check if we haven't officially marked the trade as taken today.
+            # This avoids redundant logging once we are already in 'monitoring' mode.
+            if not ORB_TRADE_TAKEN_TODAY.get(symbol, False):
+                if await is_symbol_occupied(symbol, ibkr_client):
+                    logger.info(
+                        f"[{symbol}] 🛡️ Symbol Shield: Occupancy found (Position/Order on Broker). Marking trade as taken today."
+                    )
+                    ORB_TRADE_TAKEN_TODAY[symbol] = True
+
+            # If trade taken, just sleep and check for EOD exit
+            if ORB_TRADE_TAKEN_TODAY.get(symbol, False):
+                # Check if position was actively closed on broker (occupied returns false while trade_taken is true)
+                # CRITICAL: We pass include_local=False to check the actual broker state.
+                if not await is_symbol_occupied(
+                    symbol, ibkr_client, include_local=False
+                ):
+                    if symbol in ORB_ACTIVE_POSITIONS:
+                        logger.info(
+                            f"[{symbol}] 🏁 Trade detected as CLOSED on broker side."
+                        )
+                        send_telegram(
+                            f"🏁 ORB Trade Closed (IBKR): {symbol}. Position cleared on broker.",
+                            broker="IBKR",
+                        )
+                        del ORB_ACTIVE_POSITIONS[symbol]
+
+                # Check for EOD exit even if trade taken
+                if should_force_exit(
+                    now, MARKET_CLOSE_TIME, exit_before_minutes=15, symbol=symbol
+                ):
+                    await force_exit_position(symbol, ibkr_client, reason="EOD")
+                    break
+                await asyncio.sleep(60)
+                continue
 
             # Check if market is open
             if not is_us_market_open():
@@ -549,6 +871,11 @@ async def orb_signal_monitor(
             if should_force_exit(
                 now, MARKET_CLOSE_TIME, exit_before_minutes=15, symbol=symbol
             ):
+                logger.warning(f"[{symbol}] EOD Force exit time reached")
+                send_telegram(
+                    f"🕒 [{symbol}] ORB Strategy (IBKR): EOD Force exit time reached (15:45 ET)",
+                    broker="IBKR",
+                )
                 await force_exit_position(symbol, ibkr_client, reason="EOD")
                 break
 
@@ -630,6 +957,10 @@ async def orb_signal_monitor(
             if not allowed:
                 if reason == "past_max_entry_hour":
                     logger.info(f"[{symbol}] Past max entry hour, stopping monitor")
+                    send_telegram(
+                        f"🏁 [{symbol}] ORB Strategy (IBKR): Past max entry hour ({ORB_MAX_ENTRY_HOUR}:00). Stopping monitor for today.",
+                        broker="IBKR",
+                    )
                     break
                 await asyncio.sleep(60)
                 continue
@@ -678,12 +1009,14 @@ async def orb_signal_monitor(
                 # Execute Entry
                 success = await execute_orb_entry(
                     ibkr_client=ibkr_client,
+                    cash_mgr=cash_mgr,
                     symbol=symbol,
                     direction=breakout,
                     quantity=IBKR_QUANTITY,
                     stop_loss=stop_loss,
                     take_profit=take_profit,
                     entry_price=entry_price,
+                    underlying=underlying,
                 )
 
                 if success:
@@ -742,23 +1075,43 @@ async def _async_ibkr_session():
     logger.info("🌅 Starting Daily Session (IBKR)")
     ibkr_client = None
     try:
+        # CRITICAL: Re-initialize stop event in the current process's event loop
+        global _STOP_EVENT
+        _STOP_EVENT = asyncio.Event()
+
         # Initialize client and clear cache
         ibkr_client = IBKRClient()
         ibkr_client.option_chains_cache.clear()
         await ibkr_client.connect_async()
 
+        # Startup Recovery: Scan broker for existing ORB-relevant positions
+        await recover_active_positions(ibkr_client)
+
+        cash_mgr = LiveCashManager(ibkr_client)
+        await cash_mgr.check_and_log_start_balance()
+
         # Wait for ORB period to complete
-        if await wait_for_orb_complete():
+        if await wait_for_orb_complete(ibkr_client):
             # Start signal monitors
             tasks = []
             for symbol in ORB_IBKR_SYMBOLS:
-                task = asyncio.create_task(orb_signal_monitor(symbol, ibkr_client))
+                task = asyncio.create_task(
+                    orb_signal_monitor(symbol, ibkr_client, cash_mgr)
+                )
                 tasks.append(task)
 
             if tasks:
                 await asyncio.gather(*tasks)
+
+            send_telegram(
+                "✅ ORB Daily Session (IBKR): All symbol monitors finished.",
+                broker="IBKR",
+            )
         else:
             logger.info("ORB wait aborted")
+            send_telegram(
+                "⚠️ ORB Daily Session (IBKR): Aborted during wait.", broker="IBKR"
+            )
 
     except Exception as e:
         logger.error(f"Error in IBKR daily session: {e}", exc_info=True)

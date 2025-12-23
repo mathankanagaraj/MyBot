@@ -139,20 +139,15 @@ async def find_current_monthly_option(
         best_option = None
 
         if bias == "BULL":
-            # For BULL (CE): Select strike slightly below spot (0.5-1% ITM)
-            # This gives delta around 0.6-0.7
-            target_strike = underlying_price * 0.995  # 0.5% below spot
-
+            # For BULL (CE): Select strike slightly below spot (ITM)
             # Find strikes below spot price (ITM for CE)
             itm_options = [opt for opt in options if opt.strike < underlying_price]
 
             if itm_options:
                 # Sort by strike descending (highest ITM strike first)
                 itm_options.sort(key=lambda x: x.strike, reverse=True)
-                # Pick the strike closest to target (prefer slightly ITM)
-                best_option = min(
-                    itm_options, key=lambda x: abs(x.strike - target_strike)
-                )
+                # Pick the nearest ITM strike (one level ahead)
+                best_option = itm_options[0]
             else:
                 # Fallback: if no ITM available, pick nearest strike
                 best_option = min(
@@ -160,20 +155,15 @@ async def find_current_monthly_option(
                 )
 
         else:  # BEAR
-            # For BEAR (PE): Select strike slightly above spot (0.5-1% ITM)
-            # This gives delta around -0.6 to -0.7
-            target_strike = underlying_price * 1.005  # 0.5% above spot
-
+            # For BEAR (PE): Select strike slightly above spot (ITM)
             # Find strikes above spot price (ITM for PE)
             itm_options = [opt for opt in options if opt.strike > underlying_price]
 
             if itm_options:
                 # Sort by strike ascending (lowest ITM strike first)
                 itm_options.sort(key=lambda x: x.strike)
-                # Pick the strike closest to target (prefer slightly ITM)
-                best_option = min(
-                    itm_options, key=lambda x: abs(x.strike - target_strike)
-                )
+                # Pick the nearest ITM strike (one level ahead)
+                best_option = itm_options[0]
             else:
                 # Fallback: if no ITM available, pick nearest strike
                 best_option = min(

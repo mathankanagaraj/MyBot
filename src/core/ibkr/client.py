@@ -144,6 +144,12 @@ class IBKRClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, max_backoff)
 
+    async def ensure_connected(self):
+        """Check connection status and reconnect if needed."""
+        if not self.ib.isConnected():
+            logger.warning("⚠️ IBKR connection lost. Attempting to reconnect...")
+            await self.connect_async()
+
     def disconnect(self):
         """Disconnect from Interactive Brokers"""
         try:
@@ -483,89 +489,95 @@ class IBKRClient:
             logger.info(f"Entry price (marketable limit): {entry_price}")
 
             # 3. Create bracket orders using helper
+            # Determine TIF - Futures options usually require 'DAY' for bracket children
+            tif = "DAY" if option_contract.secType == "FOP" else "GTC"
+            logger.info(
+                f"[{option_contract.symbol}] Using TIF={tif} for bracket orders (secType={option_contract.secType})"
+            )
+
             bracket = self.ib.bracketOrder(
                 action="BUY",
                 quantity=quantity,
                 limitPrice=entry_price,
                 takeProfitPrice=target_price,
                 stopLossPrice=stop_loss_price,
-                tif="GTC",
+                tif=tif,
             )
-            parent_order, tp_order, sl_order = (
-                bracket  # bracketOrder => [parent, takeProfit, stopLoss]
-            )
+            parent_order, tp_order, sl_order = bracket
 
-            # Ensure children are not transmitted until parent acknowledged (defensive)
+            # 4. Correctly link and configure bracket
+            # parent_order.orderId is 0 here, IB will assign it upon placement
+            # bracketOrder() helper already links parentId, but we'll be explicit for safety
+            # transmit=True only on the FINAL child order
             parent_order.transmit = False
             tp_order.transmit = False
-            sl_order.transmit = True  # final transmit = True so IB receives all at once when last submitted
+            sl_order.transmit = True
 
-            # 4. Place parent
-            parent_trade = self.ib.placeOrder(option_contract, parent_order)
-
-            # 5. Wait for orderId assignment and acknowledgement (poll, with timeout)
-            max_wait = 10.0
-            waited = 0.0
-            poll_interval = 0.25
-            while waited < max_wait:
-                # orderId may be assigned in parent_trade.order.orderId
-                if getattr(parent_trade, "order", None) and getattr(
-                    parent_trade.order, "orderId", 0
-                ):
-                    # also check status to be in an acceptable state
-                    status = getattr(parent_trade, "orderStatus", None)
-                    if status and status.status in (
-                        "PreSubmitted",
-                        "Submitted",
-                        "Filled",
-                        "ApiPending",
-                    ):
-                        break
-                await asyncio.sleep(poll_interval)
-                waited += poll_interval
-
-            if not getattr(parent_trade.order, "orderId", None):
-                logger.error("Parent order did not receive valid orderId in time")
-                return None
-
-            parent_id = parent_trade.order.orderId
-            logger.info(
-                f"Parent accepted. orderId={parent_id}, status={parent_trade.orderStatus.status}"
+            # Use a unique OCA group
+            oca_group = (
+                f"ORB_{option_contract.symbol}_{datetime.now().strftime('%H%M%S')}"
             )
-
-            # 6. Attach the real parentId to children BEFORE placing them
-            tp_order.parentId = parent_id
-            sl_order.parentId = parent_id
-
-            # (optional) ensure OCA group & type set (bracketOrder usually does this)
-            oca = f"OCA_{parent_id}"
-            tp_order.ocaGroup = oca
-            sl_order.ocaGroup = oca
+            tp_order.ocaGroup = oca_group
+            sl_order.ocaGroup = oca_group
             tp_order.ocaType = 1
             sl_order.ocaType = 1
 
-            # 7. Place children (tp then sl or sl then tp—final one should have transmit=True)
+            # 5. Place all three orders sequentially
+            # ib_async handles orderId management automatically behind the scenes
+            parent_trade = self.ib.placeOrder(option_contract, parent_order)
             tp_trade = self.ib.placeOrder(option_contract, tp_order)
             sl_trade = self.ib.placeOrder(option_contract, sl_order)
 
-            # 8. Quick poll to ensure children were accepted by IB
-            await asyncio.sleep(0.5)
-            # log statuses for visibility
-            logger.info(
-                f"Orders placed: parent={parent_id}, tp={tp_order.orderId}, sl={sl_order.orderId}. "
-                f"parentStatus={parent_trade.orderStatus.status}, tpStatus={tp_trade.orderStatus.status}, slStatus={sl_trade.orderStatus.status}"
-            )
+            # 6. Wait for acknowledgment and check for rejections
+            # We poll briefly to see if the order was accepted or rejected
+            max_wait = 5.0
+            waited = 0.0
+            while waited < max_wait:
+                status = parent_trade.orderStatus.status
+                if status in ["Submitted", "PreSubmitted", "Filled", "ApiPending"]:
+                    logger.info(
+                        f"[{option_contract.symbol}] Bracket order accepted. Status: {status}"
+                    )
+                    break
+                if status in ["Rejected", "Cancelled", "Inactive"]:
+                    # Check for rejection reason in logs
+                    reason = "Unknown rejection"
+                    if parent_trade.log:
+                        # Find last entry with a message
+                        msgs = [
+                            entry.message for entry in parent_trade.log if entry.message
+                        ]
+                        if msgs:
+                            reason = msgs[-1]
+                    logger.error(
+                        f"[{option_contract.symbol}] Parent order was {status}. Reason: {reason}"
+                    )
+                    return {
+                        "status": "failed",
+                        "error": reason,
+                        "order_status": status,
+                    }
 
-            result = {
-                "entry_order_id": parent_id,
+                await asyncio.sleep(0.5)
+                waited += 0.5
+
+            # If we timed out without a definitive status
+            status = parent_trade.orderStatus.status
+            if status not in ["Submitted", "PreSubmitted", "Filled", "ApiPending"]:
+                logger.warning(
+                    f"[{option_contract.symbol}] Bracket order status uncertain: {status}"
+                )
+
+            return {
+                "status": "success",
+                "entry_order_id": parent_order.orderId,
                 "sl_order_id": sl_order.orderId,
                 "target_order_id": tp_order.orderId,
                 "parent_trade": parent_trade,
                 "tp_trade": tp_trade,
                 "sl_trade": sl_trade,
-                "oca_group": oca,
+                "oca_group": oca_group,
             }
-            return result
 
         except Exception:
             logger.exception("Error placing bracket order")
@@ -588,8 +600,7 @@ class IBKRClient:
                         "symbol": pos.contract.symbol,
                         "position": pos.position,
                         "avgCost": pos.avgCost,
-                        "marketValue": pos.marketValue,
-                        "unrealizedPNL": pos.unrealizedPNL,
+                        "contract": pos.contract,
                     }
                 )
 
@@ -597,6 +608,19 @@ class IBKRClient:
 
         except Exception as e:
             logger.exception(f"Error getting positions: {e}")
+            return []
+
+    async def get_open_orders(self) -> List:
+        """
+        Get current open orders (Trades) from IBKR.
+
+        Returns:
+            List of Trade objects
+        """
+        try:
+            return self.ib.openTrades()
+        except Exception as e:
+            logger.exception(f"Error getting open orders: {e}")
             return []
 
     async def get_account_summary_async(self) -> Dict:

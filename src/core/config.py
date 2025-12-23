@@ -190,8 +190,16 @@ NO_TRADE_LAST_MINUTES_EXPIRY = int(os.getenv("NO_TRADE_LAST_MINUTES_EXPIRY", "15
 STRATEGY = os.getenv("STRATEGY", "MACD_EMA").upper()
 
 # ORB Symbols per broker
-ORB_ANGEL_SYMBOLS = ["NIFTY", "BANKNIFTY"]
-ORB_IBKR_SYMBOLS = ["ES", "NQ"]  # E-mini S&P 500 and Nasdaq 100 futures
+ORB_ANGEL_SYMBOLS = [
+    "NIFTY",
+    "BANKNIFTY",
+    "RELIANCE",
+    "ICICIBANK",
+    "SBIN",
+    "HDFCBANK",
+    "INFY",
+]
+ORB_IBKR_SYMBOLS = ["ES", "NQ", "NVDA", "TSLA", "AAPL", "AMD", "MSFT"]
 
 # IBKR Future Exchanges mapping
 IBKR_FUTURES_EXCHANGES = {

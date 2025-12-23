@@ -8,7 +8,7 @@ from core.logger import logger
 @dataclass
 class LiveCashManager:
     """
-    Live cash manager for Angel Broker.
+    Live cash manager for brokers (Angel One, IBKR).
     Tracks positions, enforces risk limits, and monitors daily P&L.
     """
 
@@ -18,14 +18,16 @@ class LiveCashManager:
     open_positions: Dict[str, float] = field(default_factory=dict)
     daily_pnl: float = 0.0
 
-    def __init__(self, angel_client, max_alloc_pct=0.70, max_daily_loss_pct=0.05, max_position_pct=0.70):
-        self.angel_client = angel_client
+    def __init__(
+        self, client, max_alloc_pct=0.70, max_daily_loss_pct=0.05, max_position_pct=0.70
+    ):
+        self.client = client
         self.max_alloc_pct = max_alloc_pct
         self.max_daily_loss_pct = max_daily_loss_pct
         self.max_position_pct = max_position_pct
         self.open_positions = {}
         self.daily_pnl = 0.0
-        
+
         # Daily tracking
         self.daily_start_balance = 0.0
         self.total_trades_today = 0
@@ -44,8 +46,13 @@ class LiveCashManager:
             # This ensures we stick to 70% of pre-market opening balance
             if self.daily_start_balance == 0.0:
                 # Fallback to current balance if daily start not set
-                summary = await self.angel_client.get_account_summary_async()
-                base_balance = float(summary.get("AvailableFunds", 0))
+                summary = await self.client.get_account_summary_async()
+                # Use NetLiquidation/TotalFunds as base for allocation, AvailableFunds for current capacity
+                base_balance = float(
+                    summary.get("NetLiquidation")
+                    or summary.get("TotalFunds")
+                    or summary.get("AvailableFunds", 0)
+                )
             else:
                 base_balance = self.daily_start_balance
 
@@ -58,7 +65,9 @@ class LiveCashManager:
             # Check daily loss limit (percentage based on start balance)
             max_daily_loss = base_balance * self.max_daily_loss_pct
             if abs(self.daily_pnl) >= max_daily_loss:
-                logger.warning(f"Daily loss limit reached: ₹{self.daily_pnl:.2f} (Limit: ₹{max_daily_loss:.2f})")
+                logger.warning(
+                    f"Daily loss limit reached: ₹{self.daily_pnl:.2f} (Limit: ₹{max_daily_loss:.2f})"
+                )
                 return 0.0
 
             available = max(0.0, max_daily_allocation - current_exposure)
@@ -72,10 +81,10 @@ class LiveCashManager:
     async def can_open_position(self, symbol: str, cost: float) -> bool:
         """
         Check if we can open a new position based on risk limits.
-        
+
         Note: This does NOT check if position exists - that check should be done
               using Angel One API before calling this method.
-        
+
         Args:
             symbol: Trading symbol
             cost: Estimated cost of position
@@ -100,20 +109,26 @@ class LiveCashManager:
         # Check position size limit (percentage based on daily start balance)
         max_position_size = base_balance * self.max_position_pct
         if cost > max_position_size:
-            logger.warning(f"Position size ₹{cost:.2f} exceeds limit ₹{max_position_size:.2f} ({self.max_position_pct*100}% of daily start)")
+            logger.warning(
+                f"Position size ₹{cost:.2f} exceeds limit ₹{max_position_size:.2f} ({self.max_position_pct*100}% of daily start)"
+            )
             return False
 
         # Check daily loss limit (percentage based on daily start balance)
         max_daily_loss = base_balance * self.max_daily_loss_pct
         if abs(self.daily_pnl) >= max_daily_loss:
-            logger.warning(f"Daily loss limit reached: ₹{self.daily_pnl:.2f} (Limit: ₹{max_daily_loss:.2f})")
+            logger.warning(
+                f"Daily loss limit reached: ₹{self.daily_pnl:.2f} (Limit: ₹{max_daily_loss:.2f})"
+            )
             return False
 
         # Check available exposure
         available = await self.available_exposure()
 
         if cost > available:
-            logger.warning(f"Insufficient exposure: need ₹{cost:.2f}, available ₹{available:.2f}")
+            logger.warning(
+                f"Insufficient exposure: need ₹{cost:.2f}, available ₹{available:.2f}"
+            )
             return False
 
         return True
@@ -137,7 +152,7 @@ class LiveCashManager:
         # Don't increment trade count here - only increment when order is successfully placed
         logger.info(f"Registered open position: {symbol} @ ₹{cost:.2f}")
         return True
-    
+
     def increment_trade_count(self):
         """Increment total trades counter (call only after successful order placement)"""
         self.total_trades_today += 1
@@ -160,7 +175,9 @@ class LiveCashManager:
         # Update daily P&L
         self.daily_pnl += pnl
 
-        logger.info(f"Closed position: {symbol} | Entry: ₹{entry_cost:.2f} | Exit: ₹{exit_value:.2f} | P&L: ₹{pnl:.2f}")
+        logger.info(
+            f"Closed position: {symbol} | Entry: ₹{entry_cost:.2f} | Exit: ₹{exit_value:.2f} | P&L: ₹{pnl:.2f}"
+        )
         logger.info(f"Daily P&L: ₹{self.daily_pnl:.2f}")
 
         return pnl
@@ -187,16 +204,20 @@ class LiveCashManager:
 
     async def get_account_balance(self):
         """
-        Get current account balance from Angel Broker.
+        Get current account balance from Broker.
 
         Returns:
             Dict with balance information
         """
         try:
-            summary = await self.angel_client.get_account_summary_async()
+            summary = await self.client.get_account_summary_async()
             return {
                 "available_funds": float(summary.get("AvailableFunds", 0)),
-                "total_funds": float(summary.get("TotalFunds", 0)),
+                "total_funds": float(
+                    summary.get("NetLiquidation")
+                    or summary.get("TotalFunds")
+                    or summary.get("AvailableFunds", 0)
+                ),
                 "utilized_funds": float(summary.get("UtilizedFunds", 0)),
             }
         except Exception as e:
@@ -221,11 +242,11 @@ class LiveCashManager:
 
         balance_info = await self.get_account_balance()
         current_available = balance_info["available_funds"]
-        
+
         # Check if there are any existing open positions (from previous session/restart)
         # If there are, we need to account for them in the daily start balance calculation
         existing_positions_value = sum(self.open_positions.values())
-        
+
         if existing_positions_value > 0:
             logger.info(
                 f"Found existing open positions worth ₹{existing_positions_value:,.2f} from previous session"
@@ -240,7 +261,7 @@ class LiveCashManager:
         else:
             # No existing positions, use current available as daily start
             self.daily_start_balance = current_available
-        
+
         self.last_balance_check_date = today
 
         # Calculate allocation limits based on the true daily start balance
@@ -255,7 +276,7 @@ class LiveCashManager:
             f"✅ Daily Start Balance: ₹{self.daily_start_balance:,.2f}\n"
             f"📈 Max Allocation (70%): ₹{max_allocation:,.2f}\n"
         )
-        
+
         if existing_positions_value > 0:
             msg += (
                 f"🔒 Existing Positions: ₹{existing_positions_value:,.2f}\n"
@@ -263,7 +284,7 @@ class LiveCashManager:
             )
         else:
             msg += f"🎯 Available for Trading: ₹{max_allocation:,.2f}\n"
-        
+
         msg += "━━━━━━━━━━━━━━━━━━━━"
 
         logger.info(msg.replace("**", "").replace("━", "-"))
@@ -290,12 +311,14 @@ class LiveCashManager:
         }
 
 
-def create_cash_manager(angel_client, max_alloc_pct=0.70, max_daily_loss_pct=0.05, max_position_pct=0.70):
+def create_cash_manager(
+    client, max_alloc_pct=0.70, max_daily_loss_pct=0.05, max_position_pct=0.70
+):
     """
-    Create cash manager for Angel Broker (LIVE only).
+    Create cash manager for Broker (LIVE only).
 
     Args:
-        angel_client: AngelClient instance
+        client: Client instance (AngelClient or IBKRClient)
         max_alloc_pct: Maximum allocation percentage
         max_daily_loss_pct: Maximum daily loss percentage
         max_position_pct: Maximum position size percentage
@@ -304,7 +327,7 @@ def create_cash_manager(angel_client, max_alloc_pct=0.70, max_daily_loss_pct=0.0
         LiveCashManager instance
     """
     return LiveCashManager(
-        angel_client=angel_client,
+        client=client,
         max_alloc_pct=max_alloc_pct,
         max_daily_loss_pct=max_daily_loss_pct,
         max_position_pct=max_position_pct,

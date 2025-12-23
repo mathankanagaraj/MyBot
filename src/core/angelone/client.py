@@ -1127,6 +1127,33 @@ class AngelClient:
             logger.exception(f"Error getting positions: {e}")
             return []
 
+    async def get_order_book(self) -> List[Dict]:
+        """
+        Get current order book from Angel One.
+
+        Returns:
+            List of order dicts
+        """
+        try:
+            # Rate limiting for orderBook (1/sec)
+            await self.rate_limiter.acquire("orderBook")
+
+            response = await asyncio.wait_for(
+                asyncio.to_thread(self.smart_api.orderBook), timeout=5.0
+            )
+
+            if response and response.get("data"):
+                return response["data"]
+
+            return []
+
+        except asyncio.TimeoutError:
+            logger.error("Timeout getting order book (5s exceeded)")
+            return []
+        except Exception as e:
+            logger.exception(f"Error getting order book: {e}")
+            return []
+
     async def get_account_summary_async(self) -> Dict:
         """
         Get account summary including available funds and margins.
