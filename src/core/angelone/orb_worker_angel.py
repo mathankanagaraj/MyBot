@@ -67,6 +67,49 @@ MARKET_CLOSE_TIME = time(NSE_MARKET_CLOSE_HOUR, NSE_MARKET_CLOSE_MINUTE)
 # -----------------------------
 # Helper Functions
 # -----------------------------
+async def check_symbol_traded_today(symbol: str, angel_client: AngelClient) -> bool:
+    """
+    Check if we already placed an ORB entry order for this symbol today.
+    Uses broker's order book as single source of truth.
+    
+    Returns:
+        True if symbol was already traded today, False otherwise
+    """
+    try:
+        from datetime import datetime
+        
+        # Get today's date
+        today_str = get_ist_now().strftime("%d-%b-%Y").upper()  # Format: 23-DEC-2025
+        
+        # Get order book from broker
+        order_book = await angel_client.get_order_book()
+        
+        if not order_book:
+            logger.debug(f"[{symbol}] No order book data from broker")
+            return False
+        
+        # Check if any order for this symbol's options was placed today
+        for order in order_book:
+            order_date = order.get('ordertime', '')
+            # ordertime format: "23-Dec-2025 09:30:15" - extract date part
+            if order_date:
+                order_date_only = order_date.split(' ')[0].upper()
+                
+                if order_date_only == today_str:
+                    # Check if order is for this symbol's option
+                    trading_symbol = order.get('tradingsymbol', '')
+                    if trading_symbol.startswith(symbol):
+                        logger.info(f"[{symbol}] 💾 Found order from today in broker history: {trading_symbol}")
+                        return True
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"[{symbol}] Error checking broker history: {e}")
+        # On error, check local state as fallback
+        return ORB_TRADE_TAKEN_TODAY.get(symbol, False)
+
+
 def get_orb_end_time() -> datetime:
     """Get ORB period end time for today."""
     now = get_ist_now()
@@ -277,6 +320,8 @@ async def execute_orb_entry(
             int(available_exposure / (option_ltp * option_selection.lot_size)),
         )
 
+        logger.debug(f"[{symbol}] Option LTP: ₹{option_ltp:.2f}, Calculated qty: {qty}")
+
         # Calculate SL/TP in option premium points using a Delta approximation (0.7 for ITM)
         # logic: option_ltp ± (underlying_points_distance * delta)
         delta = 0.7
@@ -317,15 +362,19 @@ async def execute_orb_entry(
         )
 
         if order_result and order_result.get("status") == "success":
-            # Track position
+            # Track position with bracket order details
             ORB_ACTIVE_POSITIONS[symbol] = {
                 "direction": direction,
                 "entry_price": entry_price,
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
                 "option_symbol": option_selection.symbol,
+                "option_token": option_selection.token,
                 "qty": qty,
                 "entry_time": get_ist_now(),
+                "entry_order_id": order_result.get("entry_order_id"),
+                "sl_order_id": order_result.get("sl_order_id"),
+                "target_order_id": order_result.get("target_order_id"),
             }
             ORB_TRADE_TAKEN_TODAY[symbol] = True
 
@@ -372,7 +421,14 @@ async def execute_orb_entry(
 async def force_exit_position(
     symbol: str, angel_client: AngelClient, reason: str = "EOD"
 ):
-    """Force close any open position for symbol."""
+    """
+    Force close any open position for symbol.
+    
+    Steps:
+    1. Cancel all open orders (SL and TP)
+    2. Close position with market order
+    3. Clean up tracking
+    """
     if symbol not in ORB_ACTIVE_POSITIONS:
         return
 
@@ -383,9 +439,41 @@ async def force_exit_position(
             f"[{symbol}] ⚠️ FORCE EXIT ({reason}): Closing {position['direction']}"
         )
 
-        # Get current positions from API
+        # Step 1: Cancel SL and TP orders
+        cancelled_count = 0
+        
+        # Cancel stop-loss order
+        sl_order_id = position.get("sl_order_id")
+        if sl_order_id:
+            try:
+                await asyncio.to_thread(
+                    angel_client.smart_api.cancelOrder, sl_order_id, "STOPLOSS"
+                )
+                cancelled_count += 1
+                logger.debug(f"[{symbol}] Cancelled SL order: {sl_order_id}")
+            except Exception as e:
+                logger.warning(f"[{symbol}] Failed to cancel SL order {sl_order_id}: {e}")
+        
+        # Cancel target order
+        target_order_id = position.get("target_order_id")
+        if target_order_id:
+            try:
+                await asyncio.to_thread(
+                    angel_client.smart_api.cancelOrder, target_order_id, "NORMAL"
+                )
+                cancelled_count += 1
+                logger.debug(f"[{symbol}] Cancelled Target order: {target_order_id}")
+            except Exception as e:
+                logger.warning(f"[{symbol}] Failed to cancel Target order {target_order_id}: {e}")
+        
+        if cancelled_count > 0:
+            logger.info(f"[{symbol}] Cancelled {cancelled_count} open order(s)")
+            await asyncio.sleep(1)  # Give time for cancellations to process
+
+        # Step 2: Close position with market order
         positions = await angel_client.get_positions()
         option_symbol = position.get("option_symbol")
+        option_token = position.get("option_token")
 
         for pos in positions:
             if (
@@ -396,9 +484,9 @@ async def force_exit_position(
                 side = "SELL" if int(pos.get("netqty", 0)) > 0 else "BUY"
                 qty = abs(int(pos.get("netqty", 0)))
 
-                await angel_client.place_order(
+                close_result = await angel_client.place_order(
                     symbol=option_symbol,
-                    token=pos.get("symboltoken"),
+                    token=option_token,
                     qty=qty,
                     side=side,
                     order_type="MARKET",
@@ -407,14 +495,17 @@ async def force_exit_position(
                 msg = (
                     f"⚠️ ORB FORCE EXIT ({reason}): {symbol}\n"
                     f"Position: {position['direction']}\n"
-                    f"Entry: ₹{position['entry_price']:.2f}"
+                    f"Entry: ₹{position['entry_price']:.2f}\n"
+                    f"Qty: {qty} (Action: {side})\n"
+                    f"Status: {'Success' if close_result else 'Failed'}"
                 )
                 send_telegram(msg, broker="ANGEL")
-                logger.info(f"[{symbol}] ✅ Position closed successfully")
+                logger.info(f"[{symbol}] ✅ Position closed with {side} market order")
                 break
 
-        # Remove from tracking
+        # Step 3: Remove from tracking
         del ORB_ACTIVE_POSITIONS[symbol]
+        logger.info(f"[{symbol}] Removed from active positions tracking")
 
     except Exception as e:
         logger.exception(f"[{symbol}] Force exit error: {e}")
@@ -439,7 +530,7 @@ async def orb_signal_monitor(
         cash_mgr: Cash manager
         bar_manager: Bar manager for historical data
     """
-    logger.info(f"[{symbol}] 📊 ORB Signal Monitor started")
+    logger.debug(f"[{symbol}] 📊 ORB Signal Monitor started")
 
     orb_high = None
     orb_low = None
@@ -650,19 +741,19 @@ async def orb_signal_monitor(
 
             # Wait for next candle close
             sleep_sec = get_seconds_until_next_candle(now, ORB_BREAKOUT_TIMEFRAME)
-            logger.info(
+            logger.debug(
                 f"[{symbol}] Analysis complete. Sleeping {sleep_sec}s until next candle close..."
             )
             await asyncio.sleep(sleep_sec)
 
         except asyncio.CancelledError:
-            logger.info(f"[{symbol}] ORB Signal Monitor cancelled")
+            logger.debug(f"[{symbol}] ORB Signal Monitor cancelled")
             break
         except Exception as e:
             logger.exception(f"[{symbol}] ORB Signal Monitor error: {e}")
             await asyncio.sleep(30)
 
-    logger.info(f"[{symbol}] 📊 ORB Signal Monitor stopped")
+    logger.debug(f"[{symbol}] 📊 ORB Signal Monitor stopped")
 
 
 # -----------------------------
@@ -711,6 +802,11 @@ async def _async_daily_session():
 
         angel_client = AngelClient()
         await angel_client.connect_async()
+        
+        # Check broker for any trades placed today and mark them
+        for symbol in ORB_ANGEL_SYMBOLS:
+            if await check_symbol_traded_today(symbol, angel_client):
+                ORB_TRADE_TAKEN_TODAY[symbol] = True
 
         cash_mgr = LiveCashManager(angel_client)
         await cash_mgr.check_and_log_start_balance()

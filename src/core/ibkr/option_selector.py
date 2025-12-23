@@ -8,7 +8,13 @@ import asyncio
 from typing import Optional, Tuple, Any, List
 from dataclasses import dataclass
 
-from core.config import OPTION_MIN_DTE, OPTION_MAX_DTE
+from core.config import (
+    OPTION_MIN_DTE, 
+    OPTION_MAX_DTE,
+    FUTURES_OPTION_MIN_DTE,
+    FUTURES_OPTION_MAX_DTE,
+    IBKR_FUTURES_EXCHANGES
+)
 from core.logger import logger
 
 
@@ -45,9 +51,17 @@ async def find_ibkr_option_contract(
             f"[{symbol}] Selecting option: Bias={bias}, Price=${underlying_price:.2f}"
         )
 
+        # Determine if this is a futures symbol and use appropriate DTE range
+        is_futures = symbol in IBKR_FUTURES_EXCHANGES
+        min_dte = FUTURES_OPTION_MIN_DTE if is_futures else OPTION_MIN_DTE
+        max_dte = FUTURES_OPTION_MAX_DTE if is_futures else OPTION_MAX_DTE
+        
+        if is_futures:
+            logger.info(f"[{symbol}] Futures option - using extended DTE range: {min_dte}-{max_dte} days")
+
         # Get option chain with DTE filtering
         options = await ibkr_client.get_option_chain(
-            symbol, underlying_price, OPTION_MIN_DTE, OPTION_MAX_DTE
+            symbol, underlying_price, min_dte, max_dte
         )
         if not options:
             return (
@@ -68,8 +82,8 @@ async def find_ibkr_option_contract(
         if not valid_options:
             return None, "No options with valid DTE"
 
-        # Select strike
-        selected = _select_strike(valid_options, underlying_price, bias)
+        # Select strike (1-2 levels ITM)
+        selected = _select_strike(valid_options, underlying_price, bias, symbol)
 
         # Get option premium asynchronously
         premium = await _get_option_price(ibkr_client, selected["contract"])
@@ -108,24 +122,56 @@ async def find_ibkr_option_contract(
         return None, str(e)
 
 
-def _select_strike(options: List[dict], underlying: float, bias: str) -> dict:
+def _select_strike(options: List[dict], underlying: float, bias: str, symbol: str = "") -> dict:
     """
-    Select ITM option based on bias. Falls back to ATM if no ITM exists.
+    Select ITM option 1-2 strikes deep from ATM for better delta.
+    Falls back to nearest ATM if insufficient ITM strikes exist.
+    
+    Strategy:
+    - BULL CALL: Select strike 1-2 levels below current price (ITM)
+    - BEAR PUT: Select strike 1-2 levels above current price (ITM)
     """
     if bias == "BULL":
-        itm = [o for o in options if o["strike"] < underlying]
-        return (
-            max(itm, key=lambda x: x["strike"])
-            if itm
-            else min(options, key=lambda x: abs(x["strike"] - underlying))
-        )
+        # Get all ITM calls (strike < current price)
+        itm = sorted([o for o in options if o["strike"] < underlying], 
+                     key=lambda x: x["strike"], reverse=True)  # Sort descending
+        
+        if len(itm) >= 2:
+            # Select 2nd ITM strike (1-2 levels deep)
+            selected = itm[1]
+            logger.info(f"[{symbol}] BULL: Selected 2nd ITM strike ${selected['strike']:.2f} (underlying: ${underlying:.2f})")
+            return selected
+        elif len(itm) >= 1:
+            # Only 1 ITM available, use it
+            selected = itm[0]
+            logger.info(f"[{symbol}] BULL: Selected 1st ITM strike ${selected['strike']:.2f} (underlying: ${underlying:.2f})")
+            return selected
+        else:
+            # No ITM, fallback to nearest ATM
+            selected = min(options, key=lambda x: abs(x["strike"] - underlying))
+            logger.warning(f"[{symbol}] BULL: No ITM available, using ATM ${selected['strike']:.2f}")
+            return selected
+            
     else:  # BEAR
-        itm = [o for o in options if o["strike"] > underlying]
-        return (
-            min(itm, key=lambda x: x["strike"])
-            if itm
-            else min(options, key=lambda x: abs(x["strike"] - underlying))
-        )
+        # Get all ITM puts (strike > current price)
+        itm = sorted([o for o in options if o["strike"] > underlying],
+                     key=lambda x: x["strike"])  # Sort ascending
+        
+        if len(itm) >= 2:
+            # Select 2nd ITM strike (1-2 levels deep)
+            selected = itm[1]
+            logger.info(f"[{symbol}] BEAR: Selected 2nd ITM strike ${selected['strike']:.2f} (underlying: ${underlying:.2f})")
+            return selected
+        elif len(itm) >= 1:
+            # Only 1 ITM available, use it
+            selected = itm[0]
+            logger.info(f"[{symbol}] BEAR: Selected 1st ITM strike ${selected['strike']:.2f} (underlying: ${underlying:.2f})")
+            return selected
+        else:
+            # No ITM, fallback to nearest ATM
+            selected = min(options, key=lambda x: abs(x["strike"] - underlying))
+            logger.warning(f"[{symbol}] BEAR: No ITM available, using ATM ${selected['strike']:.2f}")
+            return selected
 
 
 async def _get_option_price(

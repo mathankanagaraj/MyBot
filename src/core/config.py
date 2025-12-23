@@ -107,8 +107,14 @@ ALLOC_PCT = float(
 # ============================================================================
 # OPTION SELECTION PARAMETERS (Common for both brokers)
 # ============================================================================
-OPTION_MIN_DTE = int(os.getenv("OPTION_MIN_DTE", "2"))
-OPTION_MAX_DTE = int(os.getenv("OPTION_MAX_DTE", "7"))
+# Stock options - use nearest monthly expiry
+OPTION_MIN_DTE = int(os.getenv("OPTION_MIN_DTE", "7"))    # Minimum 7 days to avoid weekly decay
+OPTION_MAX_DTE = int(os.getenv("OPTION_MAX_DTE", "45"))   # Max ~6 weeks (nearest monthly)
+
+# Futures Options (FOP) specific parameters - 0 DTE strategy for max gamma
+FUTURES_OPTION_MIN_DTE = int(os.getenv("FUTURES_OPTION_MIN_DTE", "0"))   # 0 DTE (same day expiry)
+FUTURES_OPTION_MAX_DTE = int(os.getenv("FUTURES_OPTION_MAX_DTE", "2"))   # Max 2 days (0 DTE strategy)
+
 OPTION_TARGET_DELTA = float(os.getenv("OPTION_TARGET_DELTA", "0.40"))
 OPTION_MAX_IV_PCT = float(os.getenv("OPTION_MAX_IV_PCT", "80"))
 OPTION_MIN_OPEN_INTEREST = int(os.getenv("OPTION_MIN_OPEN_INTEREST", "100"))
@@ -199,7 +205,12 @@ ORB_ANGEL_SYMBOLS = [
     "HDFCBANK",
     "INFY",
 ]
-ORB_IBKR_SYMBOLS = ["ES", "NQ", "NVDA", "TSLA", "AAPL", "AMD", "MSFT"]
+
+# ORB Strategy Symbols (can be overridden via .env)
+ORB_SYMBOLS_STR = os.getenv(
+    "ORB_SYMBOLS", "ES,NQ,NVDA,TSLA,AAPL,AMD,MSFT"  # Default includes futures
+)
+ORB_IBKR_SYMBOLS = [s.strip() for s in ORB_SYMBOLS_STR.split(",")]
 
 # IBKR Future Exchanges mapping
 IBKR_FUTURES_EXCHANGES = {
@@ -219,9 +230,16 @@ ORB_RISK_REWARD = float(os.getenv("ORB_RISK_REWARD", "1.5"))  # 1:1.5 risk-rewar
 ORB_BREAKOUT_TIMEFRAME = int(os.getenv("ORB_BREAKOUT_TIMEFRAME", "30"))
 
 # ORB Entry Limits (stop taking entries after this hour)
-ORB_MAX_ENTRY_HOUR = int(
-    os.getenv("ORB_MAX_ENTRY_HOUR", "14")
-)  # 2 PM (both IST and ET)
+# Separate limits for different markets
+ORB_MAX_ENTRY_HOUR_IBKR = int(
+    os.getenv("ORB_MAX_ENTRY_HOUR_IBKR", "15")
+)  # 3 PM ET for US futures/stocks
+ORB_MAX_ENTRY_HOUR_ANGEL = int(
+    os.getenv("ORB_MAX_ENTRY_HOUR_ANGEL", "14")
+)  # 2 PM IST for Indian markets
+
+# Backward compatibility: use generic setting if broker-specific not set
+ORB_MAX_ENTRY_HOUR = ORB_MAX_ENTRY_HOUR_IBKR if BROKER == "IBKR" else ORB_MAX_ENTRY_HOUR_ANGEL
 
 # ============================================================================
 # LOGGING & AUDIT

@@ -19,12 +19,13 @@ class LiveCashManager:
     daily_pnl: float = 0.0
 
     def __init__(
-        self, client, max_alloc_pct=0.70, max_daily_loss_pct=0.05, max_position_pct=0.70
+        self, client, max_alloc_pct=0.70, max_daily_loss_pct=0.05, max_position_pct=0.70, broker="ANGEL"
     ):
         self.client = client
         self.max_alloc_pct = max_alloc_pct
         self.max_daily_loss_pct = max_daily_loss_pct
         self.max_position_pct = max_position_pct
+        self.broker = broker
         self.open_positions = {}
         self.daily_pnl = 0.0
 
@@ -288,7 +289,7 @@ class LiveCashManager:
         msg += "━━━━━━━━━━━━━━━━━━━━"
 
         logger.info(msg.replace("**", "").replace("━", "-"))
-        send_telegram(msg)
+        send_telegram(msg, broker=self.broker)
 
     async def get_daily_statistics(self):
         """

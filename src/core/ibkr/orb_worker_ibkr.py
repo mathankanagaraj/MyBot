@@ -71,6 +71,50 @@ MARKET_CLOSE_TIME = time(US_MARKET_CLOSE_HOUR, US_MARKET_CLOSE_MINUTE)
 # -----------------------------
 # Helper Functions
 # -----------------------------
+async def check_symbol_traded_today(symbol: str, ibkr_client: IBKRClient) -> bool:
+    """
+    Check if we already placed an ORB entry order for this symbol today.
+    Uses broker's order/trade history as single source of truth.
+    
+    Returns:
+        True if symbol was already traded today, False otherwise
+    """
+    try:
+        # Get today's date range
+        today_start = get_us_et_now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Check recent trades (fills)
+        fills = ibkr_client.ib.fills()
+        for fill in fills:
+            # Check if fill is from today and matches our symbol
+            if hasattr(fill, 'time') and fill.time.date() >= today_start.date():
+                # For options, the contract will have the underlying symbol
+                contract = fill.contract
+                contract_symbol = getattr(contract, 'symbol', '')
+                
+                if contract_symbol == symbol:
+                    logger.info(f"[{symbol}] 💾 Found filled order from today in broker history")
+                    return True
+        
+        # Also check open trades (might not be filled yet but submitted today)
+        trades = await ibkr_client.get_open_orders()
+        for trade in trades:
+            if hasattr(trade, 'contract') and trade.contract.symbol == symbol:
+                # Check if order was placed today
+                if hasattr(trade, 'log') and trade.log:
+                    first_log = trade.log[0]
+                    if hasattr(first_log, 'time') and first_log.time.date() >= today_start.date():
+                        logger.info(f"[{symbol}] 💾 Found open order from today in broker history")
+                        return True
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"[{symbol}] Error checking broker history: {e}")
+        # On error, check local state as fallback
+        return ORB_TRADE_TAKEN_TODAY.get(symbol, False)
+
+
 def get_orb_end_time() -> datetime:
     """Get ORB period end time for today."""
     now = get_us_et_now()
@@ -324,7 +368,7 @@ async def get_0dte_option_chain(
             target_exchange = ""
 
         expiries_map = {}  # expiry -> list of tradingClasses
-        strikes_set = set()
+        strikes_per_expiry = {}  # expiry -> set of strikes
 
         for c in chains:
             # If target_exchange is empty, we accept all chains (good for stocks)
@@ -332,9 +376,11 @@ async def get_0dte_option_chain(
                 for exp in c.expirations:
                     if exp not in expiries_map:
                         expiries_map[exp] = []
+                        strikes_per_expiry[exp] = set()
                     expiries_map[exp].append(c.tradingClass)
-                for s in c.strikes:
-                    strikes_set.add(s)
+                    # Add strikes for this specific expiry
+                    for s in c.strikes:
+                        strikes_per_expiry[exp].add(s)
 
         if not expiries_map:
             logger.warning(
@@ -342,40 +388,131 @@ async def get_0dte_option_chain(
             )
             return None
 
-        # today's date for 0 DTE
-        today = get_us_et_now().strftime("%Y%m%d")
+        # Log available expiries for debugging
+        sorted_expiries = sorted(expiries_map.keys())
+        logger.debug(f"[{symbol}] Available expiries: {sorted_expiries[:10]}")  # Show first 10
+        
+        # Select expiry based on underlying type
+        from datetime import timedelta, datetime
+        now = get_us_et_now()
+        today_str = now.strftime("%Y%m%d")
+        selected_expiry = None
         selected_trading_class = None
 
-        if today in expiries_map:
-            # Prefer the standard symbol if multiple classes exist
-            classes = expiries_map[today]
-            selected_trading_class = symbol if symbol in classes else classes[0]
+        # For futures (ES/NQ), prefer weekly expiry (better liquidity/premiums)
+        if underlying_contract.secType == "FUT":
+            # Get next Friday's date (weekly expiry)
+            days_until_friday = (4 - now.weekday()) % 7  # Friday is weekday 4
+            if days_until_friday == 0:  # If today is Friday, use today
+                days_until_friday = 0
+            next_friday = now + timedelta(days=days_until_friday)
+            target_expiry = next_friday.strftime("%Y%m%d")
+            
+            # Look for target weekly expiry or nearest after
+            candidates = [e for e in sorted_expiries if e >= target_expiry]
+            if candidates:
+                selected_expiry = candidates[0]
+                logger.debug(f"[{symbol}] Using weekly expiry for futures: {selected_expiry} (Target: {target_expiry})")
+            else:
+                # Fallback to nearest available
+                selected_expiry = sorted_expiries[0] if sorted_expiries else None
+                logger.warning(f"[{symbol}] No weekly expiry found, using nearest: {selected_expiry}")
         else:
-            logger.warning(f"[{symbol}] No 0 DTE expiry available for {today}")
-            # Fall back to nearest available expiry
-            sorted_expiries = sorted(expiries_map.keys())
-            if not sorted_expiries:
-                return None
-            today = sorted_expiries[0]
-            classes = expiries_map[today]
-            selected_trading_class = symbol if symbol in classes else classes[0]
-            logger.info(
-                f"[{symbol}] Using nearest expiry: {today} (Class: {selected_trading_class})"
-            )
+            # For stocks/indices: Use weekly expiry (>2 DTE)
+            # Find the nearest expiry that's at least 2 trading days away
+            from datetime import timedelta
+            min_dte_date = (now + timedelta(days=2)).strftime("%Y%m%d")
+            
+            logger.info(f"[{symbol}] Looking for stock option expiry >= {min_dte_date} (2+ DTE)")
+            
+            # Find the closest expiry that's >= 2 DTE
+            # Prefer Friday expiries (standard weekly options), but accept any day
+            candidates = [e for e in sorted_expiries if e >= min_dte_date]
+            
+            if candidates:
+                # Try to find a Friday expiry first (more liquid)
+                from datetime import datetime as dt
+                friday_candidates = []
+                for exp_str in candidates[:5]:  # Check first 5 expiries
+                    try:
+                        exp_date = dt.strptime(exp_str, "%Y%m%d")
+                        if exp_date.weekday() == 4:  # Friday
+                            friday_candidates.append(exp_str)
+                    except:
+                        pass
+                
+                if friday_candidates:
+                    selected_expiry = friday_candidates[0]
+                    logger.debug(f"[{symbol}] Using Friday weekly expiry: {selected_expiry}")
+                else:
+                    # No Friday found, use first available
+                    selected_expiry = candidates[0]
+                    logger.debug(f"[{symbol}] Using nearest available expiry: {selected_expiry}")
+            else:
+                # Fallback to nearest available
+                selected_expiry = sorted_expiries[0] if sorted_expiries else None
+                logger.warning(f"[{symbol}] No expiry >=2 DTE found, using nearest: {selected_expiry}")
 
-        # Find ITM strike (one level ahead)
-        strikes = sorted(list(strikes_set))
-        if not strikes:
+        if not selected_expiry:
+            logger.error(f"[{symbol}] No valid expiry found")
             return None
+
+        # Select trading class - for futures use standard mini contract class (ECNQ for NQ, MESNQ for ES)
+        classes = expiries_map[selected_expiry]
+        logger.info(f"[{symbol}] Available trading classes for {selected_expiry}: {classes[:5]}")  # Show first 5
+        
+        if underlying_contract.secType == "FUT":
+            # For NQ/ES futures, prefer standard mini contract class
+            if symbol == "NQ":
+                # ECNQ is the standard E-mini NASDAQ-100 options
+                selected_trading_class = "ECNQ" if "ECNQ" in classes else classes[0]
+            elif symbol == "ES":
+                # MESNQ is the Micro E-mini S&P 500 options (or ES for standard)
+                selected_trading_class = "ES" if "ES" in classes else classes[0]
+            else:
+                selected_trading_class = classes[0]
+        else:
+            # For stocks, use the symbol itself as trading class (standard)
+            selected_trading_class = symbol if symbol in classes else classes[0]
+        
+        logger.info(f"[{symbol}] Selected trading class: {selected_trading_class} (from {classes})")
+        today = selected_expiry  # Use selected expiry for contract creation
+
+        # Get strikes specific to this expiry
+        strikes = sorted(list(strikes_per_expiry.get(selected_expiry, set())))
+        if not strikes:
+            logger.error(f"[{symbol}] No strikes available for expiry {selected_expiry}")
+            return None
+
+        logger.debug(f"[{symbol}] Available strikes for {selected_expiry}: {len(strikes)} strikes (range: {strikes[0]}-{strikes[-1]})")
+        
+        # Show strikes near the underlying price for debugging
+        nearby_strikes = [s for s in strikes if abs(s - underlying_price) <= 10]
+        logger.debug(f"[{symbol}] Strikes near underlying price {underlying_price}: {nearby_strikes[:15]}")
 
         if right == "C":
             # For Calls: Pick the highest strike below underlying price
             itm_strikes = [s for s in strikes if s < underlying_price]
-            atm_strike = itm_strikes[-1] if itm_strikes else strikes[0]
+            if itm_strikes:
+                # Find the closest ITM strike (highest below underlying)
+                atm_strike = itm_strikes[-1]
+            else:
+                # If no ITM strikes, use the lowest available
+                atm_strike = strikes[0]
         else:
             # For Puts: Pick the lowest strike above underlying price
             itm_strikes = [s for s in strikes if s > underlying_price]
-            atm_strike = itm_strikes[0] if itm_strikes else strikes[-1]
+            if itm_strikes:
+                atm_strike = itm_strikes[0]
+            else:
+                atm_strike = strikes[-1]
+        
+        # For stocks, validate strike exists in the list (handles non-standard intervals like 2.5/5)
+        if underlying_contract.secType in ["IND", "STK"] and atm_strike not in strikes:
+            # Strike calculated doesn't exist, find nearest valid strike
+            nearest_strike = min(strikes, key=lambda x: abs(x - atm_strike))
+            logger.warning(f"[{symbol}] Calculated strike {atm_strike} not in available strikes, using nearest: {nearest_strike}")
+            atm_strike = nearest_strike
 
         logger.info(
             f"[{symbol}] Selected ITM Option: Strike={atm_strike}, Expiry={today}, Right={right}, Class={selected_trading_class}, Exchange={target_exchange}"
@@ -383,6 +520,7 @@ async def get_0dte_option_chain(
 
         # Create option contract
         if underlying_contract.secType in ["IND", "STK"]:
+            # For stocks: Don't specify tradingClass for weekly options, let IBKR resolve it
             option = Option(
                 symbol=symbol,
                 lastTradeDateOrContractMonth=today,
@@ -391,7 +529,6 @@ async def get_0dte_option_chain(
                 exchange="SMART",
                 multiplier="100",  # Standard for US Options
                 currency="USD",
-                tradingClass=selected_trading_class,
             )
         else:
             # For FuturesOptions, specifying tradingClass is CRITICAL to avoid ambiguity (ES vs EW3)
@@ -405,8 +542,45 @@ async def get_0dte_option_chain(
             )
 
         qualified = await ibkr_client.ib.qualifyContractsAsync(option)
+        
+        logger.info(f"[{symbol}] Qualification result: {len(qualified) if qualified else 0} contracts")
 
-        if not qualified:
+        if not qualified or qualified[0] is None:
+            logger.warning(
+                f"[{symbol}] ⚠️ Failed to qualify option expiry {today}. Trying next available expiry..."
+            )
+            # Try up to 3 next expiries (some might not have contracts)
+            candidates_after_first = [e for e in sorted_expiries if e > selected_expiry][:3]
+            
+            for next_expiry in candidates_after_first:
+                if underlying_contract.secType not in ["IND", "STK"]:
+                    break
+                    
+                logger.debug(f"[{symbol}] Attempting with next expiry: {next_expiry}")
+                
+                # Recalculate strike for the new expiry
+                next_strikes = sorted(list(strikes_per_expiry.get(next_expiry, set())))
+                if next_strikes:
+                    if right == "C":
+                        itm_strikes = [s for s in next_strikes if s < underlying_price]
+                        atm_strike = itm_strikes[-1] if itm_strikes else next_strikes[0]
+                    else:
+                        itm_strikes = [s for s in next_strikes if s > underlying_price]
+                        atm_strike = itm_strikes[0] if itm_strikes else next_strikes[-1]
+                    
+                    logger.debug(f"[{symbol}] Recalculated strike for {next_expiry}: {atm_strike}")
+                    option.lastTradeDateOrContractMonth = next_expiry
+                    option.strike = atm_strike
+                    today = next_expiry  # Update for return value
+                    qualified = await ibkr_client.ib.qualifyContractsAsync(option)
+                    
+                    if qualified and qualified[0] is not None:
+                        logger.info(f"[{symbol}] ✅ Successfully qualified with expiry {next_expiry}")
+                        break
+                else:
+                    logger.warning(f"[{symbol}] No strikes available for next expiry {next_expiry}")
+                
+        if not qualified or qualified[0] is None:
             logger.warning(
                 f"[{symbol}] ⚠️ Failed to qualify option with full parameters. Trying aggressive fallback (relaxing Exchange/Class)..."
             )
@@ -419,7 +593,7 @@ async def get_0dte_option_chain(
             )
             qualified = await ibkr_client.ib.qualifyContractsAsync(option)
 
-        if not qualified:
+        if not qualified or qualified[0] is None:
             logger.warning(
                 f"[{symbol}] ⚠️ Final fallback: Attempting Nuclear Discovery (Broadest Search)..."
             )
@@ -435,20 +609,39 @@ async def get_0dte_option_chain(
                 logger.info(
                     f"[{symbol}] ✅ Found matching contract via discovery: {qualified[0].localSymbol} (Details: {len(details)} matches)"
                 )
+            else:
+                # Last resort: Try nearby strikes (round to common intervals: 2.5, 5)
+                logger.warning(f"[{symbol}] Trying nearby strikes (rounding to common intervals)")
+                for strike_adjustment in [2.5, 5.0, -2.5, -5.0]:
+                    adjusted_strike = round((atm_strike + strike_adjustment) * 2) / 2  # Round to nearest 0.5
+                    logger.info(f"[{symbol}] Trying adjusted strike: {adjusted_strike}")
+                    option.strike = adjusted_strike
+                    option.multiplier = "100"
+                    details = await ibkr_client.ib.reqContractDetailsAsync(option)
+                    if details:
+                        qualified = [details[0].contract]
+                        logger.info(f"[{symbol}] ✅ Found with adjusted strike {adjusted_strike}: {qualified[0].localSymbol}")
+                        atm_strike = adjusted_strike  # Update for return value
+                        break
 
-        if not qualified:
+        if not qualified or qualified[0] is None:
             logger.error(
                 f"[{symbol}] ❌ Failed to qualify option contract after all fallbacks: {option}"
             )
             return None
 
-        return {
+        logger.info(f"[{symbol}] ✅ Successfully qualified option. Contract conId: {getattr(qualified[0], 'conId', 'N/A')}")
+        logger.debug(f"[{symbol}] Contract type: {type(qualified[0])}")
+        
+        result = {
             "contract": qualified[0],
             "symbol": symbol,
             "strike": atm_strike,
             "expiry": today,
             "right": right,
         }
+        logger.debug(f"[{symbol}] Returning option_data with contract conId: {result['contract'].conId if hasattr(result['contract'], 'conId') else 'N/A'}")
+        return result
 
     except Exception as e:
         logger.exception(f"[{symbol}] Error getting 0 DTE option: {e}")
@@ -576,7 +769,9 @@ async def execute_orb_entry(
 
             # 3. Try Model price
             if (
-                option_ticker.modelOptComp
+                hasattr(option_ticker, 'modelOptComp')
+                and option_ticker.modelOptComp
+                and hasattr(option_ticker.modelOptComp, 'modelPrice')
                 and option_ticker.modelOptComp.modelPrice
                 and not math.isnan(option_ticker.modelOptComp.modelPrice)
             ):
@@ -645,10 +840,10 @@ async def execute_orb_entry(
         qty = quantity
         trade_cost = option_price * qty * 100
 
-        logger.info(
+        logger.debug(
             f"[{symbol}] 🛡️ Risk Guard: Checking capital allocation (70% rule)..."
         )
-        logger.info(
+        logger.debug(
             f"[{symbol}] 🛡️ Risk Guard: Trade Cost ${trade_cost:.2f} | Available 70% Limit ${available_exposure:.2f} | Trading Qty {qty}"
         )
 
@@ -662,7 +857,7 @@ async def execute_orb_entry(
                 trade_cost = option_price * qty * 100
                 if trade_cost > available_exposure:
                     return False
-                logger.info(
+                logger.debug(
                     f"[{symbol}] 🛡️ Risk Guard: Scaled down qty to {qty} to fit allocation limit."
                 )
             else:
@@ -688,7 +883,7 @@ async def execute_orb_entry(
         )
 
         if order_result and order_result.get("status") == "success":
-            # Track position
+            # Track position with bracket order details
             ORB_ACTIVE_POSITIONS[symbol] = {
                 "direction": direction,
                 "entry_price": entry_price,
@@ -698,6 +893,10 @@ async def execute_orb_entry(
                 "option_price": option_price,
                 "qty": qty,
                 "entry_time": get_us_et_now(),
+                "entry_order_id": order_result.get("entry_order_id"),
+                "sl_order_id": order_result.get("sl_order_id"),
+                "target_order_id": order_result.get("target_order_id"),
+                "oca_group": order_result.get("oca_group"),
             }
             ORB_TRADE_TAKEN_TODAY[symbol] = True
 
@@ -735,7 +934,14 @@ async def execute_orb_entry(
 async def force_exit_position(
     symbol: str, ibkr_client: IBKRClient, reason: str = "EOD"
 ):
-    """Force close any open position for symbol."""
+    """
+    Force close any open position for symbol.
+    
+    Steps:
+    1. Cancel all open orders (SL and TP from bracket)
+    2. Close position with market order
+    3. Clean up tracking
+    """
     if symbol not in ORB_ACTIVE_POSITIONS:
         return
 
@@ -746,33 +952,91 @@ async def force_exit_position(
             f"[{symbol}] ⚠️ FORCE EXIT ({reason}): Closing {position['direction']}"
         )
 
-        # Get current positions from API
+        # Step 1: Cancel all open orders for this symbol
+        # This cancels the SL and TP orders from the bracket
+        open_orders = await ibkr_client.get_open_orders()
+        cancelled_count = 0
+        
+        for trade in open_orders:
+            # Cancel if order belongs to this symbol's contract
+            if hasattr(trade, 'contract') and trade.contract.symbol == symbol:
+                try:
+                    ibkr_client.ib.cancelOrder(trade.order)
+                    cancelled_count += 1
+                    logger.debug(f"[{symbol}] Cancelled order ID: {trade.order.orderId}")
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Failed to cancel order {trade.order.orderId}: {e}")
+        
+        if cancelled_count > 0:
+            logger.info(f"[{symbol}] Cancelled {cancelled_count} open order(s)")
+            await asyncio.sleep(1)  # Give time for cancellations to process
+
+        # Step 2: Close position with market order
+        # We're trading OPTIONS, so we need to close the option position
+        option_contract = position.get("option_contract")
+        
+        if not option_contract:
+            logger.error(f"[{symbol}] No option contract in position tracking")
+            return
+        
+        # Get positions and find our option
         positions = await ibkr_client.get_positions()
-
+        
+        logger.debug(f"[{symbol}] Found {len(positions)} total positions in account")
+        logger.debug(f"[{symbol}] Looking for option contract conId: {getattr(option_contract, 'conId', 'N/A')}")
+        
+        position_found = False
         for pos in positions:
-            if pos.get("symbol") == symbol and pos.get("quantity", 0) != 0:
-                # Close position with market order
-                option_contract = position.get("option_contract")
-                qty = abs(pos.get("quantity", 0))
+            # Match by option contract (not underlying symbol)
+            logger.debug(f"[{symbol}] Checking position: {pos.get('contract').symbol if pos.get('contract') else 'N/A'}, conId: {getattr(pos.get('contract'), 'conId', 'N/A')}")
+            
+            if hasattr(pos.get("contract"), "conId") and hasattr(option_contract, "conId"):
+                if pos["contract"].conId == option_contract.conId:
+                    position_found = True
+                    qty = abs(pos.get("position", 0))
+                    
+                    logger.info(f"[{symbol}] Found matching option position: qty={qty}")
+                    
+                    if qty == 0:
+                        logger.warning(f"[{symbol}] Position quantity is 0, nothing to close")
+                        break
+                    
+                    from ib_async import MarketOrder
 
-                from ib_async import MarketOrder
+                    action = "SELL" if pos.get("position", 0) > 0 else "BUY"
+                    order = MarketOrder(action, qty)
+                    trade = ibkr_client.ib.placeOrder(option_contract, order)
 
-                order = MarketOrder("SELL" if pos.get("quantity") > 0 else "BUY", qty)
-                ibkr_client.ib.placeOrder(option_contract, order)
+                    # Wait for fill confirmation
+                    await asyncio.sleep(2)
+                    
+                    # Check if filled
+                    status = trade.orderStatus.status if hasattr(trade, 'orderStatus') else "Unknown"
+                    
+                    msg = (
+                        f"⚠️ ORB FORCE EXIT ({reason}): {symbol}\n"
+                        f"Position: {position['direction']}\n"
+                        f"Entry: ${position['entry_price']:.2f}\n"
+                        f"Qty: {qty} (Action: {action})\n"
+                        f"Status: {status}"
+                    )
+                    send_telegram(msg, broker="IBKR")
+                    logger.info(f"[{symbol}] ✅ Position closed with {action} market order (Status: {status})")
+                    break
+        
+        if not position_found:
+            logger.warning(f"[{symbol}] No open position found in broker (already closed or not synced)")
+            # Still send notification
+            msg = (
+                f"⚠️ ORB FORCE EXIT ({reason}): {symbol}\n"
+                f"Position: {position['direction']}\n"
+                f"Note: No open position found in broker"
+            )
+            send_telegram(msg, broker="IBKR")
 
-                await asyncio.sleep(2)
-
-                msg = (
-                    f"⚠️ ORB FORCE EXIT ({reason}): {symbol}\n"
-                    f"Position: {position['direction']}\n"
-                    f"Entry: ${position['entry_price']:.2f}"
-                )
-                send_telegram(msg, broker="IBKR")
-                logger.info(f"[{symbol}] ✅ Position closed successfully")
-                break
-
-        # Remove from tracking
+        # Step 3: Remove from tracking
         del ORB_ACTIVE_POSITIONS[symbol]
+        logger.info(f"[{symbol}] Removed from active positions tracking")
 
     except Exception as e:
         logger.exception(f"[{symbol}] Force exit error: {e}")
@@ -1083,11 +1347,16 @@ async def _async_ibkr_session():
         ibkr_client = IBKRClient()
         ibkr_client.option_chains_cache.clear()
         await ibkr_client.connect_async()
+        
+        # Check broker for any trades placed today and mark them
+        for symbol in ORB_IBKR_SYMBOLS:
+            if await check_symbol_traded_today(symbol, ibkr_client):
+                ORB_TRADE_TAKEN_TODAY[symbol] = True
 
         # Startup Recovery: Scan broker for existing ORB-relevant positions
         await recover_active_positions(ibkr_client)
 
-        cash_mgr = LiveCashManager(ibkr_client)
+        cash_mgr = LiveCashManager(ibkr_client, broker="IBKR")
         await cash_mgr.check_and_log_start_balance()
 
         # Wait for ORB period to complete

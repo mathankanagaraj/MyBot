@@ -13,12 +13,15 @@ services:
       - ./logs:/app/logs
       - ./audit:/app/audit
     restart: unless-stopped
+    profiles:
+      - angel
+      - all
 
   ibkr_bot:
     image: options_bot:latest
-    # Build handled by angel_bot service to avoid race condition
-    depends_on:
-      - angel_bot
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: ibkr_bot
     env_file: .env
     environment:
@@ -29,3 +32,6 @@ services:
       - ./logs:/app/logs
       - ./audit:/app/audit
     restart: unless-stopped
+    profiles:
+      - ibkr
+      - all

@@ -1087,6 +1087,7 @@ class AngelClient:
                 logger.warning("Target order placement failed")
 
             result = {
+                "status": "success",
                 "entry_order_id": entry_order_id,
                 "sl_order_id": sl_order_id,
                 "target_order_id": target_order_id,
