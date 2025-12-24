@@ -583,83 +583,132 @@ async def force_exit_position(
     2. Close position with market order
     3. Clean up tracking
     """
-    if symbol not in ORB_ACTIVE_POSITIONS:
+    # Check if we have local tracking for this position
+    has_local_tracking = symbol in ORB_ACTIVE_POSITIONS
+    position = ORB_ACTIVE_POSITIONS.get(symbol, {})
+    
+    # Even if not in local tracking, check broker for actual positions
+    positions = await get_cached_positions(angel_client)
+    broker_position = None
+    
+    for pos in positions:
+        trading_symbol = pos.get("tradingsymbol", "")
+        # Check if this position belongs to our symbol (starts with symbol name)
+        if trading_symbol.startswith(symbol) and int(pos.get("netqty", 0)) != 0:
+            broker_position = pos
+            break
+    
+    # If no position found anywhere, nothing to exit
+    if not has_local_tracking and not broker_position:
+        logger.debug(f"[{symbol}] No position to force exit (not in tracking or broker)")
         return
-
-    position = ORB_ACTIVE_POSITIONS[symbol]
+    
+    logger.warning(
+        f"[{symbol}] ⚠️ FORCE EXIT ({reason}): Closing {'tracked' if has_local_tracking else 'broker'} position"
+    )
 
     try:
-        logger.warning(
-            f"[{symbol}] ⚠️ FORCE EXIT ({reason}): Closing {position['direction']}"
-        )
-
-        # Step 1: Cancel SL and TP orders
+        # Step 1: Cancel SL and TP orders (only if we have local tracking)
         cancelled_count = 0
         
-        # Cancel stop-loss order
-        sl_order_id = position.get("sl_order_id")
-        if sl_order_id:
-            try:
-                await asyncio.to_thread(
-                    angel_client.smart_api.cancelOrder, sl_order_id, "STOPLOSS"
-                )
-                cancelled_count += 1
-                logger.debug(f"[{symbol}] Cancelled SL order: {sl_order_id}")
-            except Exception as e:
-                logger.warning(f"[{symbol}] Failed to cancel SL order {sl_order_id}: {e}")
-        
-        # Cancel target order
-        target_order_id = position.get("target_order_id")
-        if target_order_id:
-            try:
-                await asyncio.to_thread(
-                    angel_client.smart_api.cancelOrder, target_order_id, "NORMAL"
-                )
-                cancelled_count += 1
-                logger.debug(f"[{symbol}] Cancelled Target order: {target_order_id}")
-            except Exception as e:
-                logger.warning(f"[{symbol}] Failed to cancel Target order {target_order_id}: {e}")
-        
-        if cancelled_count > 0:
-            logger.info(f"[{symbol}] Cancelled {cancelled_count} open order(s)")
-            await asyncio.sleep(1)  # Give time for cancellations to process
+        if has_local_tracking:
+            # Cancel stop-loss order
+            sl_order_id = position.get("sl_order_id")
+            if sl_order_id:
+                try:
+                    await asyncio.to_thread(
+                        angel_client.smart_api.cancelOrder, sl_order_id, "STOPLOSS"
+                    )
+                    cancelled_count += 1
+                    logger.debug(f"[{symbol}] Cancelled SL order: {sl_order_id}")
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Failed to cancel SL order {sl_order_id}: {e}")
+            
+            # Cancel target order
+            target_order_id = position.get("target_order_id")
+            if target_order_id:
+                try:
+                    await asyncio.to_thread(
+                        angel_client.smart_api.cancelOrder, target_order_id, "NORMAL"
+                    )
+                    cancelled_count += 1
+                    logger.debug(f"[{symbol}] Cancelled Target order: {target_order_id}")
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Failed to cancel Target order {target_order_id}: {e}")
+            
+            if cancelled_count > 0:
+                logger.info(f"[{symbol}] Cancelled {cancelled_count} open order(s)")
+                await asyncio.sleep(1)  # Give time for cancellations to process
+        else:
+            # No local tracking - try to cancel all orders for this symbol from broker
+            logger.info(f"[{symbol}] No local tracking - checking broker for open orders to cancel")
+            order_book = await get_cached_order_book(angel_client)
+            for order in order_book:
+                trading_symbol = order.get("tradingsymbol", "")
+                order_status = order.get("status", "")
+                if trading_symbol.startswith(symbol) and order_status in ["open", "pending", "trigger pending"]:
+                    order_id = order.get("orderid")
+                    variety = order.get("variety", "NORMAL")
+                    try:
+                        await asyncio.to_thread(
+                            angel_client.smart_api.cancelOrder, order_id, variety
+                        )
+                        cancelled_count += 1
+                        logger.debug(f"[{symbol}] Cancelled order: {order_id} ({variety})")
+                    except Exception as e:
+                        logger.warning(f"[{symbol}] Failed to cancel order {order_id}: {e}")
+            
+            if cancelled_count > 0:
+                logger.info(f"[{symbol}] Cancelled {cancelled_count} broker order(s)")
+                await asyncio.sleep(1)
 
         # Step 2: Close position with market order
-        positions = await get_cached_positions(angel_client)
-        option_symbol = position.get("option_symbol")
-        option_token = position.get("option_token")
+        # Use broker position if we found one, otherwise use local tracking
+        if broker_position:
+            option_symbol = broker_position.get("tradingsymbol")
+            option_token = broker_position.get("symboltoken")
+            qty = abs(int(broker_position.get("netqty", 0)))
+            side = "SELL" if int(broker_position.get("netqty", 0)) > 0 else "BUY"
+        else:
+            option_symbol = position.get("option_symbol")
+            option_token = position.get("option_token")
+            # Need to check actual position for qty
+            qty = None
+            side = None
 
-        for pos in positions:
-            if (
-                pos.get("tradingsymbol") == option_symbol
-                and int(pos.get("netqty", 0)) != 0
-            ):
-                # Close position
-                side = "SELL" if int(pos.get("netqty", 0)) > 0 else "BUY"
-                qty = abs(int(pos.get("netqty", 0)))
+        # If we have qty and side, close the position
+        if qty and side and option_symbol and option_token:
+            close_result = await angel_client.place_order(
+                symbol=option_symbol,
+                token=option_token,
+                qty=qty,
+                side=side,
+                order_type="MARKET",
+            )
 
-                close_result = await angel_client.place_order(
-                    symbol=option_symbol,
-                    token=option_token,
-                    qty=qty,
-                    side=side,
-                    order_type="MARKET",
-                )
+            direction = position.get('direction', 'UNKNOWN') if has_local_tracking else ('LONG' if side == 'SELL' else 'SHORT')
+            entry_price = position.get('entry_price', 0.0) if has_local_tracking else 0.0
+            
+            msg = (
+                f"⚠️ ORB FORCE EXIT ({reason}): {symbol}\n"
+                f"Option: {option_symbol}\n"
+                f"Direction: {direction}\n"
+            )
+            if entry_price > 0:
+                msg += f"Entry: ₹{entry_price:.2f}\n"
+            msg += (
+                f"Qty: {qty} (Action: {side})\n"
+                f"Status: {'Success' if close_result else 'Failed'}"
+            )
+            send_telegram(msg, broker="ANGEL")
+            logger.info(f"[{symbol}] ✅ Position closed with {side} market order")
+        else:
+            logger.warning(f"[{symbol}] Could not determine position details for closing")
 
-                msg = (
-                    f"⚠️ ORB FORCE EXIT ({reason}): {symbol}\n"
-                    f"Position: {position['direction']}\n"
-                    f"Entry: ₹{position['entry_price']:.2f}\n"
-                    f"Qty: {qty} (Action: {side})\n"
-                    f"Status: {'Success' if close_result else 'Failed'}"
-                )
-                send_telegram(msg, broker="ANGEL")
-                logger.info(f"[{symbol}] ✅ Position closed with {side} market order")
-                break
-
-        # Step 3: Remove from tracking
-        del ORB_ACTIVE_POSITIONS[symbol]
-        logger.info(f"[{symbol}] Removed from active positions tracking")
+        # Step 3: Remove from tracking if present
+        if has_local_tracking:
+            del ORB_ACTIVE_POSITIONS[symbol]
+            logger.info(f"[{symbol}] Removed from active positions tracking")
 
     except Exception as e:
         logger.exception(f"[{symbol}] Force exit error: {e}")
