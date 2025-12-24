@@ -623,9 +623,12 @@ class IBKRClient:
             logger.exception(f"Error getting open orders: {e}")
             return []
 
-    async def get_account_summary_async(self) -> Dict:
+    async def get_account_summary_async(self, currency: str = "USD") -> Dict:
         """
         Get account summary including available funds and margins.
+
+        Args:
+            currency: Currency to filter for (default: USD)
 
         Returns:
             Dict with account details
@@ -636,6 +639,10 @@ class IBKRClient:
 
             summary = {}
             for value in account_values:
+                # Filter by currency - only include USD balances
+                if value.currency != currency:
+                    continue
+                    
                 if value.tag == "AvailableFunds":
                     summary["AvailableFunds"] = float(value.value)
                 elif value.tag == "TotalCashValue":
@@ -643,6 +650,7 @@ class IBKRClient:
                 elif value.tag == "NetLiquidation":
                     summary["NetLiquidation"] = float(value.value)
 
+            logger.debug(f"Account summary ({currency}): {summary}")
             return summary
 
         except Exception as e:

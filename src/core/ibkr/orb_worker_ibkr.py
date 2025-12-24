@@ -27,6 +27,7 @@ from core.config import (
     ORB_ATR_MULTIPLIER,
     ORB_RISK_REWARD,
     ORB_MAX_ENTRY_HOUR,
+    ORB_MAX_ENTRY_MINUTE,
     ORB_BREAKOUT_TIMEFRAME,
     US_MARKET_OPEN_HOUR,
     US_MARKET_OPEN_MINUTE,
@@ -71,6 +72,55 @@ MARKET_CLOSE_TIME = time(US_MARKET_CLOSE_HOUR, US_MARKET_CLOSE_MINUTE)
 # -----------------------------
 # Helper Functions
 # -----------------------------
+async def check_all_symbols_traded_today(symbols: list, ibkr_client) -> dict:
+    """
+    Batch check if any of the given symbols were traded today.
+    Fetches fills and orders once and checks all symbols against them.
+    
+    Args:
+        symbols: List of symbols to check
+        ibkr_client: IBKRClient instance
+        
+    Returns:
+        Dict mapping symbol to bool (True if traded today)
+    """
+    result = {symbol: False for symbol in symbols}
+    
+    try:
+        # Get today's date range
+        today_start = get_us_et_now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Check recent trades (fills) - single call
+        fills = ibkr_client.ib.fills()
+        for fill in fills:
+            if hasattr(fill, 'time') and fill.time.date() >= today_start.date():
+                contract = fill.contract
+                contract_symbol = getattr(contract, 'symbol', '')
+                
+                if contract_symbol in symbols and not result[contract_symbol]:
+                    logger.info(f"[{contract_symbol}] 💾 Found filled order from today in broker history")
+                    result[contract_symbol] = True
+        
+        # Also check open trades - single call
+        trades = await ibkr_client.get_open_orders()
+        for trade in trades:
+            if hasattr(trade, 'contract'):
+                contract_symbol = trade.contract.symbol
+                if contract_symbol in symbols and not result[contract_symbol]:
+                    if hasattr(trade, 'log') and trade.log:
+                        first_log = trade.log[0]
+                        if hasattr(first_log, 'time') and first_log.time.date() >= today_start.date():
+                            logger.info(f"[{contract_symbol}] 💾 Found open order from today in broker history")
+                            result[contract_symbol] = True
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error checking broker history for all symbols: {e}")
+        # On error, return False for all
+        return result
+
+
 async def check_symbol_traded_today(symbol: str, ibkr_client: IBKRClient) -> bool:
     """
     Check if we already placed an ORB entry order for this symbol today.
@@ -1203,6 +1253,8 @@ async def orb_signal_monitor(
                     continue
 
             # Check if trade already taken
+            # Note: We rely on in-memory flag that was seeded from broker on startup
+            # and gets set to True when we place an order. This avoids repeated API calls.
             if ORB_TRADE_TAKEN_TODAY.get(symbol, False):
                 logger.debug(
                     f"[{symbol}] Trade already taken today, monitoring position"
@@ -1216,13 +1268,15 @@ async def orb_signal_monitor(
                 max_entry_hour=ORB_MAX_ENTRY_HOUR,
                 trade_taken_today=ORB_TRADE_TAKEN_TODAY.get(symbol, False),
                 symbol=symbol,
+                current_minute=now.minute,
+                max_entry_minute=ORB_MAX_ENTRY_MINUTE,
             )
 
             if not allowed:
                 if reason == "past_max_entry_hour":
-                    logger.info(f"[{symbol}] Past max entry hour, stopping monitor")
+                    logger.info(f"[{symbol}] Past max entry time, stopping monitor")
                     send_telegram(
-                        f"🏁 [{symbol}] ORB Strategy (IBKR): Past max entry hour ({ORB_MAX_ENTRY_HOUR}:00). Stopping monitor for today.",
+                        f"🏁 [{symbol}] ORB Strategy (IBKR): Past max entry time ({ORB_MAX_ENTRY_HOUR:02d}:{ORB_MAX_ENTRY_MINUTE:02d}). Stopping monitor for today.",
                         broker="IBKR",
                     )
                     break
@@ -1348,9 +1402,10 @@ async def _async_ibkr_session():
         ibkr_client.option_chains_cache.clear()
         await ibkr_client.connect_async()
         
-        # Check broker for any trades placed today and mark them
-        for symbol in ORB_IBKR_SYMBOLS:
-            if await check_symbol_traded_today(symbol, ibkr_client):
+        # Check broker for any trades placed today and mark them (single batch call)
+        traded_symbols = await check_all_symbols_traded_today(ORB_IBKR_SYMBOLS, ibkr_client)
+        for symbol, is_traded in traded_symbols.items():
+            if is_traded:
                 ORB_TRADE_TAKEN_TODAY[symbol] = True
 
         # Startup Recovery: Scan broker for existing ORB-relevant positions

@@ -369,6 +369,8 @@ def check_orb_trade_allowed(
     max_entry_hour: int,
     trade_taken_today: bool,
     symbol: str = "UNKNOWN",
+    current_minute: int = 0,
+    max_entry_minute: int = 0,
 ) -> Tuple[bool, str]:
     """
     Check if ORB trade is allowed based on time and daily limit.
@@ -378,6 +380,8 @@ def check_orb_trade_allowed(
         max_entry_hour: Maximum hour for entries (e.g., 14 = no entries after 2 PM)
         trade_taken_today: Whether a trade has already been taken today
         symbol: Symbol for logging
+        current_minute: Current minute (0-59)
+        max_entry_minute: Maximum minute for entries (e.g., 15 = no entries after :15)
 
     Returns:
         Tuple of (is_allowed, reason)
@@ -386,9 +390,13 @@ def check_orb_trade_allowed(
         logger.debug(f"[{symbol}] ORB: Trade already taken today")
         return False, "trade_taken_today"
 
-    if current_hour >= max_entry_hour:
+    # Compare time: (hour, minute) tuple
+    current_time = (current_hour, current_minute)
+    max_time = (max_entry_hour, max_entry_minute)
+    
+    if current_time >= max_time:
         logger.debug(
-            f"[{symbol}] ORB: Past max entry hour ({current_hour} >= {max_entry_hour})"
+            f"[{symbol}] ORB: Past max entry time ({current_hour:02d}:{current_minute:02d} >= {max_entry_hour:02d}:{max_entry_minute:02d})"
         )
         return False, "past_max_entry_hour"
 

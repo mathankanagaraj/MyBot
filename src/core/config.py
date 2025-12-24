@@ -229,17 +229,26 @@ ORB_RISK_REWARD = float(os.getenv("ORB_RISK_REWARD", "1.5"))  # 1:1.5 risk-rewar
 # Breakout confirmation timeframe (30 = 30-min candles for higher conviction)
 ORB_BREAKOUT_TIMEFRAME = int(os.getenv("ORB_BREAKOUT_TIMEFRAME", "30"))
 
-# ORB Entry Limits (stop taking entries after this hour)
+# ORB Entry Limits (stop taking entries after this time)
 # Separate limits for different markets
-ORB_MAX_ENTRY_HOUR_IBKR = int(
-    os.getenv("ORB_MAX_ENTRY_HOUR_IBKR", "15")
-)  # 3 PM ET for US futures/stocks
-ORB_MAX_ENTRY_HOUR_ANGEL = int(
-    os.getenv("ORB_MAX_ENTRY_HOUR_ANGEL", "14")
-)  # 2 PM IST for Indian markets
+# Format: "HH.MM" (e.g., "15.15" = 3:15 PM)
+
+def _parse_time_string(time_str: str) -> tuple[int, int]:
+    """Parse time string like '15.15' into (hour, minute) tuple."""
+    parts = time_str.split(".")
+    hour = int(parts[0])
+    minute = int(parts[1]) if len(parts) > 1 else 0
+    return hour, minute
+
+ORB_MAX_ENTRY_TIME_IBKR = os.getenv("ORB_MAX_ENTRY_TIME_IBKR", "15.15")  # 3:15 PM ET for US futures/stocks
+ORB_MAX_ENTRY_HOUR_IBKR, ORB_MAX_ENTRY_MINUTE_IBKR = _parse_time_string(ORB_MAX_ENTRY_TIME_IBKR)
+
+ORB_MAX_ENTRY_TIME_ANGEL = os.getenv("ORB_MAX_ENTRY_TIME_ANGEL", "14.15")  # 2:15 PM IST for Indian markets
+ORB_MAX_ENTRY_HOUR_ANGEL, ORB_MAX_ENTRY_MINUTE_ANGEL = _parse_time_string(ORB_MAX_ENTRY_TIME_ANGEL)
 
 # Backward compatibility: use generic setting if broker-specific not set
 ORB_MAX_ENTRY_HOUR = ORB_MAX_ENTRY_HOUR_IBKR if BROKER == "IBKR" else ORB_MAX_ENTRY_HOUR_ANGEL
+ORB_MAX_ENTRY_MINUTE = ORB_MAX_ENTRY_MINUTE_IBKR if BROKER == "IBKR" else ORB_MAX_ENTRY_MINUTE_ANGEL
 
 # ============================================================================
 # LOGGING & AUDIT

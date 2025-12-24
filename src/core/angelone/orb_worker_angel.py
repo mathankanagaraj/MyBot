@@ -23,6 +23,7 @@ from core.config import (
     ORB_ATR_MULTIPLIER,
     ORB_RISK_REWARD,
     ORB_MAX_ENTRY_HOUR,
+    ORB_MAX_ENTRY_MINUTE,
     ORB_BREAKOUT_TIMEFRAME,
     NSE_MARKET_OPEN_HOUR,
     NSE_MARKET_OPEN_MINUTE,
@@ -63,10 +64,146 @@ IST = pytz.timezone(ANGEL_TIMEZONE)
 MARKET_OPEN_TIME = time(NSE_MARKET_OPEN_HOUR, NSE_MARKET_OPEN_MINUTE)
 MARKET_CLOSE_TIME = time(NSE_MARKET_CLOSE_HOUR, NSE_MARKET_CLOSE_MINUTE)
 
+# Cache for order book to avoid rate limiting (60 second TTL)
+_ORDER_BOOK_CACHE = {"data": None, "timestamp": None}
+_ORDER_BOOK_CACHE_TTL = 60  # seconds
+_ORDER_BOOK_CACHE_LOCK = None  # asyncio.Lock, initialized at runtime
+
+# Cache for positions to avoid rate limiting (60 second TTL)
+_POSITIONS_CACHE = {"data": None, "timestamp": None}
+_POSITIONS_CACHE_TTL = 60  # seconds
+_POSITIONS_CACHE_LOCK = None  # asyncio.Lock, initialized at runtime
+
+
+async def get_cached_order_book(angel_client) -> list:
+    """
+    Get order book with caching to avoid rate limiting.
+    Cache is valid for 60 seconds. Uses lock to prevent concurrent refreshes.
+    """
+    import time as time_module
+    global _ORDER_BOOK_CACHE, _ORDER_BOOK_CACHE_LOCK
+    now = time_module.time()
+    
+    # Check if cache is valid (fast path, no lock needed)
+    if (_ORDER_BOOK_CACHE["data"] is not None and 
+        _ORDER_BOOK_CACHE["timestamp"] is not None and
+        (now - _ORDER_BOOK_CACHE["timestamp"]) < _ORDER_BOOK_CACHE_TTL):
+        logger.debug(f"Using cached order book (age: {int(now - _ORDER_BOOK_CACHE['timestamp'])}s)")
+        return _ORDER_BOOK_CACHE["data"]
+    
+    # Cache expired or empty - need to refresh (acquire lock to prevent concurrent refreshes)
+    async with _ORDER_BOOK_CACHE_LOCK:
+        # Double-check after acquiring lock (another task may have just refreshed)
+        now = time_module.time()
+        if (_ORDER_BOOK_CACHE["data"] is not None and 
+            _ORDER_BOOK_CACHE["timestamp"] is not None and
+            (now - _ORDER_BOOK_CACHE["timestamp"]) < _ORDER_BOOK_CACHE_TTL):
+            logger.debug(f"Cache refreshed by another task (age: {int(now - _ORDER_BOOK_CACHE['timestamp'])}s)")
+            return _ORDER_BOOK_CACHE["data"]
+        
+        # Fetch fresh data (only one task does this)
+        try:
+            order_book = await angel_client.get_order_book()
+            _ORDER_BOOK_CACHE["data"] = order_book
+            _ORDER_BOOK_CACHE["timestamp"] = time_module.time()
+            logger.debug("Fetched fresh order book from broker")
+            return order_book
+        except Exception as e:
+            logger.error(f"Error fetching order book: {e}")
+            # Return cached data even if stale, or empty list
+            return _ORDER_BOOK_CACHE["data"] if _ORDER_BOOK_CACHE["data"] is not None else []
+
+
+async def get_cached_positions(angel_client) -> list:
+    """
+    Get positions with caching to avoid rate limiting.
+    Cache is valid for 60 seconds. Uses lock to prevent concurrent refreshes.
+    """
+    import time as time_module
+    global _POSITIONS_CACHE, _POSITIONS_CACHE_LOCK
+    now = time_module.time()
+    
+    # Check if cache is valid (fast path, no lock needed)
+    if (_POSITIONS_CACHE["data"] is not None and 
+        _POSITIONS_CACHE["timestamp"] is not None and
+        (now - _POSITIONS_CACHE["timestamp"]) < _POSITIONS_CACHE_TTL):
+        logger.debug(f"Using cached positions (age: {int(now - _POSITIONS_CACHE['timestamp'])}s)")
+        return _POSITIONS_CACHE["data"]
+    
+    # Cache expired or empty - need to refresh (acquire lock to prevent concurrent refreshes)
+    async with _POSITIONS_CACHE_LOCK:
+        # Double-check after acquiring lock (another task may have just refreshed)
+        now = time_module.time()
+        if (_POSITIONS_CACHE["data"] is not None and 
+            _POSITIONS_CACHE["timestamp"] is not None and
+            (now - _POSITIONS_CACHE["timestamp"]) < _POSITIONS_CACHE_TTL):
+            logger.debug(f"Cache refreshed by another task (age: {int(now - _POSITIONS_CACHE['timestamp'])}s)")
+            return _POSITIONS_CACHE["data"]
+        
+        # Fetch fresh data (only one task does this)
+        try:
+            positions = await angel_client.get_positions()
+            _POSITIONS_CACHE["data"] = positions
+            _POSITIONS_CACHE["timestamp"] = time_module.time()
+            logger.debug("Fetched fresh positions from broker")
+            return positions
+        except Exception as e:
+            logger.error(f"Error fetching positions: {e}")
+            # Return cached data even if stale, or empty list
+            return _POSITIONS_CACHE["data"] if _POSITIONS_CACHE["data"] is not None else []
+
 
 # -----------------------------
 # Helper Functions
 # -----------------------------
+async def check_all_symbols_traded_today(symbols: list, angel_client) -> dict:
+    """
+    Batch check if any of the given symbols were traded today.
+    Fetches order book once and checks all symbols against it.
+    
+    Args:
+        symbols: List of symbols to check
+        angel_client: AngelClient instance
+        
+    Returns:
+        Dict mapping symbol to bool (True if traded today)
+    """
+    result = {symbol: False for symbol in symbols}
+    
+    try:
+        # Get today's date
+        today_str = get_ist_now().strftime("%d-%b-%Y").upper()  # Format: 23-DEC-2025
+        
+        # Use cached order book (already fetched during startup)
+        order_book = await get_cached_order_book(angel_client)
+        
+        if not order_book:
+            logger.debug("No order book data from cache")
+            return result
+        
+        # Check all symbols against the order book
+        for order in order_book:
+            order_date = order.get('ordertime', '')
+            if order_date:
+                order_date_only = order_date.split(' ')[0].upper()
+                
+                if order_date_only == today_str:
+                    trading_symbol = order.get('tradingsymbol', '')
+                    logger.debug(f"Checking order: {trading_symbol} from {order_date_only}")
+                    # Check which symbol this order belongs to
+                    for symbol in symbols:
+                        if trading_symbol.startswith(symbol) and not result[symbol]:
+                            logger.info(f"[{symbol}] 💾 Found order from today in broker history: {trading_symbol}")
+                            result[symbol] = True
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error checking broker history for all symbols: {e}")
+        # On error, return False for all
+        return result
+
+
 async def check_symbol_traded_today(symbol: str, angel_client: AngelClient) -> bool:
     """
     Check if we already placed an ORB entry order for this symbol today.
@@ -81,8 +218,8 @@ async def check_symbol_traded_today(symbol: str, angel_client: AngelClient) -> b
         # Get today's date
         today_str = get_ist_now().strftime("%d-%b-%Y").upper()  # Format: 23-DEC-2025
         
-        # Get order book from broker
-        order_book = await angel_client.get_order_book()
+        # Get order book from broker (using cache to avoid rate limiting)
+        order_book = await get_cached_order_book(angel_client)
         
         if not order_book:
             logger.debug(f"[{symbol}] No order book data from broker")
@@ -142,7 +279,7 @@ async def is_symbol_occupied(
             return True
 
         # 2. Broker Positions check
-        positions = await angel_client.get_positions()
+        positions = await get_cached_positions(angel_client)
         for pos in positions:
             # For Angel, we check the underlying symbol match in positions
             # Usually positions are for the OPTION symbol, so we check if any netqty > 0
@@ -158,7 +295,7 @@ async def is_symbol_occupied(
                     return True
 
         # 3. Broker Order Book check (pending orders)
-        order_book = await angel_client.get_order_book()
+        order_book = await get_cached_order_book(angel_client)
         for order in order_book:
             status = order.get("status", "")
             if status in ["ordered", "trigger pending", "open"]:
@@ -182,7 +319,7 @@ async def recover_active_positions(angel_client: AngelClient):
     """
     try:
         logger.info("🔍 Scanning for existing Angel positions to recover state...")
-        positions = await angel_client.get_positions()
+        positions = await get_cached_positions(angel_client)
         for pos in positions:
             if int(pos.get("netqty", 0)) != 0:
                 tradingsymbol = pos.get("tradingsymbol", "")
@@ -352,11 +489,27 @@ async def execute_orb_entry(
             f"[{symbol}]   Option SL Price: ₹{option_sl_price:.2f}, TP: ₹{option_tp_price:.2f} (RR: 1:{ORB_RISK_REWARD})"
         )
 
+        # Check if we can open this position (risk limits and balance)
+        total_qty = qty * option_selection.lot_size
+        estimated_cost = option_ltp * total_qty
+        
+        can_trade = await cash_mgr.can_open_position(symbol, estimated_cost)
+        if not can_trade:
+            logger.error(
+                f"[{symbol}] ❌ Cannot open position due to risk limits or insufficient balance"
+            )
+            send_telegram(
+                f"❌ Order Rejected: {symbol}\nRisk limit exceeded or insufficient balance\nCost: ₹{estimated_cost:.2f}",
+                broker="ANGEL"
+            )
+            return False
+        logger.info(f"[{symbol}] ✅ Risk check passed. Estimated cost: ₹{estimated_cost:.2f}")
+
         # Place bracket order
         order_result = await angel_client.place_bracket_order(
             option_symbol=option_selection.symbol,
             option_token=option_selection.token,
-            quantity=qty * option_selection.lot_size,
+            quantity=total_qty,
             stop_loss_price=round(option_sl_price, 1),
             target_price=round(option_tp_price, 1),
         )
@@ -391,16 +544,17 @@ async def execute_orb_entry(
 
             # Audit log
             write_audit_row(
-                {
-                    "timestamp": get_ist_now().isoformat(),
-                    "symbol": symbol,
+                timestamp=get_ist_now().isoformat(),
+                symbol=symbol,
+                bias=direction,
+                option=option_selection.symbol,
+                entry_price=entry_price,
+                stop=stop_loss,
+                target=take_profit,
+                details={
                     "strategy": "ORB",
-                    "direction": direction,
-                    "entry_price": entry_price,
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                    "option_symbol": option_selection.symbol,
                     "qty": qty,
+                    "option_strike": option_selection.strike,
                 }
             )
 
@@ -471,7 +625,7 @@ async def force_exit_position(
             await asyncio.sleep(1)  # Give time for cancellations to process
 
         # Step 2: Close position with market order
-        positions = await angel_client.get_positions()
+        positions = await get_cached_positions(angel_client)
         option_symbol = position.get("option_symbol")
         option_token = position.get("option_token")
 
@@ -646,6 +800,8 @@ async def orb_signal_monitor(
                     continue
 
             # Check if trade already taken
+            # Note: We rely on in-memory flag that was seeded from broker on startup
+            # and gets set to True when we place an order. This avoids repeated API calls.
             if ORB_TRADE_TAKEN_TODAY.get(symbol, False):
                 logger.debug(
                     f"[{symbol}] Trade already taken today, monitoring position"
@@ -659,13 +815,15 @@ async def orb_signal_monitor(
                 max_entry_hour=ORB_MAX_ENTRY_HOUR,
                 trade_taken_today=ORB_TRADE_TAKEN_TODAY.get(symbol, False),
                 symbol=symbol,
+                current_minute=now.minute,
+                max_entry_minute=ORB_MAX_ENTRY_MINUTE,
             )
 
             if not allowed:
                 if reason == "past_max_entry_hour":
-                    logger.info(f"[{symbol}] Past max entry hour, stopping monitor")
+                    logger.info(f"[{symbol}] Past max entry time, stopping monitor")
                     send_telegram(
-                        f"🏁 [{symbol}] ORB Strategy: Past max entry hour ({ORB_MAX_ENTRY_HOUR}:00). Stopping monitor for today.",
+                        f"🏁 [{symbol}] ORB Strategy: Past max entry time ({ORB_MAX_ENTRY_HOUR:02d}:{ORB_MAX_ENTRY_MINUTE:02d}). Stopping monitor for today.",
                         broker="ANGEL",
                     )
                     break
@@ -683,7 +841,8 @@ async def orb_signal_monitor(
             # Note: df comes from resample_to_timeframe which might effectively return IST timestamps if BarManager uses IST.
             # Assuming safe comparison.
 
-            cutoff = now
+            # Convert cutoff to naive datetime to match DataFrame index
+            cutoff = now.replace(tzinfo=None)
             completed_bars = df[df.index <= cutoff]
 
             if completed_bars.empty:
@@ -797,18 +956,35 @@ async def _async_daily_session():
         import threading
 
         # CRITICAL: Re-initialize stop event in the new process's event loop
-        global _STOP_EVENT
+        global _STOP_EVENT, _ORDER_BOOK_CACHE_LOCK, _POSITIONS_CACHE_LOCK
         _STOP_EVENT = asyncio.Event()
+        _ORDER_BOOK_CACHE_LOCK = asyncio.Lock()
+        _POSITIONS_CACHE_LOCK = asyncio.Lock()
 
         angel_client = AngelClient()
         await angel_client.connect_async()
         
-        # Check broker for any trades placed today and mark them
-        for symbol in ORB_ANGEL_SYMBOLS:
-            if await check_symbol_traded_today(symbol, angel_client):
+        # Fetch order book ONCE and populate cache (single API call for all symbols)
+        logger.info("📋 Fetching order book from broker to check today's trades...")
+        try:
+            order_book = await angel_client.get_order_book()
+            # Populate cache immediately
+            import time as time_module
+            global _ORDER_BOOK_CACHE
+            _ORDER_BOOK_CACHE["data"] = order_book
+            _ORDER_BOOK_CACHE["timestamp"] = time_module.time()
+            logger.info(f"✅ Order book cached ({len(order_book)} orders)")
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch order book on startup: {e}")
+            order_book = []
+        
+        # Now check which symbols were traded (uses cached data)
+        traded_symbols = await check_all_symbols_traded_today(ORB_ANGEL_SYMBOLS, angel_client)
+        for symbol, is_traded in traded_symbols.items():
+            if is_traded:
                 ORB_TRADE_TAKEN_TODAY[symbol] = True
 
-        cash_mgr = LiveCashManager(angel_client)
+        cash_mgr = LiveCashManager(angel_client, broker="ANGEL")
         await cash_mgr.check_and_log_start_balance()
 
         # Startup Recovery: Scan for existing positions

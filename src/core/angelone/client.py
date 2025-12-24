@@ -1064,11 +1064,17 @@ class AngelClient:
                 product_type=product_type,
                 variety="STOPLOSS",  # Important: usually STOPLOSS variety for SL orders
             )
-            sl_order_id = sl_order.get("data", {}).get("orderid") if sl_order else None
-            if not sl_order_id:
-                logger.warning("Stop-loss order placement failed")
+            
+            if not sl_order or not sl_order.get("data"):
+                logger.error(f"Stop-loss order placement failed. Response: {sl_order}")
+                sl_order_id = None
+            else:
+                sl_order_id = sl_order.get("data", {}).get("orderid")
+                if not sl_order_id:
+                    logger.warning(f"SL order placement returned success but no order ID: {sl_order}")
 
             # --- Place Target ---
+            # For target order, we're closing the position so product_type should match entry
             target_order = await self.place_order(
                 symbol=option_symbol,
                 token=option_token,
@@ -1077,14 +1083,16 @@ class AngelClient:
                 quantity=quantity,
                 order_type="LIMIT",
                 price=target_price,
-                product_type=product_type,
-                variety="NORMAL",
+                product_type=product_type,  # Must match entry product type
             )
-            target_order_id = (
-                target_order.get("data", {}).get("orderid") if target_order else None
-            )
-            if not target_order_id:
-                logger.warning("Target order placement failed")
+            
+            if not target_order or not target_order.get("data"):
+                logger.error(f"Target order placement failed. Response: {target_order}")
+                target_order_id = None
+            else:
+                target_order_id = target_order.get("data", {}).get("orderid")
+                if not target_order_id:
+                    logger.warning(f"Target order placement returned success but no order ID: {target_order}")
 
             result = {
                 "status": "success",
