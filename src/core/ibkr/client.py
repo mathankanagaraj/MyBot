@@ -625,13 +625,13 @@ class IBKRClient:
 
     async def get_account_summary_async(self, currency: str = "USD") -> Dict:
         """
-        Get account summary including available funds and margins.
+        Get account summary including available funds and margins for a specific currency.
 
         Args:
             currency: Currency to filter for (default: USD)
 
         Returns:
-            Dict with account details
+            Dict with account details for the specified currency
         """
         try:
             # Get account values from IBKR (works for both live and paper trading)
@@ -639,18 +639,36 @@ class IBKRClient:
 
             summary = {}
             for value in account_values:
-                # Filter by currency - only include USD balances
-                if value.currency != currency:
-                    continue
-                    
-                if value.tag == "AvailableFunds":
+                # For currency-specific balances, use the "ByCurrency" fields which give actual currency balances
+                # not converted to base currency
+                if value.tag == "CashBalance" and value.currency == currency:
+                    summary["CashBalance"] = float(value.value)
+                elif value.tag == "TotalCashBalance" and value.currency == currency:
+                    summary["TotalCashBalance"] = float(value.value)
+                elif value.tag == "NetLiquidationByCurrency" and value.currency == currency:
+                    summary["NetLiquidationByCurrency"] = float(value.value)
+                elif value.tag == "AvailableFunds-S" and value.currency == currency:
+                    # AvailableFunds for securities segment in specified currency
                     summary["AvailableFunds"] = float(value.value)
-                elif value.tag == "TotalCashValue":
-                    summary["TotalCashValue"] = float(value.value)
-                elif value.tag == "NetLiquidation":
-                    summary["NetLiquidation"] = float(value.value)
 
-            logger.debug(f"Account summary ({currency}): {summary}")
+            # If we didn't get AvailableFunds, use CashBalance or NetLiquidationByCurrency as fallback
+            if "AvailableFunds" not in summary:
+                if "TotalCashBalance" in summary:
+                    summary["AvailableFunds"] = summary["TotalCashBalance"]
+                elif "NetLiquidationByCurrency" in summary:
+                    summary["AvailableFunds"] = summary["NetLiquidationByCurrency"]
+                elif "CashBalance" in summary:
+                    summary["AvailableFunds"] = summary["CashBalance"]
+
+            # Use NetLiquidationByCurrency as the total value in that currency
+            if "NetLiquidation" not in summary and "NetLiquidationByCurrency" in summary:
+                summary["NetLiquidation"] = summary["NetLiquidationByCurrency"]
+
+            # Use TotalCashBalance as TotalCashValue
+            if "TotalCashValue" not in summary and "TotalCashBalance" in summary:
+                summary["TotalCashValue"] = summary["TotalCashBalance"]
+
+            logger.info(f"Account summary ({currency}): {summary}")
             return summary
 
         except Exception as e:
