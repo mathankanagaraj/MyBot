@@ -47,6 +47,18 @@ class IBKRClient:
         # Silence ib_async/ib_insync ambiguous contract logs
         logging.getLogger("ib_async").setLevel(logging.WARNING)
         logging.getLogger("ib_insync").setLevel(logging.WARNING)
+        
+        # Suppress harmless KeyError tracebacks during IB Gateway reconnection
+        # These occur in ib_async.decoder when contract details arrive for old request IDs
+        import sys
+        original_excepthook = sys.excepthook
+        def custom_excepthook(exc_type, exc_value, exc_traceback):
+            if exc_type == KeyError and 'contractDetails' in str(exc_traceback):
+                # Suppress KeyError from ib_async decoder during reconnection
+                logger.debug(f"Suppressed harmless KeyError during IB reconnection: {exc_value}")
+                return
+            original_excepthook(exc_type, exc_value, exc_traceback)
+        sys.excepthook = custom_excepthook
 
     def _get_contract(self, symbol: str):
         """Helper to get Stock or Index or Future contract based on symbol."""
@@ -70,7 +82,14 @@ class IBKRClient:
             exchange = IBKR_FUTURES_EXCHANGES[symbol]
             # Create a generic future contract to request details
             contract = Future(symbol=symbol, exchange=exchange, currency="USD")
-            details = await self.ib.reqContractDetailsAsync(contract)
+            
+            # Wrap in error handling for IB Gateway reconnection issues
+            try:
+                details = await self.ib.reqContractDetailsAsync(contract)
+            except (KeyError, RuntimeError) as e:
+                logger.warning(f"IB API request error (likely reconnection), retrying in 1s: {e}")
+                await asyncio.sleep(1)
+                details = await self.ib.reqContractDetailsAsync(contract)
 
             if not details:
                 logger.warning(f"No contract details found for {symbol}")
@@ -128,6 +147,20 @@ class IBKRClient:
 
                 # Connect to IB
                 await self.ib.connectAsync(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
+
+                # Set up error event handler to capture full error messages
+                def on_error(reqId, errorCode, errorString, contract):
+                    # Log all errors with full context
+                    if errorCode in [1100, 1102]:  # Disconnection/reconnection - INFO level
+                        logger.info(f"IB Connection Event {errorCode}: {errorString}")
+                    elif errorCode == 202:  # Order canceled - log with full reason
+                        logger.warning(f"⚠️ Order Canceled (reqId {reqId}): {errorString}")
+                    elif errorCode >= 2000:  # Warnings
+                        logger.warning(f"IB Warning {errorCode}, reqId {reqId}: {errorString}")
+                    else:  # Errors
+                        logger.error(f"IB Error {errorCode}, reqId {reqId}: {errorString}")
+                
+                self.ib.errorEvent += on_error
 
                 self.connected = True
                 logger.info(f"✅ Connected successfully (Mode: {self.mode})")
@@ -488,85 +521,145 @@ class IBKRClient:
 
             logger.info(f"Entry price (marketable limit): {entry_price}")
 
-            # 3. Create bracket orders using helper
-            # Determine TIF - Futures options usually require 'DAY' for bracket children
-            tif = "DAY" if option_contract.secType == "FOP" else "GTC"
+            # 3. Determine tick size and round prices appropriately
+            # Futures options (FOP) have different tick sizes than stock options
+            # ES options: 0.25, NQ options: 0.05, Stock options: 0.01
+            if option_contract.secType == "FOP":
+                # Futures options - determine tick size by underlying
+                if "ES" in option_contract.symbol:
+                    min_tick = 0.25  # ES mini S&P options
+                elif "NQ" in option_contract.symbol:
+                    min_tick = 0.05  # NQ mini NASDAQ options
+                elif "YM" in option_contract.symbol:
+                    min_tick = 1.0   # YM mini Dow options
+                elif "RTY" in option_contract.symbol or "RUT" in option_contract.symbol:
+                    min_tick = 0.05  # Russell 2000 options
+                else:
+                    min_tick = 0.05  # Default for most futures options
+            else:
+                min_tick = 0.01  # Stock and index options typically use 0.01
+
+            # Round all prices to conform to minimum tick size
+            from core.ibkr.utils import round_to_tick_size
+            entry_price = round_to_tick_size(entry_price, min_tick)
+            target_price = round_to_tick_size(target_price, min_tick)
+            stop_loss_price = round_to_tick_size(stop_loss_price, min_tick)
+            
+            # Ensure minimum price for stop loss
+            if stop_loss_price < min_tick:
+                stop_loss_price = min_tick
+            
             logger.info(
-                f"[{option_contract.symbol}] Using TIF={tif} for bracket orders (secType={option_contract.secType})"
+                f"[{option_contract.symbol}] Prices rounded to tick size {min_tick}: "
+                f"Entry={entry_price}, Target={target_price}, Stop={stop_loss_price}"
             )
 
-            bracket = self.ib.bracketOrder(
-                action="BUY",
-                quantity=quantity,
-                limitPrice=entry_price,
-                takeProfitPrice=target_price,
-                stopLossPrice=stop_loss_price,
-                tif=tif,
+            # 4. Create bracket orders manually for better control
+            # For FOP (futures options), we need to handle brackets differently
+            # Create parent entry order first
+            from ib_async import LimitOrder, Order
+            
+            parent_order = LimitOrder("BUY", quantity, entry_price)
+            parent_order.transmit = True  # Transmit parent immediately
+            parent_order.tif = "DAY"  # DAY for immediate market orders
+            
+            logger.info(
+                f"[{option_contract.symbol}] Placing parent entry order (secType={option_contract.secType})"
             )
-            parent_order, tp_order, sl_order = bracket
-
-            # 4. Correctly link and configure bracket
-            # parent_order.orderId is 0 here, IB will assign it upon placement
-            # bracketOrder() helper already links parentId, but we'll be explicit for safety
-            # transmit=True only on the FINAL child order
-            parent_order.transmit = False
-            tp_order.transmit = False
-            sl_order.transmit = True
-
-            # Use a unique OCA group
-            oca_group = (
-                f"ORB_{option_contract.symbol}_{datetime.now().strftime('%H%M%S')}"
-            )
-            tp_order.ocaGroup = oca_group
-            sl_order.ocaGroup = oca_group
-            tp_order.ocaType = 1
-            sl_order.ocaType = 1
-
-            # 5. Place all three orders sequentially
-            # ib_async handles orderId management automatically behind the scenes
+            
+            # 5. Place parent order first
             parent_trade = self.ib.placeOrder(option_contract, parent_order)
-            tp_trade = self.ib.placeOrder(option_contract, tp_order)
-            sl_trade = self.ib.placeOrder(option_contract, sl_order)
-
-            # 6. Wait for acknowledgment and check for rejections
-            # We poll briefly to see if the order was accepted or rejected
-            max_wait = 5.0
+            
+            # Wait for parent to fill
+            max_wait = 10.0
             waited = 0.0
+            parent_filled = False
             while waited < max_wait:
+                await asyncio.sleep(0.5)
+                waited += 0.5
                 status = parent_trade.orderStatus.status
-                if status in ["Submitted", "PreSubmitted", "Filled", "ApiPending"]:
-                    logger.info(
-                        f"[{option_contract.symbol}] Bracket order accepted. Status: {status}"
-                    )
+                if status == "Filled":
+                    parent_filled = True
+                    logger.info(f"[{option_contract.symbol}] ✅ Parent order filled")
                     break
                 if status in ["Rejected", "Cancelled", "Inactive"]:
-                    # Check for rejection reason in logs
                     reason = "Unknown rejection"
                     if parent_trade.log:
-                        # Find last entry with a message
-                        msgs = [
-                            entry.message for entry in parent_trade.log if entry.message
-                        ]
+                        msgs = [entry.message for entry in parent_trade.log if entry.message]
                         if msgs:
                             reason = msgs[-1]
-                    logger.error(
-                        f"[{option_contract.symbol}] Parent order was {status}. Reason: {reason}"
-                    )
+                    logger.error(f"[{option_contract.symbol}] Parent order {status}. Reason: {reason}")
                     return {
                         "status": "failed",
                         "error": reason,
                         "order_status": status,
                     }
+            
+            if not parent_filled:
+                logger.error(f"[{option_contract.symbol}] Parent order did not fill within {max_wait}s")
+                return {
+                    "status": "failed",
+                    "error": "Parent order timeout",
+                    "order_status": parent_trade.orderStatus.status,
+                }
+            
+            # 6. Now place child orders (stop loss and target) attached to filled parent
+            # Use the assigned parent order ID
+            parent_id = parent_trade.order.orderId
+            
+            # Create stop loss order
+            sl_order = Order()
+            sl_order.action = "SELL"
+            sl_order.orderType = "STP"
+            sl_order.totalQuantity = quantity
+            sl_order.auxPrice = stop_loss_price  # Stop trigger price
+            sl_order.tif = "DAY" if option_contract.secType == "FOP" else "GTC"
+            sl_order.parentId = parent_id
+            sl_order.transmit = False
+            
+            # Create take profit order
+            tp_order = Order()
+            tp_order.action = "SELL"
+            tp_order.orderType = "LMT"
+            tp_order.totalQuantity = quantity
+            tp_order.lmtPrice = target_price
+            tp_order.tif = "DAY" if option_contract.secType == "FOP" else "GTC"
+            tp_order.parentId = parent_id
+            tp_order.transmit = False
+            
+            # Set up OCA group (One-Cancels-All) for stop and target
+            oca_group = f"ORB_{option_contract.symbol}_{parent_id}"
+            tp_order.ocaGroup = oca_group
+            sl_order.ocaGroup = oca_group
+            tp_order.ocaType = 1  # Cancel all remaining orders on fill
+            sl_order.ocaType = 1
+            
+            # Transmit last order to send both
+            sl_order.transmit = True
+            
+            logger.info(
+                f"[{option_contract.symbol}] Placing bracket child orders: "
+                f"SL @ ${stop_loss_price:.2f}, TP @ ${target_price:.2f} (OCA: {oca_group})"
+            )
+            
+            # Place child orders
+            sl_trade = self.ib.placeOrder(option_contract, sl_order)
+            tp_trade = self.ib.placeOrder(option_contract, tp_order)
+            
+            # Wait briefly to confirm child orders submitted
+            await asyncio.sleep(2)
 
-                await asyncio.sleep(0.5)
-                waited += 0.5
+            # Wait briefly to confirm child orders submitted
+            await asyncio.sleep(2)
 
-            # If we timed out without a definitive status
-            status = parent_trade.orderStatus.status
-            if status not in ["Submitted", "PreSubmitted", "Filled", "ApiPending"]:
-                logger.warning(
-                    f"[{option_contract.symbol}] Bracket order status uncertain: {status}"
-                )
+            # 7. Check child order status
+            sl_status = sl_trade.orderStatus.status if hasattr(sl_trade, 'orderStatus') else "Unknown"
+            tp_status = tp_trade.orderStatus.status if hasattr(tp_trade, 'orderStatus') else "Unknown"
+            
+            logger.info(
+                f"[{option_contract.symbol}] Child orders status: "
+                f"SL={sl_status}, TP={tp_status}"
+            )
 
             return {
                 "status": "success",
@@ -589,6 +682,79 @@ class IBKRClient:
 
         Returns:
             List of position dictionaries
+        """
+        try:
+            positions = self.ib.positions()
+
+            result = []
+            for pos in positions:
+                # Get market price from contract
+                market_price = 0
+                market_value = 0
+                unrealized_pnl = 0
+                
+                try:
+                    # Qualify contract first to ensure exchange is set
+                    contract = pos.contract
+                    if not contract.exchange or contract.exchange == '':
+                        # Set appropriate exchange for contract type
+                        if contract.secType == 'FOP':  # Futures options
+                            contract.exchange = 'CME'  # Most futures options trade on CME
+                        elif contract.secType == 'OPT':  # Stock options
+                            contract.exchange = 'SMART'
+                        else:
+                            contract.exchange = 'SMART'
+                        
+                        # Qualify to get correct exchange
+                        try:
+                            await self.ib.qualifyContractsAsync(contract)
+                        except Exception as e:
+                            logger.debug(f"Could not qualify contract for {contract.symbol}: {e}")
+                    
+                    # Request current market data
+                    ticker = self.ib.reqMktData(contract, "", False, False)
+                    await asyncio.sleep(0.5)  # Brief wait for price
+                    
+                    # Get market price (prefer last, then close)
+                    if hasattr(ticker, 'last') and ticker.last and ticker.last > 0:
+                        market_price = ticker.last
+                    elif hasattr(ticker, 'close') and ticker.close and ticker.close > 0:
+                        market_price = ticker.close
+                    
+                    self.ib.cancelMktData(contract)
+                    
+                    if market_price > 0:
+                        market_value = pos.position * market_price
+                        # P&L = (market_value) - (position * avgCost)
+                        unrealized_pnl = market_value - (pos.position * pos.avgCost)
+                except Exception as e:
+                    logger.debug(f"Could not get market price for {pos.contract.symbol}: {e}")
+                
+                result.append(
+                    {
+                        "symbol": pos.contract.symbol,
+                        "position": pos.position,
+                        "avgCost": pos.avgCost,
+                        "marketPrice": market_price,
+                        "marketValue": market_value,
+                        "unrealizedPNL": unrealized_pnl,
+                        "contract": pos.contract,
+                    }
+                )
+
+            return result
+
+        except Exception as e:
+            logger.exception(f"Error getting positions: {e}")
+            return []
+
+    async def get_positions_fast(self) -> List[Dict]:
+        """
+        Get current open positions without market data (fast).
+        Use this for shield checks and cleanup tasks where P&L is not needed.
+
+        Returns:
+            List of position dictionaries (no market price/P&L)
         """
         try:
             positions = self.ib.positions()

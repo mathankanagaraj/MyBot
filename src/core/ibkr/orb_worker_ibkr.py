@@ -179,7 +179,7 @@ def reset_daily_state():
 
 
 async def is_symbol_occupied(
-    symbol: str, ibkr_client: IBKRClient, include_local: bool = True
+    symbol: str, ibkr_client: IBKRClient, include_local: bool = True, silent: bool = False
 ) -> bool:
     """
     Check if a symbol is already 'occupied' by an open position or active order.
@@ -190,23 +190,22 @@ async def is_symbol_occupied(
         ibkr_client: The IBKR client instance.
         include_local: Whether to check local tracking (ORB_ACTIVE_POSITIONS).
                        Set to False when detecting if a position was closed on the broker.
+        silent: If True, suppress shield log messages (used by cleanup task).
     """
     try:
         # 1. Check local state first
         if include_local and symbol in ORB_ACTIVE_POSITIONS:
-            # Use debug level for repetitive logs to reduce noise
-            logger.debug(
-                f"[{symbol}] 🛡️ Symbol Shield: Occupied (Active in Local Memory). The bot is already tracking an active trade for this symbol."
-            )
+            # Already tracked locally - no need to log repeatedly
             return True
 
         # 2. Check Broker Positions
-        positions = await ibkr_client.get_positions()
+        positions = await ibkr_client.get_positions_fast()
         for pos in positions:
             if pos.get("symbol") == symbol and abs(pos.get("position", 0)) > 0:
-                logger.debug(
-                    f"[{symbol}] 🛡️ Symbol Shield: Occupied (Broker Position Found)"
-                )
+                if not silent:
+                    logger.info(
+                        f"[{symbol}] 🛡️ Shield: Position found on broker ({pos.get('position')} @ ${pos.get('avgCost'):.2f})"
+                    )
                 # Re-link contract if missing
                 if symbol not in ORB_ACTIVE_POSITIONS:
                     ORB_ACTIVE_POSITIONS[symbol] = {"contract": pos.get("contract")}
@@ -216,9 +215,10 @@ async def is_symbol_occupied(
         trades = await ibkr_client.get_open_orders()
         for trade in trades:
             if trade.contract.symbol == symbol and not trade.isDone():
-                logger.debug(
-                    f"[{symbol}] 🛡️ Symbol Shield: Occupied (Open Order/Trade Found)"
-                )
+                if not silent:
+                    logger.info(
+                        f"[{symbol}] 🛡️ Shield: Open order found ({trade.order.action} {trade.order.totalQuantity})"
+                    )
                 return True
 
         return False
@@ -230,11 +230,14 @@ async def is_symbol_occupied(
 async def recover_active_positions(ibkr_client: IBKRClient):
     """
     Scan broker for any existing ORB-relevant positions and populate local state.
+    Also check filled orders to mark symbols as traded today (even if closed).
     Called on startup to prevent duplicates.
     """
     try:
-        logger.info("🔍 Scanning for existing positions to recover state...")
-        positions = await ibkr_client.get_positions()
+        logger.info("🔍 Scanning for existing positions and today's trades...")
+        
+        # 1. Check current positions
+        positions = await ibkr_client.get_positions_fast()
         for pos in positions:
             symbol = pos.get("symbol")
             if symbol in ORB_IBKR_SYMBOLS and abs(pos.get("position", 0)) > 0:
@@ -253,6 +256,36 @@ async def recover_active_positions(ibkr_client: IBKRClient):
                     f"Found existing {ORB_ACTIVE_POSITIONS[symbol]['direction']} position on broker. Tracking active trade.",
                     broker="IBKR",
                 )
+        
+        # 2. Check filled orders from today to mark symbols as "already traded"
+        # This prevents re-entry on symbols that were opened and closed earlier today
+        try:
+            import pytz
+            from datetime import datetime
+            
+            et = pytz.timezone("America/New_York")
+            today_start = datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            fills = await ibkr_client.ib.reqExecutionsAsync()
+            for fill in fills:
+                fill_time = fill.time
+                if fill_time >= today_start:
+                    # Check if this is an option on one of our symbols
+                    contract = fill.contract
+                    if hasattr(contract, 'symbol'):
+                        # For options, the underlying symbol is in contract.symbol
+                        underlying = contract.symbol
+                        if underlying in ORB_IBKR_SYMBOLS:
+                            # Mark as traded today (even if position is now closed)
+                            if underlying not in ORB_TRADE_TAKEN_TODAY:
+                                ORB_TRADE_TAKEN_TODAY[underlying] = True
+                                logger.info(
+                                    f"[{underlying}] ✅ Found filled order from today. "
+                                    f"Marked as traded (prevents re-entry)."
+                                )
+        except Exception as e:
+            logger.warning(f"Could not check today's fills during recovery: {e}")
+            
     except Exception as e:
         logger.error(f"Error during state recovery: {e}")
 
@@ -959,6 +992,10 @@ async def execute_orb_entry(
                 f"Qty: {qty}"
             )
             send_telegram(msg, broker="IBKR")
+            
+            # Send portfolio update after entry
+            await send_portfolio_summary_telegram(ibkr_client, "AFTER ENTRY")
+            
             logger.info(f"[{symbol}] ✅ ORB Entry order placed successfully")
 
             return True
@@ -1030,7 +1067,7 @@ async def force_exit_position(
             return
         
         # Get positions and find our option
-        positions = await ibkr_client.get_positions()
+        positions = await ibkr_client.get_positions_fast()
         
         logger.debug(f"[{symbol}] Found {len(positions)} total positions in account")
         logger.debug(f"[{symbol}] Looking for option contract conId: {getattr(option_contract, 'conId', 'N/A')}")
@@ -1149,10 +1186,10 @@ async def orb_signal_monitor(
                     )
                     ORB_TRADE_TAKEN_TODAY[symbol] = True
 
-            # If trade taken, just sleep and check for EOD exit
+            # If trade taken, monitor for position closure
+            # Check if position was actively closed on broker (occupied returns false while trade_taken is true)
+            # CRITICAL: We pass include_local=False to check the actual broker state.
             if ORB_TRADE_TAKEN_TODAY.get(symbol, False):
-                # Check if position was actively closed on broker (occupied returns false while trade_taken is true)
-                # CRITICAL: We pass include_local=False to check the actual broker state.
                 if not await is_symbol_occupied(
                     symbol, ibkr_client, include_local=False
                 ):
@@ -1164,6 +1201,9 @@ async def orb_signal_monitor(
                             f"🏁 ORB Trade Closed (IBKR): {symbol}. Position cleared on broker.",
                             broker="IBKR",
                         )
+                        
+                        # Send portfolio update after exit
+                        await send_portfolio_summary_telegram(ibkr_client, "AFTER EXIT")
                         del ORB_ACTIVE_POSITIONS[symbol]
 
                 # Check for EOD exit even if trade taken
@@ -1365,6 +1405,221 @@ async def orb_signal_monitor(
 # -----------------------------
 # Main ORB Worker
 # -----------------------------
+
+async def send_portfolio_summary_telegram(ibkr_client: IBKRClient, title: str = "PORTFOLIO STATUS"):
+    """
+    Send portfolio summary to Telegram.
+    """
+    try:
+        summary = await ibkr_client.get_account_summary_async()
+        positions = await ibkr_client.get_positions()
+        
+        cash_balance = summary.get('CashBalance', 0)
+        net_liquidation = summary.get('NetLiquidation', 0)
+        position_value = net_liquidation - cash_balance
+        
+        msg = f"📊 {title}\n"
+        msg += f"={'='*40}\n"
+        msg += f"💵 Cash: ${cash_balance:,.2f}\n"
+        msg += f"📈 Positions: ${position_value:,.2f}\n"
+        msg += f"💰 Total: ${net_liquidation:,.2f}\n"
+        
+        if positions:
+            msg += f"\n📍 Active ({len(positions)}):" 
+            total_pnl = 0
+            for pos in positions:
+                symbol = pos.get('symbol')
+                qty = pos.get('position', 0)
+                avg_cost = pos.get('avgCost', 0)
+                pnl = pos.get('unrealizedPNL', 0)
+                total_pnl += pnl
+                pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                msg += f"\n{pnl_emoji} {symbol}: {qty} @ ${avg_cost:.2f} | P&L: ${pnl:+.2f}"
+            
+            overall_emoji = "🟢" if total_pnl >= 0 else "🔴"
+            msg += f"\n\n{overall_emoji} Total P&L: ${total_pnl:+,.2f}"
+        else:
+            msg += f"\n📍 No positions (100% cash)"
+        
+        send_telegram(msg, broker="IBKR")
+        
+    except Exception as e:
+        logger.error(f"Error sending portfolio summary to Telegram: {e}")
+
+
+async def portfolio_status_task(ibkr_client: IBKRClient, interval=300):
+    """
+    Periodic portfolio status logging task.
+    Logs cash balance, positions, and P&L every 5 minutes.
+    """
+    logger.info("📊 Portfolio status task started (logs every 5 minutes)")
+    try:
+        while not _STOP_EVENT.is_set():
+            await asyncio.sleep(interval)
+            
+            try:
+                # Get account summary
+                await ibkr_client.ensure_connected()
+                summary = await ibkr_client.get_account_summary_async()
+                
+                # Get positions
+                positions = await ibkr_client.get_positions()
+                
+                # Calculate totals
+                cash_balance = summary.get('CashBalance', 0)
+                net_liquidation = summary.get('NetLiquidation', 0)
+                position_value = net_liquidation - cash_balance
+                
+                logger.info("="*60)
+                logger.info("📊 PORTFOLIO STATUS")
+                logger.info("="*60)
+                logger.info(f"💵 Cash Balance: ${cash_balance:,.2f}")
+                logger.info(f"📈 Position Value: ${position_value:,.2f}")
+                logger.info(f"💰 Net Liquidation: ${net_liquidation:,.2f}")
+                
+                if positions:
+                    logger.info(f"📍 Active Positions ({len(positions)}):")
+                    for pos in positions:
+                        symbol = pos.get('symbol')
+                        position = pos.get('position', 0)
+                        avg_cost = pos.get('avgCost', 0)
+                        market_price = pos.get('marketPrice', 0)
+                        market_value = pos.get('marketValue', 0)
+                        unrealized_pnl = pos.get('unrealizedPNL', 0)
+                        
+                        pnl_pct = (unrealized_pnl / abs(market_value - unrealized_pnl) * 100) if (market_value - unrealized_pnl) != 0 else 0
+                        pnl_emoji = "🟢" if unrealized_pnl >= 0 else "🔴"
+                        
+                        logger.info(
+                            f"  {pnl_emoji} {symbol}: {position} @ ${avg_cost:.2f} | "
+                            f"Mkt: ${market_price:.2f} | P&L: ${unrealized_pnl:,.2f} ({pnl_pct:+.2f}%)"
+                        )
+                else:
+                    logger.info("📍 Active Positions: None (all cash)")
+                
+                logger.info("="*60)
+                
+            except Exception as e:
+                logger.error(f"📊 Error fetching portfolio status: {e}")
+                
+    except asyncio.CancelledError:
+        logger.info("📊 Portfolio status task cancelled")
+    except Exception as e:
+        logger.error(f"📊 Portfolio status task error: {e}")
+    finally:
+        logger.info("📊 Portfolio status task stopped")
+
+
+async def position_cleanup_task(ibkr_client: IBKRClient, interval=60):
+    """
+    Periodic cleanup task to detect manually closed positions.
+    Runs every 60 seconds to check if tracked positions still exist on broker.
+    If a position was manually closed, remove it from ORB_ACTIVE_POSITIONS.
+    """
+    logger.info("🧹 Position cleanup task started")
+    try:
+        while not _STOP_EVENT.is_set():
+            await asyncio.sleep(interval)
+            
+            # Get list of symbols currently tracked
+            tracked_symbols = list(ORB_ACTIVE_POSITIONS.keys())
+            
+            # Also check symbols with trade_taken flag but not in active positions
+            trade_taken_symbols = [s for s in ORB_TRADE_TAKEN_TODAY.keys() if s not in tracked_symbols]
+            all_symbols_to_check = tracked_symbols + trade_taken_symbols
+            
+            if all_symbols_to_check:
+                logger.info(f"🧹 Cleanup: Monitoring {len(all_symbols_to_check)} symbols: {', '.join(all_symbols_to_check)}")
+                # Check each symbol
+                for symbol in all_symbols_to_check:
+                    try:
+                        # Check if position still exists on broker (include_local=False, silent=True)
+                        still_occupied = await is_symbol_occupied(
+                            symbol, ibkr_client, include_local=False, silent=True
+                        )
+                        
+                        if not still_occupied:
+                            # Position was closed (manually or via bot)
+                            # Check if it was stop loss or target hit
+                            exit_reason = "Unknown"
+                            exit_price = None
+                            
+                            if symbol in ORB_ACTIVE_POSITIONS:
+                                position = ORB_ACTIVE_POSITIONS[symbol]
+                                sl_order_id = position.get("sl_order_id")
+                                target_order_id = position.get("target_order_id")
+                                oca_group = position.get("oca_group")
+                                
+                                # Check filled orders to determine which leg executed
+                                try:
+                                    fills = await ibkr_client.ib.reqExecutionsAsync()
+                                    for fill in fills:
+                                        if fill.execution.orderId in [sl_order_id, target_order_id]:
+                                            exit_price = fill.execution.avgPrice
+                                            if fill.execution.orderId == sl_order_id:
+                                                exit_reason = "🛑 STOP LOSS"
+                                            elif fill.execution.orderId == target_order_id:
+                                                exit_reason = "🎯 TARGET"
+                                            break
+                                    
+                                    # If no fill found, check if position exists (manual close)
+                                    if exit_reason == "Unknown":
+                                        exit_reason = "👤 Manual Close"
+                                except Exception as e:
+                                    logger.debug(f"[{symbol}] Could not determine exit reason: {e}")
+                                    exit_reason = "❓ Unknown"
+                            
+                            exit_msg = f"[{symbol}] 🧹 Cleanup: Position closed. Reason: {exit_reason}"
+                            if exit_price:
+                                exit_msg += f" @ ${exit_price:.2f}"
+                            logger.info(exit_msg)
+                            
+                            # Send Telegram notification with exit details
+                            if symbol in ORB_ACTIVE_POSITIONS:
+                                position = ORB_ACTIVE_POSITIONS[symbol]
+                                entry_price = position.get("entry_price", 0)
+                                pnl = None
+                                if exit_price and entry_price:
+                                    direction = position.get("direction", "")
+                                    if direction == "LONG":
+                                        pnl = exit_price - entry_price
+                                    elif direction == "SHORT":
+                                        pnl = entry_price - exit_price
+                                
+                                telegram_msg = f"🏁 ORB Trade Closed (IBKR): {symbol}\n"
+                                telegram_msg += f"Exit Reason: {exit_reason}\n"
+                                if exit_price:
+                                    telegram_msg += f"Exit Price: ${exit_price:.2f}\n"
+                                if pnl is not None:
+                                    pnl_emoji = "✅" if pnl >= 0 else "❌"
+                                    telegram_msg += f"P&L: {pnl_emoji} ${pnl:+.2f}"
+                                
+                                send_telegram(telegram_msg, broker="IBKR")
+                                
+                                # Send portfolio update after exit
+                                await send_portfolio_summary_telegram(ibkr_client, "AFTER EXIT")
+                                
+                            if symbol in ORB_ACTIVE_POSITIONS:
+                                del ORB_ACTIVE_POSITIONS[symbol]
+                            
+                            # Also clear the trade taken flag to allow re-entry
+                            if symbol in ORB_TRADE_TAKEN_TODAY:
+                                del ORB_TRADE_TAKEN_TODAY[symbol]
+                                logger.info(
+                                    f"[{symbol}] 🔓 Cleanup: Cleared trade-taken flag. Symbol available for re-entry."
+                                )
+                        # Don't log "still occupied" - reduces noise since monitoring loops already check
+                    except Exception as e:
+                        logger.error(f"[{symbol}] Error in cleanup check: {e}")
+                        
+    except asyncio.CancelledError:
+        logger.info("🧹 Position cleanup task cancelled")
+    except Exception as e:
+        logger.error(f"🧹 Position cleanup task error: {e}")
+    finally:
+        logger.info("🧹 Position cleanup task stopped")
+
+
 async def heartbeat_task(interval=60):
     """Continuous heartbeat to show bot is alive."""
     logger.info("💓 Heartbeat task started")
@@ -1391,7 +1646,32 @@ async def _async_ibkr_session():
     Connects, waits for ORB, and runs signal monitors.
     """
     logger.info("🌅 Starting Daily Session (IBKR)")
+    
+    # Check for early close and adjust market close time
+    from core.holiday_checker import get_us_market_close_time, is_us_early_close_day
+    import pytz
+    
+    us_et = pytz.timezone("America/New_York")
+    today = datetime.now(us_et)
+    actual_close_time = get_us_market_close_time(today)
+    
+    # Update global MARKET_CLOSE_TIME if early close detected
+    global MARKET_CLOSE_TIME
+    if is_us_early_close_day(today):
+        MARKET_CLOSE_TIME = actual_close_time.time()
+        logger.warning(
+            f"⚠️ EARLY CLOSE DETECTED: Market closes at {actual_close_time.strftime('%I:%M %p ET')} "
+            f"(normally 4:00 PM ET)"
+        )
+        send_telegram(
+            f"⚠️ US Market Early Close Today\\n"
+            f"Closing at {actual_close_time.strftime('%I:%M %p ET')}\\n"
+            f"Bot will exit positions 15 min before close",
+            broker="IBKR"
+        )
+    
     ibkr_client = None
+    cleanup_task = None
     try:
         # CRITICAL: Re-initialize stop event in the current process's event loop
         global _STOP_EVENT
@@ -1401,6 +1681,18 @@ async def _async_ibkr_session():
         ibkr_client = IBKRClient()
         ibkr_client.option_chains_cache.clear()
         await ibkr_client.connect_async()
+        
+        # Start position cleanup background task
+        cleanup_task = asyncio.create_task(
+            position_cleanup_task(ibkr_client, interval=60)
+        )
+        logger.info("🧹 Position cleanup task launched")
+        
+        # Start portfolio status logging task (every 5 minutes)
+        portfolio_task = asyncio.create_task(
+            portfolio_status_task(ibkr_client, interval=300)
+        )
+        logger.info("📊 Portfolio status task launched")
         
         # Check broker for any trades placed today and mark them (single batch call)
         traded_symbols = await check_all_symbols_traded_today(ORB_IBKR_SYMBOLS, ibkr_client)
@@ -1413,6 +1705,9 @@ async def _async_ibkr_session():
 
         cash_mgr = LiveCashManager(ibkr_client, broker="IBKR")
         await cash_mgr.check_and_log_start_balance()
+        
+        # Send pre-market portfolio summary to Telegram
+        await send_portfolio_summary_telegram(ibkr_client, "PRE-MARKET")
 
         # Wait for ORB period to complete
         if await wait_for_orb_complete(ibkr_client):
@@ -1427,6 +1722,9 @@ async def _async_ibkr_session():
             if tasks:
                 await asyncio.gather(*tasks)
 
+            # Send post-market portfolio summary to Telegram
+            await send_portfolio_summary_telegram(ibkr_client, "POST-MARKET")
+            
             send_telegram(
                 "✅ ORB Daily Session (IBKR): All symbol monitors finished.",
                 broker="IBKR",
@@ -1440,6 +1738,21 @@ async def _async_ibkr_session():
     except Exception as e:
         logger.error(f"Error in IBKR daily session: {e}", exc_info=True)
     finally:
+        # Cancel background tasks
+        if cleanup_task and not cleanup_task.done():
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+        if 'portfolio_task' in locals() and portfolio_task and not portfolio_task.done():
+            portfolio_task.cancel()
+            try:
+                await portfolio_task
+            except asyncio.CancelledError:
+                pass
+        
         if ibkr_client:
             try:
                 ibkr_client.disconnect()
@@ -1457,6 +1770,35 @@ async def run_orb_ibkr_workers():
     logger.info(f"   Symbols: {ORB_IBKR_SYMBOLS}")
     logger.info(f"   ORB Duration: {ORB_DURATION_MINUTES} minutes")
     logger.info(f"   Risk/Reward: 1:{ORB_RISK_REWARD}")
+
+    # Check and log holidays at startup
+    try:
+        from core.holiday_checker import get_upcoming_us_holidays, is_us_trading_day, get_next_us_trading_day
+        from datetime import datetime
+        import pytz
+        
+        et = pytz.timezone("America/New_York")
+        today = datetime.now(et)
+        
+        # Check if today is a holiday
+        if not is_us_trading_day(today):
+            logger.info(f"📅 Today ({today.strftime('%Y-%m-%d %A')}) is a US market holiday")
+            next_trading_day = get_next_us_trading_day(today)
+            logger.info(f"📅 Next US trading day: {next_trading_day.strftime('%Y-%m-%d %A')}")
+            send_telegram(
+                f"📅 Today is US Market Holiday\n"
+                f"Next trading day: {next_trading_day.strftime('%Y-%m-%d %A')}",
+                broker="IBKR",
+            )
+        
+        # Log upcoming holidays (next 30 days)
+        upcoming = get_upcoming_us_holidays(30)
+        if upcoming:
+            logger.info(f"📅 Upcoming US holidays (next 30 days): {len(upcoming)} holiday(s)")
+            for holiday_date, name in upcoming[:3]:  # Show first 3
+                logger.info(f"   • {holiday_date.strftime('%Y-%m-%d %A')}: {name}")
+    except Exception as e:
+        logger.warning(f"Failed to check US holidays at startup: {e}")
 
     send_telegram(
         f"🚀 IBKR ORB Bot Starting\n"

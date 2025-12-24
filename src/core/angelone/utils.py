@@ -42,6 +42,7 @@ def is_market_open(now_utc=None):
     """
     Check if NSE market is open.
     NSE Trading Hours: Monday-Friday, 9:15 AM - 3:30 PM IST
+    Also checks for NSE holidays (Republic Day, Independence Day, Diwali, etc.)
     """
     if not now_utc:
         now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
@@ -50,6 +51,18 @@ def is_market_open(now_utc=None):
     # Check if weekend
     if now_ist.weekday() >= 5:  # Saturday = 5, Sunday = 6
         return False
+
+    # Check if NSE holiday
+    try:
+        from core.holiday_checker import is_nse_trading_day
+        if not is_nse_trading_day(now_ist):
+            logger.debug(
+                "NSE Market Closed: Holiday detected on %s",
+                now_ist.strftime("%Y-%m-%d %A")
+            )
+            return False
+    except Exception as e:
+        logger.warning(f"Holiday check failed, assuming trading day: {e}")
 
     # NSE market hours: 9:15 AM - 3:30 PM IST
     open_t = dtime(NSE_MARKET_OPEN_HOUR, NSE_MARKET_OPEN_MINUTE)
@@ -75,6 +88,7 @@ def get_seconds_until_market_close(now_utc=None):
     """
     Calculate seconds until NSE market close (3:30 PM IST).
     If already past market close, returns seconds until next trading day's close.
+    Skips weekends and NSE holidays.
 
     Returns:
         Number of seconds until market close
@@ -92,6 +106,30 @@ def get_seconds_until_market_close(now_utc=None):
         second=0,
         microsecond=0,
     )
+
+    # If we're past market close today, target next trading day
+    if now_ist >= close_time:
+        try:
+            from core.holiday_checker import get_next_nse_trading_day
+            # Get next trading day (skips weekends and holidays)
+            next_day = get_next_nse_trading_day(now_ist)
+            close_time = next_day.replace(
+                hour=NSE_MARKET_CLOSE_HOUR,
+                minute=NSE_MARKET_CLOSE_MINUTE,
+                second=0,
+                microsecond=0,
+            )
+        except Exception as e:
+            logger.warning(f"Holiday check failed, using simple date logic: {e}")
+            # Fallback: Move to next day
+            close_time += timedelta(days=1)
+            # Skip weekends
+            while close_time.weekday() >= 5:
+                close_time += timedelta(days=1)
+
+    # Calculate seconds difference
+    seconds = int((close_time - now_ist).total_seconds())
+    return max(seconds, 0)
 
     # If we're past market close today, target next trading day
     if now_ist >= close_time:

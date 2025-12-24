@@ -102,8 +102,8 @@ ANGEL_PASSWORD="YOUR_PASSWORD_HERE"
 ANGEL_TOTP_SECRET="YOUR_TOTP_SECRET_HERE"
 
 # Telegram Configuration
-TELEGRAM_BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID="YOUR_TELEGRAM_CHAT_ID_HERE"
+ANGEL_TELEGRAM_TOKEN="YOUR_TELEGRAM_BOT_TOKEN_HERE"
+ANGEL_TELEGRAM_CHAT_ID="YOUR_TELEGRAM_CHAT_ID_HERE"
 
 # Trading Configuration
 TRADING_MODE="LIVE"
@@ -130,8 +130,8 @@ ANGEL_PASSWORD=${ANGEL_PASSWORD}
 ANGEL_TOTP_SECRET=${ANGEL_TOTP_SECRET}
 
 # Telegram Configuration
-TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+ANGEL_TELEGRAM_TOKEN=${ANGEL_TELEGRAM_TOKEN}
+ANGEL_TELEGRAM_CHAT_ID=${ANGEL_TELEGRAM_CHAT_ID}
 
 # Trading Configuration
 TRADING_MODE=${TRADING_MODE}
@@ -160,7 +160,7 @@ cat > /usr/local/bin/tg.sh << 'EOF'
 
 source /etc/default/intraday-bot
 
-if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+if [ -z "$ANGEL_TELEGRAM_TOKEN" ] || [ -z "$ANGEL_TELEGRAM_CHAT_ID" ]; then
     echo "Telegram credentials not configured"
     exit 1
 fi
@@ -171,8 +171,8 @@ if [ -z "$MESSAGE" ]; then
     exit 1
 fi
 
-curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    -d chat_id="${TELEGRAM_CHAT_ID}" \
+curl -s -X POST "https://api.telegram.org/bot${ANGEL_TELEGRAM_TOKEN}/sendMessage" \
+    -d chat_id="${ANGEL_TELEGRAM_CHAT_ID}" \
     -d text="${MESSAGE}" \
     -d parse_mode="HTML" > /dev/null
 EOF

@@ -10,8 +10,8 @@ from core.config import (
     AUDIT_CSV,
     IBKR_TELEGRAM_CHAT_ID,
     IBKR_TELEGRAM_TOKEN,
-    TELEGRAM_CHAT_ID,
-    TELEGRAM_TOKEN,
+    ANGEL_TELEGRAM_CHAT_ID,
+    ANGEL_TELEGRAM_TOKEN,
 )
 from core.logger import logger
 
@@ -29,8 +29,8 @@ def send_telegram(text: str, broker: str = "ANGEL"):
         token = IBKR_TELEGRAM_TOKEN
         chat_id = IBKR_TELEGRAM_CHAT_ID
     else:  # Default to Angel One
-        token = TELEGRAM_TOKEN
-        chat_id = TELEGRAM_CHAT_ID
+        token = ANGEL_TELEGRAM_TOKEN
+        chat_id = ANGEL_TELEGRAM_CHAT_ID
     
     if not token or not chat_id:
         logger.info(f"[{broker}] Telegram not configured: %s", text)

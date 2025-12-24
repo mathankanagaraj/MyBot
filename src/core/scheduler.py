@@ -75,6 +75,65 @@ async def run_strategy_loop(
             pre_connect_time = market_open - timedelta(minutes=pre_connect_minutes)
 
             # ---------------------------------------------------------
+            # 0. Holiday Check (Skip Non-Trading Days)
+            # ---------------------------------------------------------
+            try:
+                is_trading_day = True
+                if broker_name == "ANGEL":
+                    from core.holiday_checker import is_nse_trading_day
+                    is_trading_day = is_nse_trading_day(now)
+                elif broker_name == "IBKR":
+                    from core.holiday_checker import is_us_trading_day
+                    is_trading_day = is_us_trading_day(now)
+                
+                if not is_trading_day:
+                    logger.info(f"📅 Today ({now.strftime('%Y-%m-%d %A')}) is a holiday. Skipping to next trading day...")
+                    # Skip to next trading day at market open
+                    next_trading_day = now + timedelta(days=1)
+                    while next_trading_day.weekday() > 4:  # Skip weekends
+                        next_trading_day += timedelta(days=1)
+                    
+                    if broker_name == "ANGEL":
+                        from core.holiday_checker import is_nse_trading_day
+                        while not is_nse_trading_day(next_trading_day):
+                            logger.info(f"📅 Skipping holiday: {next_trading_day.strftime('%Y-%m-%d %A')}")
+                            next_trading_day += timedelta(days=1)
+                            while next_trading_day.weekday() > 4:
+                                next_trading_day += timedelta(days=1)
+                    elif broker_name == "IBKR":
+                        from core.holiday_checker import is_us_trading_day
+                        while not is_us_trading_day(next_trading_day):
+                            logger.info(f"📅 Skipping holiday: {next_trading_day.strftime('%Y-%m-%d %A')}")
+                            next_trading_day += timedelta(days=1)
+                            while next_trading_day.weekday() > 4:
+                                next_trading_day += timedelta(days=1)
+                    
+                    next_start_time = next_trading_day.replace(
+                        hour=market_open_hour,
+                        minute=market_open_minute,
+                        second=0,
+                        microsecond=0
+                    ) - timedelta(minutes=pre_connect_minutes)
+                    
+                    wait_seconds = (next_start_time - now).total_seconds()
+                    wait_hours = wait_seconds / 3600
+                    logger.info(
+                        f"💤 Holiday detected. Sleeping {wait_hours:.2f}h until {next_start_time.strftime('%d-%b %H:%M')}..."
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(stop_event.wait()), timeout=wait_seconds
+                        )
+                        if stop_event.is_set():
+                            break
+                    except asyncio.TimeoutError:
+                        logger.info("⏰ Waking up after holiday sleep...")
+                    continue  # Start next iteration of the loop
+            
+            except Exception as e:
+                logger.warning(f"⚠️ Could not check holiday status: {e}. Proceeding with normal schedule.")
+
+            # ---------------------------------------------------------
             # 1. Post-Market Check (Too Late)
             # ---------------------------------------------------------
             if now >= market_close:
@@ -163,9 +222,30 @@ async def run_strategy_loop(
             if now >= next_start:
                 next_start += timedelta(days=1)
 
-            # Skip weekends (Sat=5, Sun=6)
+            # Skip weekends and holidays
             while next_start.weekday() > 4:
                 next_start += timedelta(days=1)
+            
+            # Skip holidays based on broker
+            try:
+                if broker_name == "ANGEL":
+                    from core.holiday_checker import is_nse_trading_day
+                    while not is_nse_trading_day(next_start):
+                        logger.info(f"📅 Skipping holiday: {next_start.strftime('%Y-%m-%d %A')}")
+                        next_start += timedelta(days=1)
+                        # Also skip weekends after adding a day
+                        while next_start.weekday() > 4:
+                            next_start += timedelta(days=1)
+                elif broker_name == "IBKR":
+                    from core.holiday_checker import is_us_trading_day
+                    while not is_us_trading_day(next_start):
+                        logger.info(f"📅 Skipping holiday: {next_start.strftime('%Y-%m-%d %A')}")
+                        next_start += timedelta(days=1)
+                        # Also skip weekends after adding a day
+                        while next_start.weekday() > 4:
+                            next_start += timedelta(days=1)
+            except Exception as e:
+                logger.warning(f"Holiday check failed in scheduler, using weekend-only logic: {e}")
 
             wait_sec = (next_start - now).total_seconds()
             wait_hours = wait_sec / 3600

@@ -67,8 +67,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # TELEGRAM NOTIFICATIONS
 # ============================================================================
 # Angel One Bot Telegram (for NSE/Indian market notifications)
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+ANGEL_TELEGRAM_TOKEN = os.getenv("ANGEL_TELEGRAM_TOKEN", "")
+ANGEL_TELEGRAM_CHAT_ID = os.getenv("ANGEL_TELEGRAM_CHAT_ID", "")
 
 # IBKR Bot Telegram (for US market notifications)
 IBKR_TELEGRAM_TOKEN = os.getenv("IBKR_TELEGRAM_TOKEN", "")
@@ -195,18 +195,12 @@ NO_TRADE_LAST_MINUTES_EXPIRY = int(os.getenv("NO_TRADE_LAST_MINUTES_EXPIRY", "15
 # Strategy selection: ORB or MACD_EMA (default existing strategy)
 STRATEGY = os.getenv("STRATEGY", "MACD_EMA").upper()
 
-# ORB Symbols per broker
-ORB_ANGEL_SYMBOLS = [
-    "NIFTY",
-    "BANKNIFTY",
-    "RELIANCE",
-    "ICICIBANK",
-    "SBIN",
-    "HDFCBANK",
-    "INFY",
-]
+# Angel One: Use ANGEL_SYMBOLS (defined at top of file)
+# - Index symbols (NIFTY, BANKNIFTY): Uses front-month FUTURES for ORB strategy
+# - Stock symbols: Uses SPOT price directly
+# - Option selection: Always uses SPOT price (NSE) for strike selection
 
-# ORB Strategy Symbols (can be overridden via .env)
+# IBKR ORB Strategy Symbols (can be overridden via .env)
 ORB_SYMBOLS_STR = os.getenv(
     "ORB_SYMBOLS", "ES,NQ,NVDA,TSLA,AAPL,AMD,MSFT"  # Default includes futures
 )

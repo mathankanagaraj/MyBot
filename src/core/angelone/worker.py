@@ -144,6 +144,29 @@ async def market_state_watcher(poll_interval=5):
 
     logger.info("🕒 Market state watcher started (AngelOne - NSE)")
 
+    # Check for upcoming holidays and log
+    try:
+        from core.holiday_checker import get_upcoming_nse_holidays, is_nse_trading_day, get_next_nse_trading_day
+        import pytz
+        
+        ist = pytz.timezone("Asia/Kolkata")
+        today = datetime.now(ist)
+        
+        # Check if today is a holiday
+        if not is_nse_trading_day(today):
+            logger.info(f"📅 Today ({today.strftime('%Y-%m-%d %A')}) is an NSE holiday")
+            next_trading_day = get_next_nse_trading_day(today)
+            logger.info(f"📅 Next NSE trading day: {next_trading_day.strftime('%Y-%m-%d %A')}")
+        
+        # Log upcoming holidays (next 30 days)
+        upcoming = get_upcoming_nse_holidays(30)
+        if upcoming:
+            logger.info(f"📅 Upcoming NSE holidays (next 30 days): {len(upcoming)} holiday(s)")
+            for holiday_date, name in upcoming[:3]:  # Show first 3
+                logger.info(f"   • {holiday_date.strftime('%Y-%m-%d %A')}: {name}")
+    except Exception as e:
+        logger.warning(f"Failed to check NSE holidays at startup: {e}")
+
     # Initialize last state using is_market_open() if possible
     try:
         initial_state = is_market_open() if MARKET_HOURS_ONLY else True
@@ -203,6 +226,15 @@ async def market_state_watcher(poll_interval=5):
                     logger.info(
                         "🛑 _STOP_EVENT set by market watcher (hard close at 15:30 IST)"
                     )
+                    
+                    # Log next trading day
+                    try:
+                        from core.holiday_checker import get_next_nse_trading_day
+                        next_day = get_next_nse_trading_day(now_ist)
+                        logger.info(f"📅 Next NSE trading day: {next_day.strftime('%Y-%m-%d %A')}")
+                    except Exception:
+                        pass
+                    
                     send_telegram(
                         "🛑 [AngelOne] Trading stopped - Market closed at 15:30 IST",
                         broker="ANGEL",

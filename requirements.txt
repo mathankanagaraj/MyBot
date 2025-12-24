@@ -9,3 +9,4 @@ requests
 websocket-client
 ib_async>=1.0.0
 pandas-ta>=0.3.14b
+pandas-market-calendars>=4.3.0

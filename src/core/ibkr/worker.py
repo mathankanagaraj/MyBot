@@ -30,6 +30,30 @@ async def market_hours_watcher():
     """
     logger.info("🕒 Market hours watcher started (IBKR - US Markets)")
 
+    # Check for upcoming holidays and log
+    try:
+        from core.holiday_checker import get_upcoming_us_holidays, is_us_trading_day, get_next_us_trading_day
+        from datetime import datetime
+        import pytz
+        
+        et = pytz.timezone("America/New_York")
+        today = datetime.now(et)
+        
+        # Check if today is a holiday
+        if not is_us_trading_day(today):
+            logger.info(f"📅 Today ({today.strftime('%Y-%m-%d %A')}) is a US market holiday")
+            next_trading_day = get_next_us_trading_day(today)
+            logger.info(f"📅 Next US trading day: {next_trading_day.strftime('%Y-%m-%d %A')}")
+        
+        # Log upcoming holidays (next 30 days)
+        upcoming = get_upcoming_us_holidays(30)
+        if upcoming:
+            logger.info(f"📅 Upcoming US holidays (next 30 days): {len(upcoming)} holiday(s)")
+            for holiday_date, name in upcoming[:3]:  # Show first 3
+                logger.info(f"   • {holiday_date.strftime('%Y-%m-%d %A')}: {name}")
+    except Exception as e:
+        logger.warning(f"Failed to check US holidays at startup: {e}")
+
     last_market_state = None
 
     # Initialize was_trading_today based on current market state
@@ -62,6 +86,15 @@ async def market_hours_watcher():
                 if was_trading_today and last_market_state != "CLOSED":
                     # We were trading and now market closed - stop for the day
                     logger.info("🛑 US Market closed (16:00 ET) - Stopping all trading")
+                    
+                    # Log next trading day
+                    try:
+                        from core.holiday_checker import get_next_us_trading_day
+                        next_day = get_next_us_trading_day(now_et)
+                        logger.info(f"📅 Next US trading day: {next_day.strftime('%Y-%m-%d %A')}")
+                    except Exception:
+                        pass
+                    
                     send_telegram(
                         "🛑 [IBKR] Trading stopped - Market closed at 16:00 ET",
                         broker="IBKR",

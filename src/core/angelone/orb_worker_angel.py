@@ -17,7 +17,8 @@ import pytz
 
 from core.logger import logger
 from core.config import (
-    ORB_ANGEL_SYMBOLS,
+    ANGEL_SYMBOLS,
+    ANGEL_INDEX_FUTURES,
     ORB_DURATION_MINUTES,
     ORB_ATR_LENGTH,
     ORB_ATR_MULTIPLIER,
@@ -258,7 +259,7 @@ def get_orb_end_time() -> datetime:
 
 
 async def is_symbol_occupied(
-    symbol: str, angel_client: AngelClient, include_local: bool = True
+    symbol: str, angel_client: AngelClient, include_local: bool = True, silent: bool = False
 ) -> bool:
     """
     Check if a symbol is already 'occupied' by an open position or active order.
@@ -269,13 +270,15 @@ async def is_symbol_occupied(
         angel_client: The Angel One client instance.
         include_local: Whether to check local tracking (ORB_ACTIVE_POSITIONS).
                        Set to False when detecting if a position was closed on the broker.
+        silent: If True, suppress shield log messages (used by cleanup task).
     """
     try:
         # 1. Local state check
         if include_local and symbol in ORB_ACTIVE_POSITIONS:
-            logger.debug(
-                f"[{symbol}] 🛡️ Symbol Shield: Occupied (Active in Local Memory). The bot is already tracking an active trade for this symbol."
-            )
+            if not silent:
+                logger.debug(
+                    f"[{symbol}] 🛡️ Symbol Shield: Occupied (Active in Local Memory). The bot is already tracking an active trade for this symbol."
+                )
             return True
 
         # 2. Broker Positions check
@@ -289,9 +292,10 @@ async def is_symbol_occupied(
                 if pos.get("symbolname") == symbol or pos.get(
                     "tradingsymbol", ""
                 ).startswith(symbol):
-                    logger.debug(
-                        f"[{symbol}] 🛡️ Symbol Shield: Occupied (Broker Position Found: {pos.get('tradingsymbol')})"
-                    )
+                    if not silent:
+                        logger.debug(
+                            f"[{symbol}] 🛡️ Symbol Shield: Occupied (Broker Position Found: {pos.get('tradingsymbol')})"
+                        )
                     return True
 
         # 3. Broker Order Book check (pending orders)
@@ -302,9 +306,10 @@ async def is_symbol_occupied(
                 if order.get("symbolname") == symbol or order.get(
                     "tradingsymbol", ""
                 ).startswith(symbol):
-                    logger.debug(
-                        f"[{symbol}] 🛡️ Symbol Shield: Occupied (Open Order Found: {order.get('tradingsymbol')})"
-                    )
+                    if not silent:
+                        logger.debug(
+                            f"[{symbol}] 🛡️ Symbol Shield: Occupied (Open Order Found: {order.get('tradingsymbol')})"
+                        )
                     return True
 
         return False
@@ -324,7 +329,7 @@ async def recover_active_positions(angel_client: AngelClient):
             if int(pos.get("netqty", 0)) != 0:
                 tradingsymbol = pos.get("tradingsymbol", "")
                 # Find which of our symbols this belongs to
-                for symbol in ORB_ANGEL_SYMBOLS:
+                for symbol in ANGEL_SYMBOLS:
                     if tradingsymbol.startswith(symbol):
                         logger.info(
                             f"[{symbol}] Recovered active position: {tradingsymbol}"
@@ -415,7 +420,16 @@ async def execute_orb_entry(
         logger.info(f"[{symbol}]   SL: {stop_loss:.2f}, TP: {take_profit:.2f}")
 
         # Get underlying price for option selection
-        ltp = await angel_client.get_last_price(symbol)
+        # For indices (NIFTY/BANKNIFTY), always use SPOT price for option selection
+        # even though we used futures for ORB strategy confirmation
+        if symbol in ANGEL_INDEX_FUTURES:
+            # Use spot index price (NSE) for option selection
+            ltp = await angel_client.get_last_price(symbol, exchange="NSE")
+            logger.debug(f"[{symbol}] Using SPOT price for option selection: {ltp}")
+        else:
+            # For stocks, use direct price
+            ltp = await angel_client.get_last_price(symbol)
+        
         if not ltp:
             logger.error(f"[{symbol}] Failed to get LTP for option selection")
             return False
@@ -540,6 +554,10 @@ async def execute_orb_entry(
                 f"Qty: {qty}"
             )
             send_telegram(msg, broker="ANGEL")
+            
+            # Send portfolio update after entry
+            await send_portfolio_summary_telegram(angel_client, "AFTER ENTRY")
+            
             logger.info(f"[{symbol}] ✅ ORB Entry order placed successfully")
 
             # Audit log
@@ -785,6 +803,9 @@ async def orb_signal_monitor(
                             f"🏁 ORB Trade Closed (ANGEL): {symbol}. Position cleared on broker.",
                             broker="ANGEL",
                         )
+                        
+                        # Send portfolio update after exit
+                        await send_portfolio_summary_telegram(angel_client, "AFTER EXIT")
                         del ORB_ACTIVE_POSITIONS[symbol]
 
                 # Check for EOD exit
@@ -967,6 +988,117 @@ async def orb_signal_monitor(
 # -----------------------------
 
 
+async def send_portfolio_summary_telegram(angel_client: AngelClient, title: str = "PORTFOLIO STATUS"):
+    """
+    Send portfolio summary to Telegram for Angel One.
+    """
+    try:
+        # Get positions from Angel One
+        positions = await get_cached_positions(angel_client)
+        
+        # Calculate totals
+        total_pnl = 0
+        position_value = 0
+        active_positions = []
+        
+        for pos in positions:
+            qty = int(pos.get('netqty', 0))
+            if qty != 0:  # Only active positions
+                symbol = pos.get('symbolname', 'Unknown')
+                trading_symbol = pos.get('tradingsymbol', '')
+                avg_price = float(pos.get('netavgprice', 0))
+                ltp = float(pos.get('ltp', 0))
+                pnl = float(pos.get('unrealisedprofitloss', 0))
+                
+                total_pnl += pnl
+                position_value += abs(qty * ltp)
+                
+                active_positions.append({
+                    'symbol': symbol,
+                    'trading_symbol': trading_symbol,
+                    'qty': qty,
+                    'avg_price': avg_price,
+                    'ltp': ltp,
+                    'pnl': pnl
+                })
+        
+        # Build message
+        msg = f"📊 {title}\n"
+        msg += f"={'='*40}\n"
+        msg += f"📈 Positions: ₹{position_value:,.2f}\n"
+        
+        if active_positions:
+            msg += f"\n📍 Active ({len(active_positions)}):"
+            for pos in active_positions:
+                pnl_emoji = "🟢" if pos['pnl'] >= 0 else "🔴"
+                symbol_display = pos['symbol'] if len(pos['trading_symbol']) > 20 else pos['trading_symbol']
+                msg += f"\n{pnl_emoji} {symbol_display}: {pos['qty']} @ ₹{pos['avg_price']:.2f} | P&L: ₹{pos['pnl']:+.2f}"
+            
+            overall_emoji = "🟢" if total_pnl >= 0 else "🔴"
+            msg += f"\n\n{overall_emoji} Total P&L: ₹{total_pnl:+,.2f}"
+        else:
+            msg += f"\n📍 No positions"
+        
+        send_telegram(msg, broker="ANGEL")
+        
+    except Exception as e:
+        logger.error(f"Error sending Angel One portfolio summary to Telegram: {e}")
+
+
+async def position_cleanup_task(angel_client, interval=60):
+    """
+    Periodic cleanup task to detect manually closed positions.
+    Runs every 60 seconds to check if tracked positions still exist on broker.
+    If a position was manually closed, remove it from ORB_ACTIVE_POSITIONS.
+    """
+    logger.info("🧹 Position cleanup task started")
+    try:
+        while not _STOP_EVENT.is_set():
+            await asyncio.sleep(interval)
+            
+            # Get list of symbols currently tracked
+            tracked_symbols = list(ORB_ACTIVE_POSITIONS.keys())
+            
+            # Also check symbols with trade_taken flag but not in active positions
+            trade_taken_symbols = [s for s in ORB_TRADE_TAKEN_TODAY.keys() if s not in tracked_symbols]
+            all_symbols_to_check = tracked_symbols + trade_taken_symbols
+            
+            if all_symbols_to_check:
+                logger.debug(f"🧹 Cleanup checking: {all_symbols_to_check}")
+                # Check each symbol
+                for symbol in all_symbols_to_check:
+                    try:
+                        # Check if position still exists on broker (include_local=False, silent=True)
+                        still_occupied = await is_symbol_occupied(
+                            symbol, angel_client, include_local=False, silent=True
+                        )
+                        
+                        if not still_occupied:
+                            # Position was closed (manually or via bot)
+                            logger.info(
+                                f"[{symbol}] 🧹 Cleanup: Position no longer on broker. Removing from tracking."
+                            )
+                            if symbol in ORB_ACTIVE_POSITIONS:
+                                del ORB_ACTIVE_POSITIONS[symbol]
+                            
+                            # Also clear the trade taken flag to allow re-entry
+                            if symbol in ORB_TRADE_TAKEN_TODAY:
+                                del ORB_TRADE_TAKEN_TODAY[symbol]
+                                logger.info(
+                                    f"[{symbol}] 🔓 Cleanup: Cleared trade-taken flag. Symbol available for re-entry."
+                                )
+                        # Don't log "still occupied" - reduces noise since monitoring loops already check
+                    except Exception as e:
+                        logger.error(f"[{symbol}] Error in cleanup check: {e}")
+                        
+    except asyncio.CancelledError:
+        logger.info("🧹 Position cleanup task cancelled")
+    except Exception as e:
+        logger.error(f"🧹 Position cleanup task error: {e}")
+    finally:
+        logger.info("🧹 Position cleanup task stopped")
+
+
 async def heartbeat_task(interval=60):
     """Continuous heartbeat to show bot is alive."""
     logger.info("💓 Heartbeat task started")
@@ -1013,6 +1145,15 @@ async def _async_daily_session():
         angel_client = AngelClient()
         await angel_client.connect_async()
         
+        # Start position cleanup background task
+        cleanup_task = asyncio.create_task(
+            position_cleanup_task(angel_client, interval=60)
+        )
+        logger.info("🧹 Position cleanup task launched")
+        
+        # Send PRE-MARKET portfolio summary
+        await send_portfolio_summary_telegram(angel_client, "PRE-MARKET")
+        
         # Fetch order book ONCE and populate cache (single API call for all symbols)
         logger.info("📋 Fetching order book from broker to check today's trades...")
         try:
@@ -1028,7 +1169,7 @@ async def _async_daily_session():
             order_book = []
         
         # Now check which symbols were traded (uses cached data)
-        traded_symbols = await check_all_symbols_traded_today(ORB_ANGEL_SYMBOLS, angel_client)
+        traded_symbols = await check_all_symbols_traded_today(ANGEL_SYMBOLS, angel_client)
         for symbol, is_traded in traded_symbols.items():
             if is_traded:
                 ORB_TRADE_TAKEN_TODAY[symbol] = True
@@ -1039,9 +1180,14 @@ async def _async_daily_session():
         # Startup Recovery: Scan for existing positions
         await recover_active_positions(angel_client)
 
-        # Resolve current futures contracts
+        # STRATEGY: Use futures for ORB breakout confirmation, SPOT for option selection
+        # - NIFTY/BANKNIFTY: Use front-month futures for ORB range building and breakout detection
+        # - Stocks: Use spot price directly (no futures)
+        # - Option selection: Always use SPOT price (NSE) for strike selection
+        
+        # Resolve futures contracts (NFO) for indices only
         fut_contracts = {}
-        for symbol in ORB_ANGEL_SYMBOLS:
+        for symbol in ANGEL_INDEX_FUTURES:
             contract = await angel_client.get_current_futures_contract(symbol)
             if contract:
                 fut_contracts[symbol] = contract
@@ -1050,15 +1196,17 @@ async def _async_daily_session():
                     f"[{symbol}] Could not resolve futures contract. Using spot (NSE) as fallback."
                 )
 
-        # Create bar managers for each symbol (still keyed by NIFTY/BANKNIFTY)
-        bar_managers = {symbol: BarManager(symbol) for symbol in ORB_ANGEL_SYMBOLS}
+        # Create bar managers for each symbol
+        bar_managers = {symbol: BarManager(symbol) for symbol in ANGEL_SYMBOLS}
 
         # Load historical data
+        # - For indices: Use futures contract for ORB strategy
+        # - For stocks: Use spot price directly
         for symbol, bar_mgr in bar_managers.items():
             logger.info(f"[{symbol}] Loading historical data...")
             try:
-                # Use futures contract if available
-                if symbol in fut_contracts:
+                # Use futures contract if available (indices only)
+                if symbol in ANGEL_INDEX_FUTURES and symbol in fut_contracts:
                     fut_symbol = fut_contracts[symbol]["symbol"]
                     logger.info(
                         f"[{symbol}] Fetching historical data for future: {fut_symbol}"
@@ -1091,8 +1239,8 @@ async def _async_daily_session():
                 loop=asyncio.get_running_loop(),
             )
 
-            for symbol in ORB_ANGEL_SYMBOLS:
-                if symbol in fut_contracts:
+            for symbol in ANGEL_SYMBOLS:
+                if symbol in ANGEL_INDEX_FUTURES and symbol in fut_contracts:
                     token = fut_contracts[symbol]["token"]
                     exchange = "NFO"
                     disp_symbol = fut_contracts[symbol]["symbol"]
@@ -1121,7 +1269,7 @@ async def _async_daily_session():
         if await wait_for_orb_complete():
             # Start signal monitors
             tasks = []
-            for symbol in ORB_ANGEL_SYMBOLS:
+            for symbol in ANGEL_SYMBOLS:
                 tasks.append(
                     asyncio.create_task(
                         orb_signal_monitor(
@@ -1133,6 +1281,9 @@ async def _async_daily_session():
             if tasks:
                 await asyncio.gather(*tasks)
 
+            # Send POST-MARKET portfolio summary
+            await send_portfolio_summary_telegram(angel_client, "POST-MARKET")
+            
             send_telegram(
                 "✅ ORB Daily Session: All symbol monitors finished.", broker="ANGEL"
             )
@@ -1144,6 +1295,14 @@ async def _async_daily_session():
         logger.error(f"Error in daily monitoring session: {e}", exc_info=True)
 
     finally:
+        # Cancel cleanup task
+        if 'cleanup_task' in locals() and cleanup_task:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                logger.info("🧹 Position cleanup task cancelled")
+        
         # Session Cleanup
         try:
             if ws_client:
@@ -1190,10 +1349,39 @@ async def run_orb_angel_workers():
     close_h = 15
     close_m = 30
 
+    # Check and log holidays at startup
+    try:
+        from core.holiday_checker import get_upcoming_nse_holidays, is_nse_trading_day, get_next_nse_trading_day
+        from datetime import datetime
+        import pytz
+        
+        ist = pytz.timezone("Asia/Kolkata")
+        today = datetime.now(ist)
+        
+        # Check if today is a holiday
+        if not is_nse_trading_day(today):
+            logger.info(f"📅 Today ({today.strftime('%Y-%m-%d %A')}) is an NSE holiday")
+            next_trading_day = get_next_nse_trading_day(today)
+            logger.info(f"📅 Next NSE trading day: {next_trading_day.strftime('%Y-%m-%d %A')}")
+            send_telegram(
+                f"📅 Today is NSE Holiday\n"
+                f"Next trading day: {next_trading_day.strftime('%Y-%m-%d %A')}",
+                broker="ANGEL",
+            )
+        
+        # Log upcoming holidays (next 30 days)
+        upcoming = get_upcoming_nse_holidays(30)
+        if upcoming:
+            logger.info(f"📅 Upcoming NSE holidays (next 30 days): {len(upcoming)} holiday(s)")
+            for holiday_date, name in upcoming[:3]:  # Show first 3
+                logger.info(f"   • {holiday_date.strftime('%Y-%m-%d %A')}: {name}")
+    except Exception as e:
+        logger.warning(f"Failed to check NSE holidays at startup: {e}")
+
     # Send Startup Message
     send_telegram(
         f"🚀 Angel One ORB Bot Starting\n"
-        f"Symbols: {', '.join(ORB_ANGEL_SYMBOLS)}\n"
+        f"Symbols: {', '.join(ANGEL_SYMBOLS)}\n"
         f"ORB Duration: {ORB_DURATION_MINUTES} minutes\n"
         f"R:R Ratio: 1:{ORB_RISK_REWARD}",
         broker="ANGEL",
