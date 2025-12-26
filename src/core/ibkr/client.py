@@ -155,7 +155,9 @@ class IBKRClient:
                         logger.info(f"IB Connection Event {errorCode}: {errorString}")
                     elif errorCode == 202:  # Order canceled - log with full reason
                         logger.warning(f"⚠️ Order Canceled (reqId {reqId}): {errorString}")
-                    elif errorCode >= 2000:  # Warnings
+                    elif errorCode in [2104, 2108, 2119]:  # Data farm connection status - suppress (noisy, informational only)
+                        logger.debug(f"IB Data Farm Status {errorCode}: {errorString}")
+                    elif errorCode >= 2000:  # Other warnings
                         logger.warning(f"IB Warning {errorCode}, reqId {reqId}: {errorString}")
                     else:  # Errors
                         logger.error(f"IB Error {errorCode}, reqId {reqId}: {errorString}")
@@ -554,23 +556,38 @@ class IBKRClient:
                 f"Entry={entry_price}, Target={target_price}, Stop={stop_loss_price}"
             )
 
-            # 4. Create bracket orders manually for better control
-            # For FOP (futures options), we need to handle brackets differently
-            # Create parent entry order first
+            # 4. Create bracket orders: Parent + SL + TP submitted together
+            # Use ib_insync's bracket order helper for proper parent-child relationships
             from ib_async import LimitOrder, Order
             
-            parent_order = LimitOrder("BUY", quantity, entry_price)
-            parent_order.transmit = True  # Transmit parent immediately
-            parent_order.tif = "DAY"  # DAY for immediate market orders
-            
-            logger.info(
-                f"[{option_contract.symbol}] Placing parent entry order (secType={option_contract.secType})"
+            # Use ib_insync's bracketOrder helper to create properly linked orders
+            parent, sl, tp = self.ib.bracketOrder(
+                action="BUY",
+                quantity=quantity,
+                limitPrice=entry_price,
+                takeProfitPrice=target_price,
+                stopLossPrice=stop_loss_price
             )
             
-            # 5. Place parent order first
-            parent_trade = self.ib.placeOrder(option_contract, parent_order)
+            # Customize for our needs
+            parent.tif = "DAY"
+            sl.tif = "DAY" if option_contract.secType == "FOP" else "GTC"
+            tp.tif = "DAY" if option_contract.secType == "FOP" else "GTC"
             
-            # Wait for parent to fill
+            logger.info(
+                f"[{option_contract.symbol}] Placing bracket order group (Parent + SL + TP): "
+                f"Entry @ ${entry_price:.2f}, SL @ ${stop_loss_price:.2f}, TP @ ${target_price:.2f}"
+            )
+            
+            # 5. Place all 3 orders - ib_insync handles the parent-child relationships automatically
+            parent_trade = self.ib.placeOrder(option_contract, parent)
+            sl_trade = self.ib.placeOrder(option_contract, sl)
+            tp_trade = self.ib.placeOrder(option_contract, tp)
+            
+            # Wait briefly for orders to be acknowledged and parent to fill
+            await asyncio.sleep(2)
+            
+            # 6. Check parent fill status
             max_wait = 10.0
             waited = 0.0
             parent_filled = False
@@ -603,67 +620,23 @@ class IBKRClient:
                     "order_status": parent_trade.orderStatus.status,
                 }
             
-            # 6. Now place child orders (stop loss and target) attached to filled parent
-            # Use the assigned parent order ID
-            parent_id = parent_trade.order.orderId
-            
-            # Create stop loss order
-            sl_order = Order()
-            sl_order.action = "SELL"
-            sl_order.orderType = "STP"
-            sl_order.totalQuantity = quantity
-            sl_order.auxPrice = stop_loss_price  # Stop trigger price
-            sl_order.tif = "DAY" if option_contract.secType == "FOP" else "GTC"
-            sl_order.parentId = parent_id
-            sl_order.transmit = False
-            
-            # Create take profit order
-            tp_order = Order()
-            tp_order.action = "SELL"
-            tp_order.orderType = "LMT"
-            tp_order.totalQuantity = quantity
-            tp_order.lmtPrice = target_price
-            tp_order.tif = "DAY" if option_contract.secType == "FOP" else "GTC"
-            tp_order.parentId = parent_id
-            tp_order.transmit = False
-            
-            # Set up OCA group (One-Cancels-All) for stop and target
-            oca_group = f"ORB_{option_contract.symbol}_{parent_id}"
-            tp_order.ocaGroup = oca_group
-            sl_order.ocaGroup = oca_group
-            tp_order.ocaType = 1  # Cancel all remaining orders on fill
-            sl_order.ocaType = 1
-            
-            # CRITICAL: Set transmit=True on LAST order only to send both together
-            # This ensures both SL and TP orders are transmitted
-            tp_order.transmit = True  # Last order triggers transmission of both
-            
-            logger.info(
-                f"[{option_contract.symbol}] Placing bracket child orders: "
-                f"SL @ ${stop_loss_price:.2f}, TP @ ${target_price:.2f} (OCA: {oca_group})"
-            )
-            
-            # Place child orders in sequence: SL first (transmit=False), then TP (transmit=True)
-            sl_trade = self.ib.placeOrder(option_contract, sl_order)
-            tp_trade = self.ib.placeOrder(option_contract, tp_order)
-            
-            # Wait for child orders to be acknowledged
-            await asyncio.sleep(2)
-
             # 7. Check child order status
             sl_status = sl_trade.orderStatus.status if hasattr(sl_trade, 'orderStatus') else "Unknown"
             tp_status = tp_trade.orderStatus.status if hasattr(tp_trade, 'orderStatus') else "Unknown"
             
             logger.info(
-                f"[{option_contract.symbol}] Child orders status: "
-                f"SL={sl_status}, TP={tp_status}"
+                f"[{option_contract.symbol}] Bracket orders status: "
+                f"Parent=Filled, SL={sl_status}, TP={tp_status}"
             )
+
+            # Get OCA group name for tracking
+            oca_group = f"ORB_{option_contract.symbol}_{parent.orderId}"
 
             return {
                 "status": "success",
-                "entry_order_id": parent_order.orderId,
-                "sl_order_id": sl_order.orderId,
-                "target_order_id": tp_order.orderId,
+                "entry_order_id": parent.orderId,
+                "sl_order_id": sl.orderId,
+                "target_order_id": tp.orderId,
                 "parent_trade": parent_trade,
                 "tp_trade": tp_trade,
                 "sl_trade": sl_trade,
@@ -676,103 +649,43 @@ class IBKRClient:
 
     async def get_positions(self) -> List[Dict]:
         """
-        Get current open positions.
+        Get current open positions with FRESH P&L data from IBKR.
+        Uses ib.portfolio() which provides broker-calculated unrealized P&L.
 
         Returns:
-            List of position dictionaries
+            List of position dictionaries with broker-provided P&L
         """
         try:
-            positions = self.ib.positions()
+            # Request fresh portfolio data (includes P&L calculated by IBKR)
+            logger.debug("Requesting FRESH portfolio data from IBKR...")
+            await self.ib.reqPositionsAsync()
+            
+            # Get portfolio items which include unrealized P&L from broker
+            portfolio_items = self.ib.portfolio()
+            logger.debug(f"Retrieved {len(portfolio_items)} portfolio item(s) from IBKR")
 
             result = []
-            for pos in positions:
-                # Get market price from contract
-                market_price = 0
-                market_value = 0
-                unrealized_pnl = 0
+            for item in portfolio_items:
+                # Use broker-provided values directly
+                market_price = item.marketPrice if hasattr(item, 'marketPrice') else 0
+                market_value = item.marketValue if hasattr(item, 'marketValue') else 0
+                unrealized_pnl = item.unrealizedPNL if hasattr(item, 'unrealizedPNL') else 0
                 
-                try:
-                    # Qualify contract first to ensure exchange is set
-                    contract = pos.contract
-                    if not contract.exchange or contract.exchange == '':
-                        # Set appropriate exchange for contract type
-                        if contract.secType == 'FOP':  # Futures options
-                            contract.exchange = 'CME'  # Most futures options trade on CME
-                        elif contract.secType == 'OPT':  # Stock options
-                            contract.exchange = 'SMART'
-                        else:
-                            contract.exchange = 'SMART'
-                        
-                        # Qualify to get correct exchange
-                        try:
-                            await self.ib.qualifyContractsAsync(contract)
-                        except Exception as e:
-                            logger.debug(f"Could not qualify contract for {contract.symbol}: {e}")
-                    
-                    # IMPORTANT: Cancel any existing market data subscription first
-                    self.ib.cancelMktData(contract)
-                    
-                    # Request FRESH market data (not cached)
-                    ticker = self.ib.reqMktData(contract, "", False, False)
-                    
-                    # Wait for fresh tick data (poll for valid price)
-                    max_wait = 3.0
-                    waited = 0.0
-                    poll_interval = 0.25
-                    while waited < max_wait:
-                        # Prefer last trade price, then bid/ask midpoint
-                        if hasattr(ticker, 'last') and ticker.last and ticker.last > 0:
-                            market_price = ticker.last
-                            break
-                        if hasattr(ticker, 'bid') and hasattr(ticker, 'ask'):
-                            if ticker.bid > 0 and ticker.ask > 0:
-                                market_price = (ticker.bid + ticker.ask) / 2
-                                break
-                        if hasattr(ticker, 'close') and ticker.close and ticker.close > 0:
-                            market_price = ticker.close
-                            break
-                        await asyncio.sleep(poll_interval)
-                        waited += poll_interval
-                    
-                    self.ib.cancelMktData(contract)
-                    
-                    if market_price > 0:
-                        # For options: 
-                        # - position: number of contracts (e.g., 1.0)
-                        # - avgCost: TOTAL premium paid per contract (e.g., $1130.73 for entire contract)
-                        # - market_price: Current price per share (e.g., $9.80 per share)
-                        # - Each contract = 100 shares
-                        
-                        # Market value: current price per share × 100 shares × number of contracts
-                        market_value = pos.position * market_price * 100
-                        
-                        # Cost basis: what we paid (avgCost is already total per contract)
-                        cost_basis = pos.position * pos.avgCost
-                        
-                        # P&L = current value - what we paid
-                        unrealized_pnl = market_value - cost_basis
-                        
-                        logger.debug(
-                            f"Position P&L calc: {pos.contract.symbol} | "
-                            f"Contracts: {pos.position} | AvgCost: ${pos.avgCost:.2f}/contract | "
-                            f"MktPrice: ${market_price:.2f}/share | "
-                            f"Cost: ${cost_basis:.2f} | MktVal: ${market_value:.2f} | "
-                            f"P&L: ${unrealized_pnl:.2f}"
-                        )
-                    else:
-                        logger.warning(f"No market price available for {pos.contract.symbol}")
-                except Exception as e:
-                    logger.debug(f"Could not get market price for {pos.contract.symbol}: {e}")
+                # Portfolio items already have all data calculated by IBKR (logged at DEBUG level)
+                logger.debug(
+                    f"Portfolio: {item.contract.symbol} | Qty={item.position} | "
+                    f"AvgCost=${item.averageCost:.2f} | Price=${market_price:.2f} | P&L=${unrealized_pnl:.2f}"
+                )
                 
                 result.append(
                     {
-                        "symbol": pos.contract.symbol,
-                        "position": pos.position,
-                        "avgCost": pos.avgCost,
+                        "symbol": item.contract.symbol,
+                        "position": item.position,
+                        "avgCost": item.averageCost,
                         "marketPrice": market_price,
                         "marketValue": market_value,
-                        "unrealizedPNL": unrealized_pnl,
-                        "contract": pos.contract,
+                        "unrealizedPNL": unrealized_pnl,  # IBKR-calculated P&L
+                        "contract": item.contract,
                     }
                 )
 

@@ -22,6 +22,7 @@ class TradeStateManager:
     
     def __init__(self):
         self.state_dir = TRADE_STATE_DIR
+        self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self._get_today_state_file()
         self.traded_symbols: Set[str] = set()
         self.open_positions: Set[str] = set()
@@ -35,41 +36,51 @@ class TradeStateManager:
     
     def _load_state(self):
         """Load state from file if exists"""
+        if not self.state_file.exists():
+            logger.info("📄 No existing state file for today, starting fresh")
+            self._save_state()
+            return
+        
         try:
-            if self.state_file.exists():
-                with open(self.state_file, 'r') as f:
-                    data = json.load(f)
-                    self.traded_symbols = set(data.get('traded_symbols', []))
-                    self.open_positions = set(data.get('open_positions', []))
-                logger.info(
-                    f"📂 Loaded trade state: {len(self.traded_symbols)} traded, "
-                    f"{len(self.open_positions)} open positions"
-                )
-            else:
-                logger.info("📂 No existing state file - starting fresh for today")
+            with open(self.state_file, 'r') as f:
+                data = json.load(f)
+                self.traded_symbols = set(data.get('traded_symbols', []))
+                self.open_positions = set(data.get('open_positions', []))
+            
+            logger.info(
+                "📂 Loaded state: %d traded symbols, %d open positions",
+                len(self.traded_symbols),
+                len(self.open_positions)
+            )
         except Exception as e:
-            logger.error(f"Error loading trade state: {e}")
+            logger.error("❌ Failed to load state file: %s", e)
+            # Start fresh if load fails
             self.traded_symbols = set()
             self.open_positions = set()
     
     def _save_state(self):
         """Save current state to file"""
         try:
+            ist = pytz.timezone("Asia/Kolkata")
+            today = datetime.now(ist).date()
             data = {
-                'traded_symbols': list(self.traded_symbols),
-                'open_positions': list(self.open_positions),
-                'last_updated': datetime.now(pytz.timezone("Asia/Kolkata")).isoformat()
+                'date': today.isoformat(),
+                'traded_symbols': sorted(list(self.traded_symbols)),
+                'open_positions': sorted(list(self.open_positions)),
+                'last_updated': datetime.now(ist).isoformat()
             }
             with open(self.state_file, 'w') as f:
                 json.dump(data, f, indent=2)
+            
+            logger.debug("💾 State saved: %s", self.state_file.name)
         except Exception as e:
-            logger.error(f"Error saving trade state: {e}")
+            logger.error("❌ Failed to save state: %s", e)
     
     def mark_symbol_traded(self, symbol: str):
         """Mark symbol as traded today"""
         self.traded_symbols.add(symbol)
         self._save_state()
-        logger.info(f"[{symbol}] ✅ Marked as traded today")
+        logger.info("[%s] ✅ Marked as traded", symbol)
     
     def is_symbol_traded_today(self, symbol: str) -> bool:
         """Check if symbol was traded today"""
@@ -79,18 +90,30 @@ class TradeStateManager:
         """Mark symbol as having an open position"""
         self.open_positions.add(symbol)
         self._save_state()
-        logger.info(f"[{symbol}] 📂 Marked position as OPEN")
+        logger.debug("[%s] 📈 Position opened", symbol)
     
     def mark_position_closed(self, symbol: str):
         """Mark symbol position as closed"""
         if symbol in self.open_positions:
             self.open_positions.remove(symbol)
             self._save_state()
-            logger.info(f"[{symbol}] 📂 Marked position as CLOSED")
+            logger.debug("[%s] 📉 Position closed", symbol)
     
     def has_open_position(self, symbol: str) -> bool:
         """Check if symbol has an open position"""
         return symbol in self.open_positions
+    
+    def get_state_summary(self) -> dict:
+        """
+        Get summary of current trade state.
+        
+        Returns:
+            Dict with traded_symbols, open_positions lists
+        """
+        return {
+            "traded_symbols": sorted(list(self.traded_symbols)),
+            "open_positions": sorted(list(self.open_positions))
+        }
     
     def sync_with_broker(self, positions: list):
         """
@@ -153,11 +176,11 @@ class TradeStateManager:
         added = broker_symbols - self.open_positions
         
         if removed:
-            logger.info(f"📂 Syncing: Positions closed on broker: {removed}")
+            logger.info("📂 Syncing: Positions closed on broker: %s", list(removed))
             self.open_positions -= removed
         
         if added:
-            logger.info(f"📂 Syncing: Positions opened on broker: {added}")
+            logger.info("📂 Syncing: Positions opened on broker: %s", list(added))
             self.open_positions |= added
         
         if removed or added:
@@ -196,8 +219,8 @@ class TradeStateManager:
                         if tracked in symbol and tracked not in self.traded_symbols:
                             self.traded_symbols.add(tracked)
                             logger.info(
-                                f"[{tracked}] 📂 Found existing order from today - "
-                                f"marked as traded"
+                                "[%s] 📂 Found existing order from today - marked as traded",
+                                tracked
                             )
             except Exception as e:
                 logger.debug(f"Error parsing order time: {e}")

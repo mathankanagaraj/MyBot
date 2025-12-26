@@ -50,6 +50,7 @@ from core.angelone.client import AngelClient
 from core.angelone.option_selector import find_option_contract_async
 from core.angelone.utils import is_market_open, get_ist_now
 from core.scheduler import run_strategy_loop
+from core.telegram_commands import TelegramCommandHandler
 
 
 # -----------------------------
@@ -58,6 +59,8 @@ from core.scheduler import run_strategy_loop
 _STOP_EVENT = asyncio.Event()
 ORB_TRADE_TAKEN_TODAY: Dict[str, bool] = {}  # Track if trade taken per symbol
 ORB_ACTIVE_POSITIONS: Dict[str, Dict] = {}  # Track active positions per symbol
+_TELEGRAM_HANDLER = None  # Telegram command listener
+_BOT_PAUSED = False  # Manual pause/resume state
 
 # IST timezone
 IST = pytz.timezone(ANGEL_TIMEZONE)
@@ -1028,10 +1031,15 @@ async def orb_signal_monitor(
 async def send_portfolio_summary_telegram(angel_client: AngelClient, title: str = "PORTFOLIO STATUS"):
     """
     Send portfolio summary to Telegram for Angel One.
+    Always fetches FRESH data from broker (no cache).
     """
     try:
-        # Get positions from Angel One
-        positions = await get_cached_positions(angel_client)
+        import time
+        request_time = time.strftime("%H:%M:%S")
+        logger.info(f"📊 [{request_time}] Fetching FRESH portfolio data from Angel One for: {title}")
+        
+        # Get FRESH positions from Angel One (bypass cache for Telegram requests)
+        positions = await angel_client.get_positions()
         
         # Calculate totals
         total_pnl = 0
@@ -1045,10 +1053,15 @@ async def send_portfolio_summary_telegram(angel_client: AngelClient, title: str 
                 trading_symbol = pos.get('tradingsymbol', '')
                 avg_price = float(pos.get('netavgprice', 0))
                 ltp = float(pos.get('ltp', 0))
+                # Use broker-calculated P&L directly from Angel One API
                 pnl = float(pos.get('unrealisedprofitloss', 0))
                 
                 total_pnl += pnl
                 position_value += abs(qty * ltp)
+                
+                # Log each position at DEBUG level
+                symbol_display = symbol if len(trading_symbol) > 20 else trading_symbol
+                logger.debug(f"  {symbol_display}: Qty={qty}, AvgPrice=₹{avg_price:.2f}, LTP=₹{ltp:.2f}, P&L=₹{pnl:+.2f}")
                 
                 active_positions.append({
                     'symbol': symbol,
@@ -1056,7 +1069,7 @@ async def send_portfolio_summary_telegram(angel_client: AngelClient, title: str 
                     'qty': qty,
                     'avg_price': avg_price,
                     'ltp': ltp,
-                    'pnl': pnl
+                    'pnl': pnl  # Broker-calculated P&L
                 })
         
         # Build message
@@ -1167,6 +1180,8 @@ async def heartbeat_task(interval=60):
 
 async def _async_daily_session():
     """Actual daily trading logic running inside the subprocess."""
+    global _STOP_EVENT, _ORDER_BOOK_CACHE_LOCK, _POSITIONS_CACHE_LOCK, _TELEGRAM_HANDLER, _TRADE_STATE_MANAGER
+    
     logger.info("🌅 Starting Daily Session (Subprocess)")
     ws_client = None
     angel_client = None
@@ -1178,13 +1193,54 @@ async def _async_daily_session():
         import threading
 
         # CRITICAL: Re-initialize stop event in the new process's event loop
-        global _STOP_EVENT, _ORDER_BOOK_CACHE_LOCK, _POSITIONS_CACHE_LOCK
         _STOP_EVENT = asyncio.Event()
         _ORDER_BOOK_CACHE_LOCK = asyncio.Lock()
         _POSITIONS_CACHE_LOCK = asyncio.Lock()
 
         angel_client = AngelClient()
         await angel_client.connect_async()
+        
+        # Initialize trade state manager (for persistence across restarts)
+        from core.angelone.trade_state import TradeStateManager
+        
+        _TRADE_STATE_MANAGER = TradeStateManager()
+        logger.info("✅ Initialized Angel One TradeStateManager")
+        
+        # Sync state with broker on startup
+        try:
+            positions = await angel_client.get_positions()
+            logger.info(f"📋 Retrieved {len(positions)} position(s) from Angel One broker for sync")
+            
+            # Log each position for debugging
+            for pos in positions:
+                logger.debug(
+                    f"  Position: {pos.get('tradingsymbol')} | NetQty: {pos.get('netqty', 0)} | AvgPrice: ₹{pos.get('avgnetprice', 0.0)}"
+                )
+            
+            _TRADE_STATE_MANAGER.sync_with_broker(positions)
+            
+            # Log state summary
+            state_summary = _TRADE_STATE_MANAGER.get_state_summary()
+            logger.info(
+                "📊 Trade state synced: %d traded symbols, %d open positions",
+                len(state_summary["traded_symbols"]),
+                len(state_summary["open_positions"])
+            )
+            
+            if state_summary["traded_symbols"]:
+                traded_list = ', '.join(sorted(state_summary['traded_symbols']))
+                send_telegram(
+                    f"📊 **Angel One Trade State Summary**\\n"
+                    f"Traded Today: {traded_list}\\n"
+                    f"Open Positions: {len(state_summary['open_positions'])}",
+                    broker="ANGEL",
+                )
+            
+            # Cleanup old state files (keep last 7 days)
+            _TRADE_STATE_MANAGER.cleanup_old_state_files(7)
+            
+        except Exception as e:
+            logger.error("⚠️ Failed to sync trade state: %s", e)
         
         # Start position cleanup background task
         cleanup_task = asyncio.create_task(
@@ -1322,6 +1378,27 @@ async def _async_daily_session():
             if tasks:
                 await asyncio.gather(*tasks)
 
+            # Start Telegram command handler
+            try:
+                from core.config import ANGEL_TELEGRAM_TOKEN, ANGEL_TELEGRAM_CHAT_ID
+                
+                # Callback for positions command
+                async def positions_callback():
+                    await send_portfolio_summary_telegram(angel_client, "TELEGRAM REQUEST")
+                
+                _TELEGRAM_HANDLER = TelegramCommandHandler(
+                    token=ANGEL_TELEGRAM_TOKEN,
+                    chat_id=ANGEL_TELEGRAM_CHAT_ID,
+                    broker="ANGEL",
+                    stop_callback=stop_orb_angel_workers,
+                    start_callback=start_angel_bot,
+                    positions_callback=positions_callback,
+                )
+                _TELEGRAM_HANDLER.start()
+                logger.info("✅ Telegram command handler started")
+            except Exception as e:
+                logger.error(f"Failed to start Telegram command handler: {e}")
+
             # Send POST-MARKET portfolio summary
             await send_portfolio_summary_telegram(angel_client, "POST-MARKET")
             
@@ -1336,6 +1413,14 @@ async def _async_daily_session():
         logger.error(f"Error in daily monitoring session: {e}", exc_info=True)
 
     finally:
+        # Stop Telegram command handler
+        if _TELEGRAM_HANDLER:
+            try:
+                await _TELEGRAM_HANDLER.stop()
+                logger.info("✅ Telegram command handler stopped")
+            except Exception as e:
+                logger.error(f"Error stopping Telegram handler: {e}")
+        
         # Cancel cleanup task
         if 'cleanup_task' in locals() and cleanup_task:
             cleanup_task.cancel()
@@ -1414,8 +1499,17 @@ async def run_orb_angel_workers():
         upcoming = get_upcoming_nse_holidays(30)
         if upcoming:
             logger.info(f"📅 Upcoming NSE holidays (next 30 days): {len(upcoming)} holiday(s)")
-            for holiday_date, name in upcoming[:3]:  # Show first 3
+            holiday_summary = []
+            for holiday_date, name in upcoming[:5]:  # Show first 5
                 logger.info(f"   • {holiday_date.strftime('%Y-%m-%d %A')}: {name}")
+                holiday_summary.append(f"• {holiday_date.strftime('%b %d (%a)')}")
+            
+            # Send holiday info to Telegram
+            send_telegram(
+                f"📅 **Upcoming NSE Holidays**\\n" +
+                "\\n".join(holiday_summary[:5]),
+                broker="ANGEL",
+            )
     except Exception as e:
         logger.warning(f"Failed to check NSE holidays at startup: {e}")
 
@@ -1446,5 +1540,17 @@ async def run_orb_angel_workers():
 
 def stop_orb_angel_workers():
     """Signal ORB workers to stop."""
+    global _BOT_PAUSED
     _STOP_EVENT.set()
+    _BOT_PAUSED = True
     logger.info("🛑 Stop signal sent to ORB Angel workers")
+    send_telegram("🛑 Angel One bot stopped by user command", broker="ANGEL")
+
+
+def start_angel_bot():
+    """Resume Angel bot (clear pause state)."""
+    global _BOT_PAUSED
+    _BOT_PAUSED = False
+    _STOP_EVENT.clear()
+    logger.info("▶️ Angel bot resumed (pause state cleared)")
+    send_telegram("▶️ Angel One bot resumed\nNote: Bot will wait for next trading day if market is closed", broker="ANGEL")

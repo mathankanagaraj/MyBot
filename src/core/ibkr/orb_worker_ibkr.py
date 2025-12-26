@@ -55,6 +55,7 @@ from core.ibkr.client import IBKRClient
 from core.ibkr.utils import is_us_market_open, get_us_et_now
 from core.scheduler import run_strategy_loop
 from core.cash_manager import LiveCashManager
+from core.telegram_commands import TelegramCommandHandler
 
 
 # -----------------------------
@@ -64,6 +65,8 @@ _STOP_EVENT = asyncio.Event()
 ORB_TRADE_TAKEN_TODAY: Dict[str, bool] = {}  # Track if trade taken per symbol
 ORB_ACTIVE_POSITIONS: Dict[str, Dict] = {}  # Track active positions per symbol
 _TRADE_STATE_MANAGER = None  # File-based state persistence
+_TELEGRAM_HANDLER = None  # Telegram command listener
+_BOT_PAUSED = False  # Manual pause/resume state
 
 # US Eastern timezone
 US_ET = pytz.timezone(IBKR_TIMEZONE)
@@ -1168,6 +1171,13 @@ async def force_exit_position(
                     
                     from ib_async import MarketOrder
 
+                    # Ensure contract has exchange set
+                    if not option_contract.exchange or option_contract.exchange == '':
+                        if option_contract.secType == 'FOP':
+                            option_contract.exchange = 'CME'
+                        else:
+                            option_contract.exchange = 'SMART'
+                    
                     action = "SELL" if pos.get("position", 0) > 0 else "BUY"
                     order = MarketOrder(action, qty)
                     trade = ibkr_client.ib.placeOrder(option_contract, order)
@@ -1178,10 +1188,14 @@ async def force_exit_position(
                     # Check if filled
                     status = trade.orderStatus.status if hasattr(trade, 'orderStatus') else "Unknown"
                     
+                    # Get entry price from position dict (may not exist for old positions)
+                    entry_price = position.get('entry_price', 0)
+                    entry_str = f"Entry: ${entry_price:.2f}\n" if entry_price > 0 else ""
+                    
                     msg = (
                         f"⚠️ ORB FORCE EXIT ({reason}): {symbol}\n"
                         f"Position: {position['direction']}\n"
-                        f"Entry: ${position['entry_price']:.2f}\n"
+                        f"{entry_str}"
                         f"Qty: {qty} (Action: {action})\n"
                         f"Status: {status}"
                     )
@@ -1200,8 +1214,11 @@ async def force_exit_position(
             send_telegram(msg, broker="IBKR")
 
         # Step 3: Remove from tracking
-        del ORB_ACTIVE_POSITIONS[symbol]
-        logger.info(f"[{symbol}] Removed from active positions tracking")
+        if symbol in ORB_ACTIVE_POSITIONS:
+            del ORB_ACTIVE_POSITIONS[symbol]
+            logger.info(f"[{symbol}] Removed from active positions tracking")
+        else:
+            logger.debug(f"[{symbol}] Already removed from active positions tracking")
 
     except Exception as e:
         logger.exception(f"[{symbol}] Force exit error: {e}")
@@ -1282,7 +1299,10 @@ async def orb_signal_monitor(
                         
                         # Send portfolio update after exit
                         await send_portfolio_summary_telegram(ibkr_client, "AFTER EXIT")
-                        del ORB_ACTIVE_POSITIONS[symbol]
+                        
+                        # Remove from tracking
+                        if symbol in ORB_ACTIVE_POSITIONS:
+                            del ORB_ACTIVE_POSITIONS[symbol]
 
                 # Check for EOD exit even if trade taken
                 if should_force_exit(
@@ -1487,10 +1507,20 @@ async def orb_signal_monitor(
 async def send_portfolio_summary_telegram(ibkr_client: IBKRClient, title: str = "PORTFOLIO STATUS"):
     """
     Send portfolio summary to Telegram.
+    Always fetches FRESH data from broker.
     """
     try:
+        import time
+        request_time = time.strftime("%H:%M:%S")
+        logger.debug(f"📊 [{request_time}] Fetching portfolio data from IBKR: {title}")
+        
         summary = await ibkr_client.get_account_summary_async()
         positions = await ibkr_client.get_positions()
+        
+        # Wait for market data to update (positions already requested fresh data)
+        await asyncio.sleep(3)
+        
+        logger.debug(f"📊 Retrieved {len(positions)} position(s)")
         
         cash_balance = summary.get('CashBalance', 0)
         net_liquidation = summary.get('NetLiquidation', 0)
@@ -1509,9 +1539,14 @@ async def send_portfolio_summary_telegram(ibkr_client: IBKRClient, title: str = 
                 symbol = pos.get('symbol')
                 qty = pos.get('position', 0)
                 avg_cost = pos.get('avgCost', 0)
+                market_price = pos.get('marketPrice', 0)
                 pnl = pos.get('unrealizedPNL', 0)
                 total_pnl += pnl
                 pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                
+                # Log each position at DEBUG level
+                logger.debug(f"  {symbol}: Qty={qty}, AvgCost=${avg_cost:.2f}, MktPrice=${market_price:.2f}, P&L=${pnl:+.2f}")
+                
                 msg += f"\n{pnl_emoji} {symbol}: {qty} @ ${avg_cost:.2f} | P&L: ${pnl:+.2f}"
             
             overall_emoji = "🟢" if total_pnl >= 0 else "🔴"
@@ -1732,6 +1767,8 @@ async def _async_ibkr_session():
     Daily trading session logic for IBKR.
     Connects, waits for ORB, and runs signal monitors.
     """
+    global _TELEGRAM_HANDLER, MARKET_CLOSE_TIME
+    
     logger.info("🌅 Starting Daily Session (IBKR)")
     
     # Check for early close and adjust market close time
@@ -1784,7 +1821,7 @@ async def _async_ibkr_session():
             # Log each position for debugging
             for pos in positions:
                 logger.debug(
-                    f"  Position: {pos.symbol} | Size: {pos.position} | AvgCost: ${pos.avgCost:.2f}"
+                    f"  Position: {pos.get('symbol')} | Size: {pos.get('position', 0)} | AvgCost: ${pos.get('avgCost', 0.0):.2f}"
                 )
             
             _TRADE_STATE_MANAGER.sync_with_broker(positions)
@@ -1843,6 +1880,27 @@ async def _async_ibkr_session():
 
         # Wait for ORB period to complete
         if await wait_for_orb_complete(ibkr_client):
+            # Start Telegram command handler
+            try:
+                from core.config import IBKR_TELEGRAM_TOKEN, IBKR_TELEGRAM_CHAT_ID
+                
+                # Callback for positions command
+                async def positions_callback():
+                    await send_portfolio_summary_telegram(ibkr_client, "TELEGRAM REQUEST")
+                
+                _TELEGRAM_HANDLER = TelegramCommandHandler(
+                    token=IBKR_TELEGRAM_TOKEN,
+                    chat_id=IBKR_TELEGRAM_CHAT_ID,
+                    broker="IBKR",
+                    stop_callback=stop_orb_ibkr_workers,
+                    start_callback=start_ibkr_bot,
+                    positions_callback=positions_callback,
+                )
+                _TELEGRAM_HANDLER.start()
+                logger.info("✅ Telegram command handler started")
+            except Exception as e:
+                logger.error(f"Failed to start Telegram command handler: {e}")
+            
             # Start signal monitors
             tasks = []
             for symbol in ORB_IBKR_SYMBOLS:
@@ -1870,6 +1928,14 @@ async def _async_ibkr_session():
     except Exception as e:
         logger.error(f"Error in IBKR daily session: {e}", exc_info=True)
     finally:
+        # Stop Telegram command handler
+        if _TELEGRAM_HANDLER:
+            try:
+                await _TELEGRAM_HANDLER.stop()
+                logger.info("✅ Telegram command handler stopped")
+            except Exception as e:
+                logger.error(f"Error stopping Telegram handler: {e}")
+        
         # Cancel background tasks
         if cleanup_task and not cleanup_task.done():
             cleanup_task.cancel()
@@ -1959,4 +2025,17 @@ async def run_orb_ibkr_workers():
 
 def stop_orb_ibkr_workers():
     """Stop all IBKR ORB workers."""
+    global _BOT_PAUSED
     _STOP_EVENT.set()
+    _BOT_PAUSED = True
+    logger.info("🛑 Stop signal sent to IBKR ORB workers")
+    send_telegram("🛑 IBKR bot stopped by user command", broker="IBKR")
+
+
+def start_ibkr_bot():
+    """Resume IBKR bot (clear pause state)."""
+    global _BOT_PAUSED
+    _BOT_PAUSED = False
+    _STOP_EVENT.clear()
+    logger.info("▶️ IBKR bot resumed (pause state cleared)")
+    send_telegram("▶️ IBKR bot resumed\nNote: Bot will wait for next trading day if market is closed", broker="IBKR")

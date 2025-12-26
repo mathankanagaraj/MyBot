@@ -233,7 +233,7 @@ STRATEGY = os.getenv("STRATEGY", "MACD_EMA").upper()
 
 # IBKR ORB Strategy Symbols (can be overridden via .env)
 ORB_SYMBOLS_STR = os.getenv(
-    "ORB_SYMBOLS", "ES,NQ,NVDA,TSLA,AAPL,AMD,MSFT"  # Default includes futures
+    "ORB_SYMBOLS", "ES,NQ,NVDA,TSLA,AAPL,AMD,MSFT,META"  # Default includes futures
 )
 ORB_IBKR_SYMBOLS = [s.strip() for s in ORB_SYMBOLS_STR.split(",")]
 

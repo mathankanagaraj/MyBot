@@ -191,8 +191,9 @@ class IBKRTradeStateManager:
         broker_open_positions = set()
         
         for pos in positions:
-            symbol = pos.symbol
-            position_size = pos.position
+            # pos is a dict with keys: symbol, position, avgCost, contract
+            symbol = pos.get("symbol")
+            position_size = pos.get("position", 0)
             
             logger.debug(
                 "Processing position: symbol='%s', size=%s",
