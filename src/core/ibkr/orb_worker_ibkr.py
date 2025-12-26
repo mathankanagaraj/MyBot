@@ -1042,22 +1042,32 @@ async def execute_orb_entry(
             }
             ORB_TRADE_TAKEN_TODAY[symbol] = True
             
-            # Mark symbol as traded in state manager
+            # Mark symbol as traded in state manager and save immediately
             if _TRADE_STATE_MANAGER:
                 _TRADE_STATE_MANAGER.mark_symbol_traded(symbol)
                 _TRADE_STATE_MANAGER.mark_position_opened(symbol)
                 _TRADE_STATE_MANAGER.increment_trade_count()
+                
+                # Verify state was saved
+                state = _TRADE_STATE_MANAGER.get_state_summary()
                 logger.info(
-                    f"[{symbol}] 📝 Marked as traded (Total: {_TRADE_STATE_MANAGER.get_total_trades()})"
+                    f"[{symbol}] 📝 State updated: Total trades: {_TRADE_STATE_MANAGER.get_total_trades()}, "
+                    f"Traded symbols: {state['traded_symbols']}, Open positions: {state['open_positions']}"
                 )
 
-            # Telegram notification
+            # Telegram notification with full details
             msg = (
                 f"🎯 ORB ENTRY (IBKR): {symbol} {direction}\n"
-                f"Option: {option_data['strike']} {option_right} 0DTE\n"
-                f"Index: ${entry_price:.2f}\n"
-                f"SL: ${stop_loss:.2f} | TP: ${take_profit:.2f}\n"
-                f"Qty: {qty}"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 Underlying: ${underlying_price:.2f}\n"
+                f"📈 Option: {option_data['strike']} {option_right} 0DTE\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 Entry: ${option_price:.2f}\n"
+                f"🛑 Stop Loss: ${option_sl:.2f}\n"
+                f"🎯 Target: ${option_tp:.2f}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 Quantity: {qty} contract(s)\n"
+                f"💵 Cost: ${trade_cost:,.2f}"
             )
             send_telegram(msg, broker="IBKR")
             
@@ -1589,17 +1599,15 @@ async def position_cleanup_task(ibkr_client: IBKRClient, interval=60):
         while not _STOP_EVENT.is_set():
             await asyncio.sleep(interval)
             
-            # Get list of symbols currently tracked
+            # Get list of symbols currently tracked in active positions
+            # Don't check trade_taken symbols that aren't in active positions
+            # (they're already closed, just kept for one-trade-per-symbol tracking)
             tracked_symbols = list(ORB_ACTIVE_POSITIONS.keys())
             
-            # Also check symbols with trade_taken flag but not in active positions
-            trade_taken_symbols = [s for s in ORB_TRADE_TAKEN_TODAY.keys() if s not in tracked_symbols]
-            all_symbols_to_check = tracked_symbols + trade_taken_symbols
-            
-            if all_symbols_to_check:
-                logger.info(f"🧹 Cleanup: Monitoring {len(all_symbols_to_check)} symbols: {', '.join(all_symbols_to_check)}")
+            if tracked_symbols:
+                logger.info(f"🧹 Cleanup: Monitoring {len(tracked_symbols)} active position(s): {', '.join(tracked_symbols)}")
                 # Check each symbol
-                for symbol in all_symbols_to_check:
+                for symbol in tracked_symbols:
                     try:
                         # Check if position still exists on broker (include_local=False, silent=True)
                         still_occupied = await is_symbol_occupied(
@@ -1676,10 +1684,16 @@ async def position_cleanup_task(ibkr_client: IBKRClient, interval=60):
                                 logger.info(f"[{symbol}] 📝 Marked position as closed in state")
                             
                             # Clear the trade taken flag if one-trade-per-symbol is disabled
+                            # This prevents cleanup from showing already closed positions
                             if not IBKR_ONE_TRADE_PER_SYMBOL and symbol in ORB_TRADE_TAKEN_TODAY:
                                 del ORB_TRADE_TAKEN_TODAY[symbol]
                                 logger.info(
                                     f"[{symbol}] 🔓 Cleanup: Cleared trade-taken flag. Symbol available for re-entry."
+                                )
+                            elif IBKR_ONE_TRADE_PER_SYMBOL:
+                                # Keep the flag but log it's intentionally kept for one-trade-per-symbol
+                                logger.debug(
+                                    f"[{symbol}] 🔒 Trade-taken flag kept (ONE_TRADE_PER_SYMBOL mode)"
                                 )
                         # Don't log "still occupied" - reduces noise since monitoring loops already check
                     except Exception as e:
@@ -1765,6 +1779,14 @@ async def _async_ibkr_session():
         # Sync state with broker on startup
         try:
             positions = await ibkr_client.get_positions_fast()
+            logger.info(f"📋 Retrieved {len(positions)} position(s) from IBKR broker for sync")
+            
+            # Log each position for debugging
+            for pos in positions:
+                logger.debug(
+                    f"  Position: {pos.symbol} | Size: {pos.position} | AvgCost: ${pos.avgCost:.2f}"
+                )
+            
             _TRADE_STATE_MANAGER.sync_with_broker(positions)
             
             # Log state summary

@@ -634,22 +634,20 @@ class IBKRClient:
             tp_order.ocaType = 1  # Cancel all remaining orders on fill
             sl_order.ocaType = 1
             
-            # Transmit last order to send both
-            sl_order.transmit = True
+            # CRITICAL: Set transmit=True on LAST order only to send both together
+            # This ensures both SL and TP orders are transmitted
+            tp_order.transmit = True  # Last order triggers transmission of both
             
             logger.info(
                 f"[{option_contract.symbol}] Placing bracket child orders: "
                 f"SL @ ${stop_loss_price:.2f}, TP @ ${target_price:.2f} (OCA: {oca_group})"
             )
             
-            # Place child orders
+            # Place child orders in sequence: SL first (transmit=False), then TP (transmit=True)
             sl_trade = self.ib.placeOrder(option_contract, sl_order)
             tp_trade = self.ib.placeOrder(option_contract, tp_order)
             
-            # Wait briefly to confirm child orders submitted
-            await asyncio.sleep(2)
-
-            # Wait briefly to confirm child orders submitted
+            # Wait for child orders to be acknowledged
             await asyncio.sleep(2)
 
             # 7. Check child order status
@@ -711,22 +709,58 @@ class IBKRClient:
                         except Exception as e:
                             logger.debug(f"Could not qualify contract for {contract.symbol}: {e}")
                     
-                    # Request current market data
-                    ticker = self.ib.reqMktData(contract, "", False, False)
-                    await asyncio.sleep(0.5)  # Brief wait for price
+                    # IMPORTANT: Cancel any existing market data subscription first
+                    self.ib.cancelMktData(contract)
                     
-                    # Get market price (prefer last, then close)
-                    if hasattr(ticker, 'last') and ticker.last and ticker.last > 0:
-                        market_price = ticker.last
-                    elif hasattr(ticker, 'close') and ticker.close and ticker.close > 0:
-                        market_price = ticker.close
+                    # Request FRESH market data (not cached)
+                    ticker = self.ib.reqMktData(contract, "", False, False)
+                    
+                    # Wait for fresh tick data (poll for valid price)
+                    max_wait = 3.0
+                    waited = 0.0
+                    poll_interval = 0.25
+                    while waited < max_wait:
+                        # Prefer last trade price, then bid/ask midpoint
+                        if hasattr(ticker, 'last') and ticker.last and ticker.last > 0:
+                            market_price = ticker.last
+                            break
+                        if hasattr(ticker, 'bid') and hasattr(ticker, 'ask'):
+                            if ticker.bid > 0 and ticker.ask > 0:
+                                market_price = (ticker.bid + ticker.ask) / 2
+                                break
+                        if hasattr(ticker, 'close') and ticker.close and ticker.close > 0:
+                            market_price = ticker.close
+                            break
+                        await asyncio.sleep(poll_interval)
+                        waited += poll_interval
                     
                     self.ib.cancelMktData(contract)
                     
                     if market_price > 0:
-                        market_value = pos.position * market_price
-                        # P&L = (market_value) - (position * avgCost)
-                        unrealized_pnl = market_value - (pos.position * pos.avgCost)
+                        # For options: 
+                        # - position: number of contracts (e.g., 1.0)
+                        # - avgCost: TOTAL premium paid per contract (e.g., $1130.73 for entire contract)
+                        # - market_price: Current price per share (e.g., $9.80 per share)
+                        # - Each contract = 100 shares
+                        
+                        # Market value: current price per share × 100 shares × number of contracts
+                        market_value = pos.position * market_price * 100
+                        
+                        # Cost basis: what we paid (avgCost is already total per contract)
+                        cost_basis = pos.position * pos.avgCost
+                        
+                        # P&L = current value - what we paid
+                        unrealized_pnl = market_value - cost_basis
+                        
+                        logger.debug(
+                            f"Position P&L calc: {pos.contract.symbol} | "
+                            f"Contracts: {pos.position} | AvgCost: ${pos.avgCost:.2f}/contract | "
+                            f"MktPrice: ${market_price:.2f}/share | "
+                            f"Cost: ${cost_basis:.2f} | MktVal: ${market_value:.2f} | "
+                            f"P&L: ${unrealized_pnl:.2f}"
+                        )
+                    else:
+                        logger.warning(f"No market price available for {pos.contract.symbol}")
                 except Exception as e:
                     logger.debug(f"Could not get market price for {pos.contract.symbol}: {e}")
                 

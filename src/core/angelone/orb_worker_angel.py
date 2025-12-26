@@ -31,6 +31,7 @@ from core.config import (
     NSE_MARKET_CLOSE_HOUR,
     NSE_MARKET_CLOSE_MINUTE,
     ANGEL_TIMEZONE,
+    ANGEL_ONE_TRADE_PER_DAY,
 )
 from core.orb_signal_engine import (
     calculate_atr,
@@ -519,16 +520,52 @@ async def execute_orb_entry(
             return False
         logger.info(f"[{symbol}] ✅ Risk check passed. Estimated cost: ₹{estimated_cost:.2f}")
 
-        # Place bracket order
-        order_result = await angel_client.place_bracket_order(
-            option_symbol=option_selection.symbol,
-            option_token=option_selection.token,
-            quantity=total_qty,
-            stop_loss_price=round(option_sl_price, 1),
-            target_price=round(option_tp_price, 1),
+        # Place ROBO bracket order (with automatic SL & Target management by broker)
+        logger.info(
+            f"[{symbol}] 📤 Placing ROBO bracket order: "
+            f"Entry=₹{option_ltp:.2f}, SL=₹{option_sl_price:.2f}, TP=₹{option_tp_price:.2f}"
+        )
+        
+        from core.angelone.robo_order_manager import RoboOrderManager
+        
+        manager = RoboOrderManager(angel_client)
+        
+        try:
+            order_result = await manager.place_robo_order(
+                symbol=option_selection.symbol,
+                token=option_selection.token,
+                quantity=total_qty,
+                side="BUY",
+                sl_points=option_ltp - option_sl_price,  # Points from entry to SL
+                target_points=option_tp_price - option_ltp,  # Points from entry to TP
+                entry_price=option_ltp,  # Explicit entry price
+                exchange="NFO",
+            )
+        except Exception as order_error:
+            logger.error(f"[{symbol}] ❌ ROBO order placement failed: {order_error}")
+            send_telegram(
+                f"❌ [{symbol}] ROBO Order Failed\\n"
+                f"Error: {order_error}\\n"
+                f"Cost: ₹{estimated_cost:,.2f}",
+                broker="ANGEL"
+            )
+            return False
+
+        if not order_result or order_result.get("mode") not in ["ROBO", "MANUAL"]:
+            logger.error(f"[{symbol}] ❌ Order placement failed: {order_result}")
+            send_telegram(
+                f"❌ [{symbol}] Order Failed\\n{order_result}",
+                broker="ANGEL"
+            )
+            return False
+        
+        # Log which mode was used
+        mode = order_result.get("mode")
+        logger.info(
+            f"[{symbol}] ✅ Order placed successfully using {mode} mode"
         )
 
-        if order_result and order_result.get("status") == "success":
+        if order_result and order_result.get("entry_order_id"):
             # Track position with bracket order details
             ORB_ACTIVE_POSITIONS[symbol] = {
                 "direction": direction,
@@ -1056,17 +1093,15 @@ async def position_cleanup_task(angel_client, interval=60):
         while not _STOP_EVENT.is_set():
             await asyncio.sleep(interval)
             
-            # Get list of symbols currently tracked
+            # Get list of symbols currently tracked in active positions
+            # Don't check trade_taken symbols that aren't in active positions
+            # (they're already closed, just kept for one-trade-per-day tracking)
             tracked_symbols = list(ORB_ACTIVE_POSITIONS.keys())
             
-            # Also check symbols with trade_taken flag but not in active positions
-            trade_taken_symbols = [s for s in ORB_TRADE_TAKEN_TODAY.keys() if s not in tracked_symbols]
-            all_symbols_to_check = tracked_symbols + trade_taken_symbols
-            
-            if all_symbols_to_check:
-                logger.debug(f"🧹 Cleanup checking: {all_symbols_to_check}")
+            if tracked_symbols:
+                logger.info(f"🧹 Cleanup: Monitoring {len(tracked_symbols)} active position(s): {', '.join(tracked_symbols)}")
                 # Check each symbol
-                for symbol in all_symbols_to_check:
+                for symbol in tracked_symbols:
                     try:
                         # Check if position still exists on broker (include_local=False, silent=True)
                         still_occupied = await is_symbol_occupied(
@@ -1080,13 +1115,19 @@ async def position_cleanup_task(angel_client, interval=60):
                             )
                             if symbol in ORB_ACTIVE_POSITIONS:
                                 del ORB_ACTIVE_POSITIONS[symbol]
-                            
-                            # Also clear the trade taken flag to allow re-entry
+                            # Clear trade-taken flag ONLY if ONE_TRADE_PER_DAY is disabled
+                            # If enabled, keep the flag to prevent re-entry for the entire day
                             if symbol in ORB_TRADE_TAKEN_TODAY:
-                                del ORB_TRADE_TAKEN_TODAY[symbol]
-                                logger.info(
-                                    f"[{symbol}] 🔓 Cleanup: Cleared trade-taken flag. Symbol available for re-entry."
-                                )
+                                if not ANGEL_ONE_TRADE_PER_DAY:
+                                    del ORB_TRADE_TAKEN_TODAY[symbol]
+                                    del ORB_TRADE_TAKEN_TODAY[symbol]
+                                    logger.info(
+                                        f"[{symbol}] 🔓 Cleanup: Cleared trade-taken flag. Symbol available for re-entry."
+                                    )
+                                else:
+                                    logger.info(
+                                        f"[{symbol}] 🔒 Cleanup: Trade-taken flag kept (ONE_TRADE_PER_DAY mode). No re-entry today."
+                                    )
                         # Don't log "still occupied" - reduces noise since monitoring loops already check
                     except Exception as e:
                         logger.error(f"[{symbol}] Error in cleanup check: {e}")

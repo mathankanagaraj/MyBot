@@ -7,7 +7,7 @@ Handles persistence of daily trade state across bot restarts.
 import json
 from datetime import datetime, date
 from pathlib import Path
-from typing import Dict, Set, Optional
+from typing import Set
 import pytz
 
 from core.logger import logger
@@ -95,19 +95,58 @@ class TradeStateManager:
     def sync_with_broker(self, positions: list):
         """
         Sync state with broker API positions.
-        Updates open_positions based on actual broker data.
+        Updates open_positions based on actual broker data (preserves traded_symbols).
         """
+        logger.info("🔄 Syncing trade state with Angel One broker...")
+        logger.debug(
+            "Current state before sync: %d traded symbols %s, %d open positions %s",
+            len(self.traded_symbols),
+            list(self.traded_symbols),
+            len(self.open_positions),
+            list(self.open_positions)
+        )
+        
+        # If broker returns empty positions but we have existing state, don't wipe it
+        # This prevents losing state due to timing issues or connection problems
+        if not positions and (self.traded_symbols or self.open_positions):
+            logger.warning(
+                "⚠️  Broker returned 0 positions but state has data. Preserving existing state to avoid data loss."
+            )
+            logger.info(
+                "✅ Sync skipped: %d open positions %s, %d traded symbols %s (preserved)",
+                len(self.open_positions),
+                list(self.open_positions),
+                len(self.traded_symbols),
+                list(self.traded_symbols)
+            )
+            return
+        
         broker_symbols = set()
         for pos in positions:
             netqty = int(pos.get("netqty", "0"))
+            tradingsymbol = pos.get("tradingsymbol", "")
+            
+            logger.debug(
+                "Processing position: tradingsymbol='%s', netqty=%s",
+                tradingsymbol,
+                netqty
+            )
+            
             if netqty != 0:
-                symbol = pos.get("tradingsymbol", "")
                 # Extract underlying symbol from option contract
                 # Example: BANKNIFTY30DEC2559300PE -> BANKNIFTY
+                matched_symbol = None
                 for tracked in self.traded_symbols | self.open_positions:
-                    if tracked in symbol:
+                    if tracked in tradingsymbol:
+                        matched_symbol = tracked
                         broker_symbols.add(tracked)
                         break
+                
+                logger.debug(
+                    "Symbol extraction: '%s' -> '%s'",
+                    tradingsymbol,
+                    matched_symbol if matched_symbol else "NO MATCH"
+                )
         
         # Update open positions to match broker
         removed = self.open_positions - broker_symbols
@@ -123,6 +162,14 @@ class TradeStateManager:
         
         if removed or added:
             self._save_state()
+        
+        logger.info(
+            "✅ Broker sync complete: %d open positions %s, %d traded symbols %s",
+            len(self.open_positions),
+            list(self.open_positions),
+            len(self.traded_symbols),
+            list(self.traded_symbols)
+        )
     
     def sync_with_order_history(self, orders: list, tracked_symbols: list):
         """
