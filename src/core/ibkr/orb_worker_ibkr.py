@@ -35,6 +35,9 @@ from core.config import (
     US_MARKET_CLOSE_MINUTE,
     IBKR_TIMEZONE,
     IBKR_QUANTITY,
+    IBKR_MAX_CONTRACTS,
+    IBKR_MAX_TRADES_PER_DAY,
+    IBKR_ONE_TRADE_PER_SYMBOL,
 )
 from core.orb_signal_engine import (
     calculate_atr,
@@ -60,6 +63,7 @@ from core.cash_manager import LiveCashManager
 _STOP_EVENT = asyncio.Event()
 ORB_TRADE_TAKEN_TODAY: Dict[str, bool] = {}  # Track if trade taken per symbol
 ORB_ACTIVE_POSITIONS: Dict[str, Dict] = {}  # Track active positions per symbol
+_TRADE_STATE_MANAGER = None  # File-based state persistence
 
 # US Eastern timezone
 US_ET = pytz.timezone(IBKR_TIMEZONE)
@@ -748,23 +752,71 @@ async def execute_orb_entry(
     """
     Execute ORB entry order with SL/TP.
 
-    Args:
-           symbol: Trading symbol (SPX, NDX)
-           direction: "LONG" or "SHORT"
-           entry_price: Entry price (index level)
-           stop_loss: Stop loss price
-           take_profit: Take profit price
-           ibkr_client: IBKR client
+    Pre-Entry Checks:
+    1. One-trade-per-symbol enforcement (if enabled)
+    2. Max trades per day limit (if > 0)
+    3. Symbol shield (no existing positions)
+    4. Capital allocation (70% rule)
+    
+    Position Sizing:
+    - Uses IBKR_MAX_CONTRACTS from config (default: 1)
+    - If 0, uses old quantity parameter
 
-       Returns:
-           True if order placed successfully
+    Args:
+        symbol: Trading symbol (SPX, NDX)
+        direction: "LONG" or "SHORT"
+        entry_price: Entry price (index level)
+        stop_loss: Stop loss price
+        take_profit: Take profit price
+        ibkr_client: IBKR client
+        cash_mgr: Cash manager
+        quantity: Fallback quantity (used only if IBKR_MAX_CONTRACTS == 0)
+        underlying: Pre-qualified underlying contract
+
+    Returns:
+        True if order placed successfully
     """
+    global _TRADE_STATE_MANAGER
+    
     try:
+        # 1. Check one-trade-per-symbol enforcement
+        if IBKR_ONE_TRADE_PER_SYMBOL and _TRADE_STATE_MANAGER:
+            if _TRADE_STATE_MANAGER.is_symbol_traded_today(symbol):
+                logger.warning(
+                    f"[{symbol}] ⛔ Already traded today (one-trade-per-symbol mode)"
+                )
+                send_telegram(
+                    f"⛔ [{symbol}] Trade blocked\\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\\n"
+                    f"Already traded today\\n"
+                    f"Mode: ONE_TRADE_PER_SYMBOL\\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\\n"
+                    f"No re-entry allowed",
+                    broker="IBKR",
+                )
+                return False
+        
+        # 2. Check max trades per day limit
+        if IBKR_MAX_TRADES_PER_DAY > 0 and _TRADE_STATE_MANAGER:
+            current_trades = _TRADE_STATE_MANAGER.get_total_trades()
+            if current_trades >= IBKR_MAX_TRADES_PER_DAY:
+                logger.warning(
+                    f"[{symbol}] ⛔ Max trades per day reached ({current_trades}/{IBKR_MAX_TRADES_PER_DAY})"
+                )
+                send_telegram(
+                    f"⛔ [{symbol}] Trade blocked\\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\\n"
+                    f"Max trades reached today\\n"
+                    f"Limit: {IBKR_MAX_TRADES_PER_DAY}\\n"
+                    f"Current: {current_trades}",
+                    broker="IBKR",
+                )
+                return False
+
         # Determine option type
         option_right = "C" if direction == "LONG" else "P"
 
-        # The Shield check is now done proactively in the monitor loop.
-        # This check serves as a final safety guard.
+        # 3. Symbol Shield check
         if await is_symbol_occupied(symbol, ibkr_client):
             logger.warning(
                 f"[{symbol}] 🛡️ Symbol Shield: BLOCKING Entry. Symbol is already active in a position or open order."
@@ -918,9 +970,16 @@ async def execute_orb_entry(
         # --- CAPITAL MANAGER (70% Rule) ---
         available_exposure = await cash_mgr.available_exposure()
 
-        # We use the available exposure to determine the quantity
-        # Cost = option_price * qty * 100
-        qty = quantity
+        # Determine contract quantity based on IBKR_MAX_CONTRACTS config
+        if IBKR_MAX_CONTRACTS == 0:
+            # Auto-sizing: use quantity parameter (old behavior)
+            qty = quantity
+            logger.info(f"[{symbol}] 📊 Auto-sizing: Using quantity parameter = {qty}")
+        else:
+            # Fixed contracts from config
+            qty = IBKR_MAX_CONTRACTS
+            logger.info(f"[{symbol}] 📊 Fixed contract size from config: {qty} contracts")
+        
         trade_cost = option_price * qty * 100
 
         logger.debug(
@@ -982,6 +1041,15 @@ async def execute_orb_entry(
                 "oca_group": order_result.get("oca_group"),
             }
             ORB_TRADE_TAKEN_TODAY[symbol] = True
+            
+            # Mark symbol as traded in state manager
+            if _TRADE_STATE_MANAGER:
+                _TRADE_STATE_MANAGER.mark_symbol_traded(symbol)
+                _TRADE_STATE_MANAGER.mark_position_opened(symbol)
+                _TRADE_STATE_MANAGER.increment_trade_count()
+                logger.info(
+                    f"[{symbol}] 📝 Marked as traded (Total: {_TRADE_STATE_MANAGER.get_total_trades()})"
+                )
 
             # Telegram notification
             msg = (
@@ -1602,8 +1670,13 @@ async def position_cleanup_task(ibkr_client: IBKRClient, interval=60):
                             if symbol in ORB_ACTIVE_POSITIONS:
                                 del ORB_ACTIVE_POSITIONS[symbol]
                             
-                            # Also clear the trade taken flag to allow re-entry
-                            if symbol in ORB_TRADE_TAKEN_TODAY:
+                            # Mark position as closed in state manager
+                            if _TRADE_STATE_MANAGER:
+                                _TRADE_STATE_MANAGER.mark_position_closed(symbol)
+                                logger.info(f"[{symbol}] 📝 Marked position as closed in state")
+                            
+                            # Clear the trade taken flag if one-trade-per-symbol is disabled
+                            if not IBKR_ONE_TRADE_PER_SYMBOL and symbol in ORB_TRADE_TAKEN_TODAY:
                                 del ORB_TRADE_TAKEN_TODAY[symbol]
                                 logger.info(
                                     f"[{symbol}] 🔓 Cleanup: Cleared trade-taken flag. Symbol available for re-entry."
@@ -1681,6 +1754,43 @@ async def _async_ibkr_session():
         ibkr_client = IBKRClient()
         ibkr_client.option_chains_cache.clear()
         await ibkr_client.connect_async()
+        
+        # Initialize trade state manager (for persistence across restarts)
+        global _TRADE_STATE_MANAGER
+        from core.ibkr.trade_state import IBKRTradeStateManager
+        
+        _TRADE_STATE_MANAGER = IBKRTradeStateManager()
+        logger.info("✅ Initialized IBKR TradeStateManager")
+        
+        # Sync state with broker on startup
+        try:
+            positions = await ibkr_client.get_positions_fast()
+            _TRADE_STATE_MANAGER.sync_with_broker(positions)
+            
+            # Log state summary
+            state_summary = _TRADE_STATE_MANAGER.get_state_summary()
+            logger.info(
+                "📊 Trade state synced: %d traded symbols, %d open positions, %d total trades",
+                len(state_summary["traded_symbols"]),
+                len(state_summary["open_positions"]),
+                state_summary["total_trades"]
+            )
+            
+            if state_summary["traded_symbols"]:
+                traded_list = ', '.join(sorted(state_summary['traded_symbols']))
+                send_telegram(
+                    f"📊 **IBKR Trade State Summary**\\n"
+                    f"Traded Today: {traded_list}\\n"
+                    f"Open Positions: {len(state_summary['open_positions'])}\\n"
+                    f"Total Trades: {state_summary['total_trades']}",
+                    broker="IBKR",
+                )
+            
+            # Cleanup old state files (keep last 7 days)
+            _TRADE_STATE_MANAGER.cleanup_old_state_files(7)
+            
+        except Exception as e:
+            logger.error("⚠️ Failed to sync trade state: %s", e)
         
         # Start position cleanup background task
         cleanup_task = asyncio.create_task(

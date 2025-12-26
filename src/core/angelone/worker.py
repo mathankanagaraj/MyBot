@@ -27,6 +27,8 @@ from core.config import (
     ANGEL_SYMBOLS,
     MARKET_HOURS_ONLY,
     INDEX_FUTURES,
+    ANGEL_MAX_LOTS,
+    ANGEL_ONE_TRADE_PER_DAY,
 )
 from core.logger import logger
 from core.angelone.option_selector import find_option_contract_async
@@ -67,6 +69,9 @@ ACTIVE_OCO_ORDERS = {}
 
 # Global trade entry lock to prevent simultaneous order placement across symbols
 _TRADE_ENTRY_LOCK = asyncio.Lock()
+
+# Trade State Manager (for persistence across restarts)
+_TRADE_STATE_MANAGER = None
 
 
 # -----------------------------
@@ -509,24 +514,45 @@ async def execute_entry_order(symbol, bias, angel_client, cash_mgr, underlying_p
 
     Pre-Trade Validation Flow (using Angel One API as single source of truth):
     1. Lock Acquisition - Acquire global trade lock
-    2. Live Position Check - Query broker API for existing positions (CRITICAL)
-    3. Balance Verification - Check available funds from broker
-    4. Exposure Check - Verify 70% daily allocation limit
-    5. Option Selection - Find appropriate contract
-    6. Premium Validation - Ensure premium meets minimum
-    7. Position Sizing - Calculate lots and cost
-    8. Final Risk Check - Verify can_open_position
-    9. Order Placement - Execute bracket order
-    10. Trade Counting - Increment only on success
+    2. One-Trade-Per-Day Check - Verify symbol hasn't been traded today (if enabled)
+    3. Live Position Check - Query broker API for existing positions (CRITICAL)
+    4. Balance Verification - Check available funds from broker
+    5. Exposure Check - Verify 70% daily allocation limit
+    6. Option Selection - Find appropriate contract
+    7. Premium Validation - Ensure premium meets minimum
+    8. Position Sizing - Calculate lots based on ANGEL_MAX_LOTS config
+    9. Final Risk Check - Verify can_open_position
+    10. Order Placement - Execute ROBO bracket order (with SL & Target)
+    11. Trade Counting - Increment and persist state
 
     Note: Does NOT rely on local cache for position verification.
           Only Angel One API is the source of truth.
     """
+    global _TRADE_STATE_MANAGER
+    
     # Acquire global lock to prevent simultaneous trades
     async with _TRADE_ENTRY_LOCK:
         logger.info("[%s] 🔒 Acquired trade entry lock", symbol)
 
-        # 1. Check real-time positions from broker API (SINGLE SOURCE OF TRUTH)
+        # 1. Check if symbol was already traded today (one-trade-per-day enforcement)
+        if ANGEL_ONE_TRADE_PER_DAY and _TRADE_STATE_MANAGER:
+            if _TRADE_STATE_MANAGER.is_symbol_traded_today(symbol):
+                logger.warning(
+                    "[%s] ⛔ Already traded today (one-trade-per-day mode)", symbol
+                )
+                send_telegram(
+                    f"⛔ [{symbol}] Trade blocked\\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\\n"
+                    f"Already traded today\\n"
+                    f"Mode: ONE_TRADE_PER_DAY\\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\\n"
+                    f"No re-entry allowed",
+                    broker="ANGEL",
+                )
+                logger.info("[%s] 🔓 Released trade entry lock", symbol)
+                return False
+
+        # 2. Check real-time positions from broker API (SINGLE SOURCE OF TRUTH)
         # Retry up to 3 times for API reliability
         logger.info("[%s] 🔍 Checking live positions from Angel One API...", symbol)
         live_positions = None
@@ -550,9 +576,9 @@ async def execute_entry_order(symbol, bias, angel_client, cash_mgr, underlying_p
                 "[%s] ❌ CRITICAL: Failed to verify positions after 3 attempts", symbol
             )
             send_telegram(
-                f"❌ [{symbol}] Trade blocked\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Failed to verify positions from broker\n"
+                f"❌ [{symbol}] Trade blocked\\n"
+                f"━━━━━━━━━━━━━━━━━━━━\\n"
+                f"Failed to verify positions from broker\\n"
                 f"Retried 3 times - blocking for safety",
                 broker="ANGEL",
             )
@@ -576,13 +602,13 @@ async def execute_entry_order(symbol, bias, angel_client, cash_mgr, underlying_p
                         netqty,
                     )
                     send_telegram(
-                        f"❌ [{symbol}] Trade blocked\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📊 Live Position Found:\n"
-                        f"Symbol: {pos_symbol}\n"
-                        f"Quantity: {netqty}\n"
-                        f"P&L: ₹{float(pos.get('pnl', 0)):,.2f}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"❌ [{symbol}] Trade blocked\\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\\n"
+                        f"📊 Live Position Found:\\n"
+                        f"Symbol: {pos_symbol}\\n"
+                        f"Quantity: {netqty}\\n"
+                        f"P&L: ₹{float(pos.get('pnl', 0)):,.2f}\\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\\n"
                         f"❌ Cannot open duplicate position",
                         broker="ANGEL",
                     )
@@ -592,11 +618,11 @@ async def execute_entry_order(symbol, bias, angel_client, cash_mgr, underlying_p
         if not has_position:
             logger.info("[%s] ✅ No existing positions found in broker", symbol)
 
-        # 2. Get current cash status and calculate limits
+        # 3. Get current cash status and calculate limits
         balance_info = await cash_mgr.get_account_balance()
         available_funds = balance_info["available_funds"]
 
-        # 3. Calculate available exposure based on 70% of daily start balance
+        # 4. Calculate available exposure based on 70% of daily start balance
         available_exposure = await cash_mgr.available_exposure()
 
         logger.info(
@@ -606,21 +632,21 @@ async def execute_entry_order(symbol, bias, angel_client, cash_mgr, underlying_p
             available_exposure,
         )
 
-        # 4. Early exit if no exposure available
+        # 5. Early exit if no exposure available
         if available_exposure <= 0:
             logger.error(
                 "[%s] ❌ No exposure available (70%% daily limit reached)", symbol
             )
             send_telegram(
-                f"❌ [{symbol}] No exposure available\n"
-                f"Daily allocation limit (70%) reached\n"
+                f"❌ [{symbol}] No exposure available\\n"
+                f"Daily allocation limit (70%) reached\\n"
                 f"Available funds: ₹{available_funds:,.2f}",
                 broker="ANGEL",
             )
             logger.info("[%s] 🔓 Released trade entry lock", symbol)
             return False
 
-        # Select option contract
+        # 6. Select option contract
         logger.info("[%s] 🔍 Selecting option contract...", symbol)
         opt_selection, reason = await find_option_contract_async(
             angel_client, symbol, bias, underlying_price
@@ -635,7 +661,7 @@ async def execute_entry_order(symbol, bias, angel_client, cash_mgr, underlying_p
 
         logger.info("[%s] ✅ Selected option: %s", symbol, opt_selection.symbol)
 
-        # Get option premium
+        # 7. Get option premium
         logger.info("[%s] 💰 Fetching option premium...", symbol)
         prem = await angel_client.get_last_price(opt_selection.symbol, exchange="NFO")
         if prem is None or prem < MIN_PREMIUM:
@@ -648,31 +674,63 @@ async def execute_entry_order(symbol, bias, angel_client, cash_mgr, underlying_p
 
         logger.info("[%s] 💰 Option premium: ₹%.2f", symbol, prem)
 
-        # Calculate position size
+        # 8. Calculate position size using ANGEL_MAX_LOTS configuration
         lot_size = opt_selection.lot_size
         per_lot_cost = float(prem) * float(lot_size)
-        qty = MAX_CONTRACTS_PER_TRADE
+        
+        # Determine lot quantity based on ANGEL_MAX_LOTS config
+        if ANGEL_MAX_LOTS == 0:
+            # Auto-calculate: Use as many lots as available exposure allows
+            max_affordable_lots = int(available_exposure / per_lot_cost)
+            qty = max(1, min(max_affordable_lots, MAX_CONTRACTS_PER_TRADE))
+            logger.info(
+                "[%s] 📊 Auto-sizing: Max affordable lots = %d (using %d)",
+                symbol, max_affordable_lots, qty
+            )
+        else:
+            # Use fixed lot size from config
+            qty = ANGEL_MAX_LOTS
+            logger.info(
+                "[%s] 📊 Fixed lot size from config: %d lots", symbol, qty
+            )
+        
         est_cost = per_lot_cost * qty
+        total_quantity = qty * lot_size
 
         logger.info(
-            "[%s] 📊 Position sizing: %d lots × %d qty × ₹%.2f = ₹%.2f",
+            "[%s] 📊 Position sizing: %d lots × %d size = %d contracts × ₹%.2f = ₹%.2f",
             symbol,
             qty,
             lot_size,
+            total_quantity,
             prem,
             est_cost,
         )
 
-        # Check if we can open position (re-check with lock held)
+        # 9. Check if we can open position (final verification)
+        if est_cost > available_exposure:
+            logger.error(
+                "[%s] ❌ Insufficient exposure: Need ₹%.2f, Have ₹%.2f",
+                symbol, est_cost, available_exposure
+            )
+            send_telegram(
+                f"❌ [{symbol}] Insufficient cash\\n"
+                f"Required: ₹{est_cost:,.2f}\\n"
+                f"Available: ₹{available_exposure:,.2f}\\n"
+                f"━━━━━━━━━━━━━━━━━━━━\\n"
+                f"Reduce lot size or free up capital",
+                broker="ANGEL",
+            )
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
+            return False
+
         can_open = await cash_mgr.can_open_position(symbol, est_cost)
         if not can_open:
-            logger.error("[%s] ❌ Insufficient funds or risk limit reached", symbol)
-            available_exposure = await cash_mgr.available_exposure()
+            logger.error("[%s] ❌ Risk limit check failed", symbol)
             send_telegram(
-                f"❌ [{symbol}] Trade blocked\n"
-                f"Required: ₹{est_cost:,.2f}\n"
-                f"Available: ₹{available_exposure:,.2f}\n"
-                f"Current balance: ₹{available_funds:,.2f}",
+                f"❌ [{symbol}] Risk limit exceeded\\n"
+                f"Required: ₹{est_cost:,.2f}\\n"
+                f"Available: ₹{available_exposure:,.2f}",
                 broker="ANGEL",
             )
             logger.info("[%s] 🔓 Released trade entry lock", symbol)
@@ -681,7 +739,7 @@ async def execute_entry_order(symbol, bias, angel_client, cash_mgr, underlying_p
         # Register position
         cash_mgr.register_open(symbol, est_cost)
 
-        # Calculate stop loss and target
+        # 10. Calculate stop loss and target
         risk_amt = prem * RISK_PCT_OF_PREMIUM
         stop_price = prem - risk_amt
         target_price = prem + (risk_amt * RR_RATIO)
@@ -689,36 +747,101 @@ async def execute_entry_order(symbol, bias, angel_client, cash_mgr, underlying_p
         if stop_price < 0.05:
             stop_price = 0.05
 
-        # Place bracket order
+        # 11. Place ROBO bracket order (with SL & Target child orders)
         logger.info(
-            f"[{symbol}] 📤 Placing bracket order: {bias} "
+            f"[{symbol}] 📤 Placing ROBO bracket order: {bias} "
             f"Entry=₹{prem:.2f}, SL=₹{stop_price:.2f}, TP=₹{target_price:.2f}"
         )
 
-        # Suppose `api` is your SmartAPI client implementing required methods
         from core.angelone.robo_order_manager import RoboOrderManager
 
         manager = RoboOrderManager(angel_client)
 
-        bracket = await manager.place_robo_order(
-            symbol=opt_selection.symbol,
-            token=opt_selection.token,
-            quantity=qty * lot_size,
-            side="BUY",
-            sl_points=stop_price,
-            target_points=target_price,
-        )
-
-        if bracket is None:
-            logger.error("[%s] ❌ Order placement failed", symbol)
-            send_telegram(f"❌ {symbol} order placement failed", broker="ANGEL")
+        try:
+            bracket = await manager.place_robo_order(
+                symbol=opt_selection.symbol,
+                token=opt_selection.token,
+                quantity=qty * lot_size,
+                side="BUY",
+                sl_points=stop_price,
+                target_points=target_price,
+            )
+        except Exception as order_error:
+            error_msg = str(order_error).lower()
+            logger.error("[%s] ❌ Order placement failed: %s", symbol, order_error)
+            
+            # Check if error is cash/funds related
+            is_cash_error = any(
+                keyword in error_msg
+                for keyword in ["insufficient", "funds", "cash", "margin", "balance"]
+            )
+            
+            if is_cash_error:
+                # Mark symbol as traded to prevent retry
+                if ANGEL_ONE_TRADE_PER_DAY and _TRADE_STATE_MANAGER:
+                    _TRADE_STATE_MANAGER.mark_symbol_traded(symbol)
+                    logger.warning(
+                        "[%s] ⚠️ Marking as traded to prevent retry after cash insufficient",
+                        symbol
+                    )
+                
+                send_telegram(
+                    f"❌ [{symbol}] Order failed - Cash Insufficient\\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\\n"
+                    f"Error: {order_error}\\n"
+                    f"Required: ₹{est_cost:,.2f}\\n"
+                    f"Available: ₹{available_exposure:,.2f}\\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\\n"
+                    f"⛔ Marked as traded (no retry)",
+                    broker="ANGEL",
+                )
+            else:
+                send_telegram(f"❌ {symbol} order placement failed: {order_error}", broker="ANGEL")
+            
             cash_mgr.force_release(symbol)
             logger.info("[%s] 🔓 Released trade entry lock", symbol)
             return False
 
+        if bracket is None:
+            logger.error("[%s] ❌ Order placement returned None", symbol)
+            send_telegram(f"❌ {symbol} order placement returned None", broker="ANGEL")
+            cash_mgr.force_release(symbol)
+            logger.info("[%s] 🔓 Released trade entry lock", symbol)
+            return False
+
+        # Verify robo order has stop loss and target IDs
+        sl_order_id = bracket.get("sl_order_id")
+        target_order_id = bracket.get("target_order_id")
+        entry_order_id = bracket.get("entry_order_id")
+        
+        if not sl_order_id or not target_order_id:
+            logger.warning(
+                "[%s] ⚠️ ROBO order missing child orders! Entry: %s, SL: %s, Target: %s",
+                symbol, entry_order_id, sl_order_id, target_order_id
+            )
+            send_telegram(
+                f"⚠️ [{symbol}] ROBO order incomplete\\n"
+                f"Entry: {entry_order_id}\\n"
+                f"SL: {sl_order_id or 'MISSING'}\\n"
+                f"Target: {target_order_id or 'MISSING'}\\n"
+                f"━━━━━━━━━━━━━━━━━━━━\\n"
+                f"Manual SL/Target may be needed",
+                broker="ANGEL",
+            )
+        else:
+            logger.info(
+                "[%s] ✅ ROBO bracket complete: Entry=%s, SL=%s, Target=%s",
+                symbol, entry_order_id, sl_order_id, target_order_id
+            )
+
         # Store IDs for OCO management
-        # Note: place_bracket_order in client.py returns dict with keys: entry_order_id, sl_order_id, target_order_id
         ACTIVE_OCO_ORDERS[symbol] = bracket
+
+        # Mark symbol as traded in state manager
+        if _TRADE_STATE_MANAGER:
+            _TRADE_STATE_MANAGER.mark_symbol_traded(symbol)
+            _TRADE_STATE_MANAGER.mark_position_opened(symbol)
+            logger.info("[%s] 📝 Marked symbol as traded and position opened", symbol)
 
         # Increment trade count only after successful order placement
         cash_mgr.increment_trade_count()
@@ -1063,6 +1186,12 @@ async def angel_signal_monitor(symbol, angel_client, cash_mgr, bar_manager):
                             symbol,
                         )
                         cash_mgr.force_release(symbol)
+                        
+                        # Update state manager
+                        if _TRADE_STATE_MANAGER:
+                            _TRADE_STATE_MANAGER.mark_position_closed(symbol)
+                            logger.info("[%s] 📝 Marked position as closed in state", symbol)
+                        
                         # Also clear OCO if still exists
                         if symbol in ACTIVE_OCO_ORDERS:
                             del ACTIVE_OCO_ORDERS[symbol]
@@ -1187,6 +1316,46 @@ async def run_angel_workers():
                     max_daily_loss_pct=MAX_DAILY_LOSS_PCT,
                     max_position_pct=MAX_POSITION_PCT,
                 )
+
+                # Initialize trade state manager (for one-trade-per-day persistence)
+                global _TRADE_STATE_MANAGER
+                from core.angelone.trade_state import TradeStateManager
+                
+                _TRADE_STATE_MANAGER = TradeStateManager()
+                logger.info("✅ Initialized TradeStateManager")
+                
+                # Sync state with broker on startup
+                try:
+                    positions = await angel_client.get_positions()
+                    _TRADE_STATE_MANAGER.sync_with_broker(positions)
+                    
+                    # Also sync with order history
+                    order_history = await angel_client.get_order_history()
+                    _TRADE_STATE_MANAGER.sync_with_order_history(
+                        order_history, ANGEL_SYMBOLS
+                    )
+                    
+                    # Log state summary
+                    state_summary = _TRADE_STATE_MANAGER.get_state_summary()
+                    logger.info(
+                        "📊 Trade state synced: %d traded symbols, %d open positions",
+                        len(state_summary["traded_symbols"]),
+                        len(state_summary["open_positions"])
+                    )
+                    
+                    if state_summary["traded_symbols"]:
+                        send_telegram(
+                            f"📊 **Trade State Summary**\\n"
+                            f"Traded Today: {', '.join(sorted(state_summary['traded_symbols']))}\\n"
+                            f"Open Positions: {len(state_summary['open_positions'])}",
+                            broker="ANGEL",
+                        )
+                    
+                    # Cleanup old state files (keep last 7 days)
+                    _TRADE_STATE_MANAGER.cleanup_old_state_files(7)
+                    
+                except Exception as e:
+                    logger.error("⚠️ Failed to sync trade state: %s", e)
 
                 logger.info("✅ Connected to Angel")
                 send_telegram("✅ Connected to Angel", broker="ANGEL")

@@ -38,6 +38,17 @@ ANGEL_STOCK_SYMBOLS = [
 ]
 ANGEL_SYMBOLS = ANGEL_INDEX_FUTURES + ANGEL_STOCK_SYMBOLS
 
+# Angel One Lot Size Control
+# 0 = Auto-calculate based on available cash (old behavior - uses max available)
+# >0 = Fixed lot size (e.g., 1, 2, 3 lots per trade)
+# Recommended: 2 for better capital allocation across symbols
+ANGEL_MAX_LOTS = int(os.getenv("ANGEL_MAX_LOTS", "2"))
+
+# Angel One Trading Constraints
+# True = Only one trade per symbol per day (first entry only, no re-entry)
+# False = Allow multiple trades if no open position exists
+ANGEL_ONE_TRADE_PER_DAY = os.getenv("ANGEL_ONE_TRADE_PER_DAY", "true").lower() == "true"
+
 # ============================================================================
 # IBKR CONFIGURATION
 # ============================================================================
@@ -55,6 +66,22 @@ IBKR_SYMBOLS_STR = os.getenv(
 IBKR_SYMBOLS = [s.strip() for s in IBKR_SYMBOLS_STR.split(",")]
 IBKR_QUANTITY = int(os.getenv("IBKR_QUANTITY", "1"))  # Number of contracts per trade
 
+# IBKR Lot Size Control
+# 0 = Auto-calculate based on available cash (old behavior)
+# >0 = Fixed number of contracts per trade (e.g., 1, 2, 3)
+# Note: For IBKR options, this is typically 1-2 contracts
+IBKR_MAX_CONTRACTS = int(os.getenv("IBKR_MAX_CONTRACTS", "1"))
+
+# IBKR Trading Constraints
+# 0 = No limit (trade as many times as capital allows)
+# >0 = Maximum number of trades per day (e.g., 3, 5, 10)
+IBKR_MAX_TRADES_PER_DAY = int(os.getenv("IBKR_MAX_TRADES_PER_DAY", "10"))
+
+# IBKR One-Trade-Per-Symbol Enforcement
+# True = Only one trade per symbol per day (first entry only, no re-entry)
+# False = Allow multiple trades per symbol if no open position exists
+IBKR_ONE_TRADE_PER_SYMBOL = os.getenv("IBKR_ONE_TRADE_PER_SYMBOL", "true").lower() == "true"
+
 # ============================================================================
 # LEGACY COMPATIBILITY (for Angel-only code paths)
 # ============================================================================
@@ -62,6 +89,10 @@ INDEX_FUTURES = ANGEL_INDEX_FUTURES
 STOCK_SYMBOLS = ANGEL_STOCK_SYMBOLS
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Trade State Persistence (for Docker restart resilience)
+TRADE_STATE_DIR = Path(os.getenv("TRADE_STATE_DIR", "/app/data/trade_state"))
+TRADE_STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================================
 # TELEGRAM NOTIFICATIONS
